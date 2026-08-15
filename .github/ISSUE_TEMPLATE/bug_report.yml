@@ -1,0 +1,110 @@
+name: Bug report
+description: Report a reproducible problem with Image Service
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        Please do not include secrets, API keys, private image URLs, or security vulnerability details in this form.
+        Security issues should follow the instructions in SECURITY.md.
+
+  - type: checkboxes
+    id: existing
+    attributes:
+      label: Existing issue
+      description: Please check whether this problem has already been reported.
+      options:
+        - label: I searched the existing issues and did not find a duplicate.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem description
+      description: Describe what happened and why you believe it is a bug.
+      placeholder: A clear and concise description of the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reproducible sequence you can.
+      placeholder: |
+        1. Start Image Service with ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide the release version, tag, or commit SHA if known.
+      placeholder: "Example: v0.1.0 or 3257b269"
+    validations:
+      required: false
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`, if relevant.
+      placeholder: "Example: rustc 1.88.0 (...)"
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Example: Ubuntu 24.04, Fedora 42, Windows 11"
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: |
+        Include relevant non-secret configuration. Do not paste API keys, credentials, tokens, or private URLs.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Remove secrets and personal data before posting logs.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add anything else that may help reproduce or understand the problem.
+    validations:
+      required: false

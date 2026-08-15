@@ -1,0 +1,87 @@
+name: Feature request
+description: Suggest an improvement or new capability for Image Service
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement.
+
+        Please focus on the problem to solve as well as the proposed solution. Check ROADMAP.md first to see whether the idea is already planned.
+
+  - type: checkboxes
+    id: existing
+    attributes:
+      label: Existing request
+      description: Please check existing issues and the roadmap before submitting.
+      options:
+        - label: I searched existing issues and ROADMAP.md and did not find an equivalent request.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What problem would this feature solve? Who would benefit from it?
+      placeholder: Describe the use case rather than only the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or API you would like to see.
+      placeholder: Explain what you think Image Service should do.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or alternative designs you considered.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project is most closely related?
+      options:
+        - HTTP API
+        - Image processing
+        - Storage
+        - Authentication and security
+        - Configuration
+        - Deployment
+        - Observability
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility or migration considerations
+      description: Could this change affect existing API behavior, configuration, stored files, or deployments?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be interested in working on this feature.
+          required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add examples, references, sketches, or other useful context.
+    validations:
+      required: false
