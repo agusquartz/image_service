@@ -1,28 +1,14 @@
 use crate::{
     config::{
-        MAX_DECODE_ALLOC,
-        MAX_IMAGE_DIMENSION,
-        MAX_OUTPUT_BYTES,
-        MAX_RESIZE_ROUNDS,
-        MIN_LONGEST_SIDE,
-        RESIZE_SCALE,
-        WEBP_QUALITIES,
+        MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION, MAX_OUTPUT_BYTES, MAX_RESIZE_ROUNDS,
+        MIN_LONGEST_SIDE, RESIZE_SCALE, WEBP_QUALITIES,
     },
     error::ApiError,
 };
 
-use image::{
-    imageops::FilterType,
-    DynamicImage,
-    ImageFormat,
-    ImageReader,
-    Limits,
-};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType};
 
-use std::{
-    io::Cursor,
-    sync::Arc,
-};
+use std::{io::Cursor, sync::Arc};
 
 use tokio::sync::Semaphore;
 
@@ -43,121 +29,80 @@ pub(crate) async fn reduce_to_webp(
     semaphore: Arc<Semaphore>,
     incoming: IncomingImage,
 ) -> Result<Vec<u8>, ApiError> {
-    let permit =
-        semaphore
-            .acquire_owned()
-            .await
-            .map_err(|error| {
-                ApiError::Internal(
-                    format!(
-                        "Image processing semaphore closed: {error}"
-                    )
-                )
-            })?;
+    let permit = semaphore.acquire_owned().await.map_err(|error| {
+        ApiError::Internal(format!("Image processing semaphore closed: {error}"))
+    })?;
 
-    tokio::task::spawn_blocking(
-        move || {
-            // Keep the permit alive for the complete duration of the
-            // blocking image-processing operation.
-            let _permit = permit;
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit alive for the complete duration of the
+        // blocking image-processing operation.
+        let _permit = permit;
 
-            process_image_blocking(
-                &incoming.bytes,
-                &incoming.mime,
-            )
-        },
-    )
+        process_image_blocking(&incoming.bytes, &incoming.mime)
+    })
     .await
-    .map_err(|error| {
-        ApiError::Internal(
-            format!(
-                "Image processing task failed: {error}"
-            )
-        )
-    })?
+    .map_err(|error| ApiError::Internal(format!("Image processing task failed: {error}")))?
 }
 
 /// Performs format validation, decoding and WebP compression.
 ///
 /// This function is synchronous because the image library and WebP
 /// encoder perform CPU-bound work.
-fn process_image_blocking(
-    bytes: &[u8],
-    declared_mime: &str,
-) -> Result<Vec<u8>, ApiError> {
-    let format =
-        image::guess_format(bytes)
-            .map_err(|_| {
-                ApiError::UnsupportedMediaType(
-                    "Unknown image format"
-                        .to_string(),
-                )
-            })?;
+fn process_image_blocking(bytes: &[u8], declared_mime: &str) -> Result<Vec<u8>, ApiError> {
+    let format = image::guess_format(bytes)
+        .map_err(|_| ApiError::UnsupportedMediaType("Unknown image format".to_string()))?;
 
     if !supported_format(format) {
-        return Err(
-            ApiError::UnsupportedMediaType(
-                format!(
-                    "Unsupported image format: {format:?}"
-                )
-            )
-        );
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "Unsupported image format: {format:?}"
+        )));
     }
 
-    if !mime_matches_format(
-        declared_mime,
-        format,
-    ) {
-        return Err(
-            ApiError::UnsupportedMediaType(
-                format!(
-                    "Declared MIME type ({declared_mime}) does not match the detected image format ({format:?})"
-                )
-            )
-        );
+    if !declared_mime_is_acceptable(declared_mime, format) {
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "Declared MIME type ({declared_mime}) does not match the detected image format ({format:?})"
+        )));
     }
 
-    let mut reader =
-        ImageReader::with_format(
-            Cursor::new(bytes),
-            format,
-        );
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
 
     // Decode limits provide an additional defense against malformed or
     // intentionally expensive image files.
-    let mut limits =
-        Limits::default();
+    let mut limits = Limits::default();
 
-    limits.max_image_width =
-        Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
 
-    limits.max_image_height =
-        Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
 
-    limits.max_alloc =
-        Some(MAX_DECODE_ALLOC);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
 
     reader.limits(limits);
 
-    let image =
-        reader
-            .decode()
-            .map_err(|error| {
-                ApiError::UnprocessableEntity(
-                    format!(
-                        "Could not decode image: {error}"
-                    )
-                )
-            })?;
+    let mut decoder = reader.into_decoder().map_err(|error| {
+        ApiError::UnprocessableEntity(format!("Could not initialize image decoder: {error}"))
+    })?;
+
+    let orientation = decoder.orientation().map_err(|error| {
+        ApiError::UnprocessableEntity(format!("Could not read image orientation: {error}"))
+    })?;
+
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|error| {
+        ApiError::UnprocessableEntity(format!("Could not decode image: {error}"))
+    })?;
+
+    // Normalize the physical pixel layout before any resize or encoding
+    // operation.
+    //
+    // This prevents images whose display orientation is stored only in
+    // metadata from becoming rotated after conversion to WebP.
+    image.apply_orientation(orientation);
 
     compress_webp(image)
 }
 
 /// Returns whether the detected source format is accepted by the
 /// service.
-fn supported_format(
-    format: ImageFormat,
-) -> bool {
+fn supported_format(format: ImageFormat) -> bool {
     matches!(
         format,
         ImageFormat::Jpeg
@@ -174,44 +119,35 @@ fn supported_format(
 ///
 /// This prevents clients from disguising arbitrary formats by merely
 /// changing the Content-Type header.
-fn mime_matches_format(
-    declared_mime: &str,
-    format: ImageFormat,
-) -> bool {
-    let mime =
-        declared_mime
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+fn declared_mime_is_acceptable(declared_mime: &str, format: ImageFormat) -> bool {
+    let mime = declared_mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    // Some clients intentionally submit generic binary content.
+    //
+    // The real format is still determined from the uploaded bytes via
+    // image::guess_format(), so accepting this does not make the
+    // declared MIME authoritative.
+    if mime == "application/octet-stream" {
+        return true;
+    }
 
     match format {
-        ImageFormat::Jpeg => {
-            mime == "image/jpeg"
-                || mime == "image/jpg"
-        }
+        ImageFormat::Jpeg => mime == "image/jpeg" || mime == "image/jpg",
 
-        ImageFormat::Png => {
-            mime == "image/png"
-        }
+        ImageFormat::Png => mime == "image/png",
 
-        ImageFormat::WebP => {
-            mime == "image/webp"
-        }
+        ImageFormat::WebP => mime == "image/webp",
 
-        ImageFormat::Gif => {
-            mime == "image/gif"
-        }
+        ImageFormat::Gif => mime == "image/gif",
 
-        ImageFormat::Bmp => {
-            mime == "image/bmp"
-                || mime == "image/x-ms-bmp"
-        }
+        ImageFormat::Bmp => mime == "image/bmp" || mime == "image/x-ms-bmp",
 
-        ImageFormat::Tiff => {
-            mime == "image/tiff"
-        }
+        ImageFormat::Tiff => mime == "image/tiff",
 
         _ => false,
     }
@@ -240,99 +176,51 @@ fn mime_matches_format(
 /// - The output fits.
 /// - The maximum number of resize rounds is reached.
 /// - The longest side reaches [`MIN_LONGEST_SIDE`].
-fn compress_webp(
-    mut image: DynamicImage,
-) -> Result<Vec<u8>, ApiError> {
-    for resize_round
-        in 0..=MAX_RESIZE_ROUNDS
-    {
-        let width =
-            image.width();
+fn compress_webp(mut image: DynamicImage) -> Result<Vec<u8>, ApiError> {
+    for resize_round in 0..=MAX_RESIZE_ROUNDS {
+        let width = image.width();
 
-        let height =
-            image.height();
+        let height = image.height();
 
-        let rgba =
-            image.to_rgba8();
+        let rgba = image.to_rgba8();
 
-        let encoder =
-            Encoder::from_rgba(
-                rgba.as_raw(),
-                width,
-                height,
-            );
+        let encoder = Encoder::from_rgba(rgba.as_raw(), width, height);
 
         // First try progressively lower WebP quality levels without
         // changing image dimensions.
-        for quality
-            in WEBP_QUALITIES
-        {
-            let encoded =
-                encoder.encode(quality);
+        for quality in WEBP_QUALITIES {
+            let encoded = encoder.encode(quality);
 
-            if encoded.len()
-                <= MAX_OUTPUT_BYTES
-            {
-                return Ok(
-                    encoded.to_vec()
-                );
+            if encoded.len() <= MAX_OUTPUT_BYTES {
+                return Ok(encoded.to_vec());
             }
         }
 
         // All quality levels failed. Decide whether another resize is
         // allowed.
-        if resize_round
-            >= MAX_RESIZE_ROUNDS
-        {
+        if resize_round >= MAX_RESIZE_ROUNDS {
             break;
         }
 
-        if width.max(height)
-            <= MIN_LONGEST_SIDE
-        {
+        if width.max(height) <= MIN_LONGEST_SIDE {
             break;
         }
 
-        let new_width =
-            (
-                width as f32
-                    * RESIZE_SCALE
-            )
-                .round()
-                .max(1.0)
-                as u32;
+        let new_width = (width as f32 * RESIZE_SCALE).round().max(1.0) as u32;
 
-        let new_height =
-            (
-                height as f32
-                    * RESIZE_SCALE
-            )
-                .round()
-                .max(1.0)
-                as u32;
+        let new_height = (height as f32 * RESIZE_SCALE).round().max(1.0) as u32;
 
         // Defensive check against a scale operation that would no
         // longer modify the dimensions.
-        if new_width == width
-            && new_height == height
-        {
+        if new_width == width && new_height == height {
             break;
         }
 
-        image =
-            image.resize_exact(
-                new_width,
-                new_height,
-                FilterType::Lanczos3,
-            );
+        image = image.resize_exact(new_width, new_height, FilterType::Lanczos3);
     }
 
-    Err(
-        ApiError::UnprocessableEntity(
-            format!(
-                "Could not reduce the image below {} KB",
-                MAX_OUTPUT_BYTES / 1024
-            )
-        )
-    )
+    Err(ApiError::UnprocessableEntity(format!(
+        "Could not reduce the image below {} KB",
+        MAX_OUTPUT_BYTES / 1024
+    )))
 }
