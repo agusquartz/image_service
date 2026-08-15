@@ -1,7 +1,4 @@
-use crate::{
-    config::AppConfig,
-    images::ImageStore,
-};
+use crate::{config::AppConfig, images::ImageStore};
 
 use std::sync::Arc;
 
@@ -31,20 +28,13 @@ impl AppState {
     /// Creates the shared application state from runtime configuration.
     pub fn from_config(config: &AppConfig) -> Self {
         Self {
-            store: ImageStore::new(
-                config.image_root.clone()
-            ),
+            store: ImageStore::new(config.image_root.clone()),
 
-            image_jobs: Arc::new(
-                Semaphore::new(
-                    config.max_concurrency
-                )
-            ),
+            image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
 
             api_key: config.api_key.clone(),
 
-            public_base_url:
-                config.public_base_url.clone(),
+            public_base_url: config.public_base_url.clone(),
         }
     }
 }

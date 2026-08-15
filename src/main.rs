@@ -11,10 +11,7 @@ use state::AppState;
 
 use std::error::Error;
 
-use tokio::{
-    fs,
-    net::TcpListener,
-};
+use tokio::{fs, net::TcpListener};
 
 /// Application entry point.
 ///
@@ -41,18 +38,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let app = router::build_router(state);
 
-    let listener =
-        TcpListener::bind(&config.bind_address).await?;
+    let listener = TcpListener::bind(&config.bind_address).await?;
 
-    println!(
-        "Image service listening on {}",
-        config.bind_address
-    );
+    println!("Image service listening on {}", config.bind_address);
 
-    println!(
-        "Image storage directory: {}",
-        config.image_root.display()
-    );
+    println!("Image storage directory: {}", config.image_root.display());
 
     axum::serve(listener, app).await?;
 

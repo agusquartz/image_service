@@ -1,10 +1,7 @@
 use axum::{
-    http::StatusCode,
-    response::{
-        IntoResponse,
-        Response,
-    },
     Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 
 use serde::Serialize;
@@ -45,71 +42,38 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) =
-            match self {
-                Self::BadRequest(message) => (
-                    StatusCode::BAD_REQUEST,
-                    message,
-                ),
+        let (status, message) = match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
 
-                Self::Unauthorized => (
-                    StatusCode::UNAUTHORIZED,
-                    "Unauthorized".to_string(),
-                ),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
 
-                Self::NotFound(message) => (
-                    StatusCode::NOT_FOUND,
-                    message,
-                ),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
 
-                Self::UnsupportedMediaType(message) => (
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    message,
-                ),
+            Self::UnsupportedMediaType(message) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, message),
 
-                Self::PayloadTooLarge(message) => (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    message,
-                ),
+            Self::PayloadTooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message),
 
-                Self::UnprocessableEntity(message) => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    message,
-                ),
+            Self::UnprocessableEntity(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
 
-                Self::Io(detail) => {
-                    eprintln!(
-                        "Filesystem error: {detail}"
-                    );
+            Self::Io(detail) => {
+                eprintln!("Filesystem error: {detail}");
 
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal storage error"
-                            .to_string(),
-                    )
-                }
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal storage error".to_string(),
+                )
+            }
 
-                Self::Internal(detail) => {
-                    eprintln!(
-                        "Internal error: {detail}"
-                    );
+            Self::Internal(detail) => {
+                eprintln!("Internal error: {detail}");
 
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal server error"
-                            .to_string(),
-                    )
-                }
-            };
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            }
+        };
 
-        (
-            status,
-            Json(
-                ErrorResponse {
-                    error: message,
-                }
-            ),
-        )
-            .into_response()
+        (status, Json(ErrorResponse { error: message })).into_response()
     }
 }

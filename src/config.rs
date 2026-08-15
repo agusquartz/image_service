@@ -1,27 +1,20 @@
-use std::{
-    env,
-    io,
-    path::PathBuf,
-};
+use std::{env, io, path::PathBuf};
 
 /// Maximum HTTP request size.
 ///
 /// This is slightly larger than [`MAX_SOURCE_BYTES`] to leave enough
 /// room for multipart headers and boundaries.
-pub const MAX_REQUEST_BYTES: usize =
-    16 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum accepted source image size.
 ///
 /// Images larger than this value are rejected before processing.
-pub const MAX_SOURCE_BYTES: usize =
-    15 * 1024 * 1024;
+pub const MAX_SOURCE_BYTES: usize = 15 * 1024 * 1024;
 
 /// Maximum encoded output size.
 ///
 /// Every successfully processed image must fit within this limit.
-pub const MAX_OUTPUT_BYTES: usize =
-    400 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 400 * 1024;
 
 /// Minimum valid image slot.
 pub const MIN_SLOT: u8 = 1;
@@ -35,15 +28,7 @@ pub const MAX_SLOT: u8 = 5;
 ///
 /// The encoder starts with the highest quality and progressively
 /// lowers it until the result fits within [`MAX_OUTPUT_BYTES`].
-pub const WEBP_QUALITIES: [f32; 7] = [
-    88.0,
-    80.0,
-    72.0,
-    64.0,
-    56.0,
-    48.0,
-    42.0,
-];
+pub const WEBP_QUALITIES: [f32; 7] = [88.0, 80.0, 72.0, 64.0, 56.0, 48.0, 42.0];
 
 /// Scale applied after all WebP quality levels have been exhausted.
 ///
@@ -64,8 +49,7 @@ pub const MIN_LONGEST_SIDE: u32 = 512;
 pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
 
 /// Maximum memory allocation allowed by the image decoder.
-pub const MAX_DECODE_ALLOC: u64 =
-    256 * 1024 * 1024;
+pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// Runtime application configuration.
 ///
@@ -107,51 +91,31 @@ impl AppConfig {
     /// - `IMAGE_API_KEY`
     /// - `IMAGE_PUBLIC_BASE_URL`
     pub fn from_env() -> io::Result<Self> {
-        let bind_address =
-            env::var("IMAGE_BIND")
-                .unwrap_or_else(|_| {
-                    "127.0.0.1:3000".to_string()
-                });
+        let bind_address = env::var("IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
-        let image_root =
-            if let Some(custom_path) =
-                env::var_os("IMAGE_SERVICE_DIR")
-            {
-                PathBuf::from(custom_path)
-            } else {
-                dirs::data_local_dir()
-                    .ok_or_else(|| {
-                        io::Error::other(
-                            "Could not determine the local data directory",
-                        )
-                    })?
-                    .join("image-service")
-                    .join("images")
-            };
+        let image_root = if let Some(custom_path) = env::var_os("IMAGE_SERVICE_DIR") {
+            PathBuf::from(custom_path)
+        } else {
+            dirs::data_local_dir()
+                .ok_or_else(|| io::Error::other("Could not determine the local data directory"))?
+                .join("image-service")
+                .join("images")
+        };
 
-        let max_concurrency =
-            env::var("IMAGE_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|value| {
-                    value.parse::<usize>().ok()
-                })
-                .filter(|value| *value > 0)
-                .unwrap_or(2);
+        let max_concurrency = env::var("IMAGE_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2);
 
-        let api_key =
-            env::var("IMAGE_API_KEY")
-                .ok()
-                .filter(|value| !value.is_empty());
+        let api_key = env::var("IMAGE_API_KEY")
+            .ok()
+            .filter(|value| !value.is_empty());
 
-        let public_base_url =
-            env::var("IMAGE_PUBLIC_BASE_URL")
-                .ok()
-                .map(|value| {
-                    value
-                        .trim_end_matches('/')
-                        .to_string()
-                })
-                .filter(|value| !value.is_empty());
+        let public_base_url = env::var("IMAGE_PUBLIC_BASE_URL")
+            .ok()
+            .map(|value| value.trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
 
         Ok(Self {
             bind_address,

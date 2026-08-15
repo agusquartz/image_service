@@ -1,10 +1,6 @@
 use crate::error::ApiError;
 
-use super::validation::{
-    validate_namespace,
-    validate_resource_id,
-    validate_slot,
-};
+use super::validation::{validate_namespace, validate_resource_id, validate_slot};
 
 /// Identifies one image belonging to an application resource.
 ///
@@ -29,18 +25,10 @@ impl ImageKey {
     ///
     /// Validation at construction time prevents invalid identifiers
     /// from reaching storage or image services.
-    pub fn new(
-        namespace: String,
-        resource_id: String,
-        slot: u8,
-    ) -> Result<Self, ApiError> {
-        validate_namespace(
-            &namespace
-        )?;
+    pub fn new(namespace: String, resource_id: String, slot: u8) -> Result<Self, ApiError> {
+        validate_namespace(&namespace)?;
 
-        validate_resource_id(
-            &resource_id
-        )?;
+        validate_resource_id(&resource_id)?;
 
         validate_slot(slot)?;
 

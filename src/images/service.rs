@@ -1,14 +1,8 @@
-use crate::{
-    error::ApiError,
-    state::AppState,
-};
+use crate::{error::ApiError, state::AppState};
 
 use super::{
     dtos::UploadResponse,
-    model::{
-        ImageKey,
-        IncomingImage,
-    },
+    model::{ImageKey, IncomingImage},
     reduction::reduce_to_webp,
 };
 
@@ -23,71 +17,39 @@ pub(crate) async fn upload(
     key: &ImageKey,
     incoming: IncomingImage,
 ) -> Result<UploadResponse, ApiError> {
-    let webp =
-        reduce_to_webp(
-            state.image_jobs.clone(),
-            incoming,
-        )
-        .await?;
+    let webp = reduce_to_webp(state.image_jobs.clone(), incoming).await?;
 
-    state
-        .store
-        .write(
-            key,
-            &webp,
-        )
-        .await?;
+    state.store.write(key, &webp).await?;
 
-    let relative =
-        relative_image_url(key);
+    let relative = relative_image_url(key);
 
-    let url =
-        public_image_url(
-            state,
-            &relative,
-        );
+    let url = public_image_url(state, &relative);
 
-    Ok(
-        UploadResponse {
-            namespace:
-                key.namespace.clone(),
+    Ok(UploadResponse {
+        namespace: key.namespace.clone(),
 
-            resource_id:
-                key.resource_id.clone(),
+        resource_id: key.resource_id.clone(),
 
-            slot:
-                key.slot,
+        slot: key.slot,
 
-            url,
+        url,
 
-            size_bytes:
-                webp.len(),
-        }
-    )
+        size_bytes: webp.len(),
+    })
 }
 
 /// Retrieves a stored image.
 ///
 /// Validation has already occurred when constructing [`ImageKey`].
-pub(crate) async fn fetch(
-    state: &AppState,
-    key: &ImageKey,
-) -> Result<Vec<u8>, ApiError> {
-    state
-        .store
-        .read(key)
-        .await
+pub(crate) async fn fetch(state: &AppState, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
+    state.store.read(key).await
 }
 
 /// Builds the API-relative URL for an image.
-fn relative_image_url(
-    key: &ImageKey,
-) -> String {
+fn relative_image_url(key: &ImageKey) -> String {
     format!(
         "/api/images/{}/{}/{}",
-        key.namespace,
-        key.resource_id,
-        key.slot,
+        key.namespace, key.resource_id, key.slot,
     )
 }
 
@@ -111,19 +73,12 @@ fn relative_image_url(
 /// ```text
 /// https://images.example.com/api/images/products/123/1
 /// ```
-fn public_image_url(
-    state: &AppState,
-    relative: &str,
-) -> String {
+fn public_image_url(state: &AppState, relative: &str) -> String {
     match &state.public_base_url {
         Some(base) => {
-            format!(
-                "{base}{relative}"
-            )
+            format!("{base}{relative}")
         }
 
-        None => {
-            relative.to_string()
-        }
+        None => relative.to_string(),
     }
 }

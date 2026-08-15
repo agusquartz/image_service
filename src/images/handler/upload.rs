@@ -1,24 +1,13 @@
-use crate::{
-    auth::require_write_auth,
-    error::ApiError,
-    state::AppState,
-};
+use crate::{auth::require_write_auth, error::ApiError, state::AppState};
 
 use axum::{
-    extract::{
-        Multipart,
-        Path,
-        State,
-    },
-    http::HeaderMap,
     Json,
+    extract::{Multipart, Path, State},
+    http::HeaderMap,
 };
 
 use super::super::{
-    dtos::UploadResponse,
-    model::ImageKey,
-    multipart::read_multipart_image,
-    service,
+    dtos::UploadResponse, model::ImageKey, multipart::read_multipart_image, service,
 };
 
 /// Uploads or replaces an image.
@@ -60,11 +49,7 @@ use super::super::{
 pub(crate) async fn upload_image(
     State(state): State<AppState>,
 
-    Path((
-        namespace,
-        resource_id,
-        slot,
-    )): Path<(String, String, u8)>,
+    Path((namespace, resource_id, slot)): Path<(String, String, u8)>,
 
     headers: HeaderMap,
 
@@ -72,35 +57,15 @@ pub(crate) async fn upload_image(
 ) -> Result<Json<UploadResponse>, ApiError> {
     // Authorization happens before expensive image parsing and
     // processing.
-    require_write_auth(
-        &headers,
-        state.api_key.as_deref(),
-    )?;
+    require_write_auth(&headers, state.api_key.as_deref())?;
 
     // Validate path parameters before consuming and processing a
     // potentially large multipart body.
-    let key =
-        ImageKey::new(
-            namespace,
-            resource_id,
-            slot,
-        )?;
+    let key = ImageKey::new(namespace, resource_id, slot)?;
 
-    let incoming =
-        read_multipart_image(
-            multipart
-        )
-        .await?;
+    let incoming = read_multipart_image(multipart).await?;
 
-    let response =
-        service::upload(
-            &state,
-            &key,
-            incoming,
-        )
-        .await?;
+    let response = service::upload(&state, &key, incoming).await?;
 
-    Ok(
-        Json(response)
-    )
+    Ok(Json(response))
 }
