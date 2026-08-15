@@ -1,4 +1,5 @@
 /target/
+debug
 .env
 .env.*
 !.env.example
