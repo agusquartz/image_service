@@ -1,0 +1,18 @@
+[package]
+name = "image_service"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A fast, configurable image processing and storage service built with Rust and Axum."
+
+[dependencies]
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+
+image = "0.25"
+webp = "0.3"
+
+dirs = "5.0"
+dotenvy = "0.15.7"
+
+serde = { version = "1", features = ["derive"] }
