@@ -11,7 +11,7 @@ use state::AppState;
 
 use std::error::Error;
 
-use tokio::{fs, net::TcpListener};
+use tokio::net::TcpListener;
 
 /// Application entry point.
 ///
@@ -31,10 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = AppConfig::from_env()?;
 
-    // Ensure the root storage directory exists before accepting requests.
-    fs::create_dir_all(&config.image_root).await?;
-
-    let state = AppState::from_config(&config);
+    let state = AppState::from_config(&config)?;
 
     let app = router::build_router(state);
 
@@ -42,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Image service listening on {}", config.bind_address);
 
-    println!("Image storage directory: {}", config.image_root.display());
+    println!("Image storage backend: {}", config.storage.scheme);
 
     axum::serve(listener, app).await?;
 

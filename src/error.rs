@@ -34,7 +34,7 @@ pub enum ApiError {
     ///
     /// The internal detail is logged but is intentionally not sent
     /// directly to the client.
-    Io(String),
+    Storage(String),
 
     /// Unexpected internal application failure.
     Internal(String),
@@ -55,8 +55,8 @@ impl IntoResponse for ApiError {
 
             Self::UnprocessableEntity(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
 
-            Self::Io(detail) => {
-                eprintln!("Filesystem error: {detail}");
+            Self::Storage(detail) => {
+                eprintln!("Storage error: {detail}");
 
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

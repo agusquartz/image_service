@@ -1,128 +1,206 @@
 use crate::error::ApiError;
 
-use atomic_write_file::AtomicWriteFile;
-
-use std::{
-    io::{ErrorKind, Write},
-    path::{Path, PathBuf},
-};
-
-use tokio::fs;
+use opendal::{ErrorKind, Operator};
 
 use super::model::ImageKey;
 
-/// Filesystem-backed image storage.
+/// The actual storage implementation is provided by OpenDAL.
 ///
-/// The physical layout is:
+/// Currently enabled backends:
 ///
-/// ```text
-/// <root>/
-///     <namespace>/
-///         <resource_id>/
-///             01.webp
-///             02.webp
-///             03.webp
-///             ...
-/// ```
-///
-/// Example:
-///
-/// ```text
-/// ~/.local/share/image-service/images/
-///     products/
-///         845/
-///             01.webp
-///             02.webp
-/// ```
+/// - Local filesystem
+/// - S3 and S3-compatible object storage
 #[derive(Debug, Clone)]
 pub(crate) struct ImageStore {
-    root: PathBuf,
+    operator: Operator,
 }
 
 impl ImageStore {
-    /// Creates a filesystem image store.
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// Creates an image store backed by the provided OpenDAL operator.
+    pub fn new(operator: Operator) -> Self {
+        Self { operator }
     }
 
     /// Stores a processed WebP image.
     ///
-    /// The image is written atomically:
-    ///
-    /// 1. A temporary file is created in the destination directory.
-    /// 2. The complete image is written to that temporary file.
-    /// 3. The temporary file is committed over the destination.
-    ///
-    /// Readers therefore observe either the previous complete image or the
-    /// new complete image, rather than a partially written file.
-    ///
     /// If the requested slot already exists, it is replaced.
     pub async fn write(&self, key: &ImageKey, bytes: &[u8]) -> Result<(), ApiError> {
-        let path = self.image_path(key);
+        let object_key = image_object_key(key);
 
-        let parent = path.parent().ok_or_else(|| {
-            ApiError::Internal("Could not determine image parent directory".to_string())
-        })?;
-
-        fs::create_dir_all(parent)
+        self.operator
+            .write(&object_key, bytes.to_vec())
             .await
-            .map_err(|error| ApiError::Io(error.to_string()))?;
-
-        // AtomicWriteFile performs synchronous filesystem operations.
-        //
-        // Keep them away from Tokio's asynchronous worker threads.
-        //
-        // The processed image is already bounded by MAX_OUTPUT_BYTES, so
-        // copying these bytes into the blocking task is intentionally
-        // small and predictable.
-        let bytes = bytes.to_vec();
-
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let mut file = AtomicWriteFile::open(&path)?;
-
-            file.write_all(&bytes)?;
-
-            // The destination becomes visible only when commit
-            // succeeds.
-            file.commit()?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|error| ApiError::Internal(format!("Atomic image write task failed: {error}")))?
-        .map_err(|error| ApiError::Io(error.to_string()))?;
+            .map_err(|error| ApiError::Storage(error.to_string()))?;
 
         Ok(())
     }
 
     /// Reads a previously stored WebP image.
     pub async fn read(&self, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
-        let path = self.image_path(key);
+        let object_key = image_object_key(key);
 
-        match fs::read(path).await {
-            Ok(bytes) => Ok(bytes),
+        match self.operator.read(&object_key).await {
+            Ok(buffer) => Ok(buffer.to_vec()),
 
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 Err(ApiError::NotFound("Image not found".to_string()))
             }
 
-            Err(error) => Err(ApiError::Io(error.to_string())),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
         }
-    }
-
-    /// Resolves the physical filesystem path corresponding to an image
-    /// identifier.
-    fn image_path(&self, key: &ImageKey) -> PathBuf {
-        physical_image_path(&self.root, key)
     }
 }
 
-/// Builds the physical path for an image.
+/// Builds the backend-independent storage key for an image.
 ///
-/// Keeping this operation centralized prevents handlers and services
-/// from making assumptions about the storage layout.
-fn physical_image_path(root: &Path, key: &ImageKey) -> PathBuf {
-    root.join(&key.namespace)
-        .join(&key.resource_id)
-        .join(format!("{:02}.webp", key.slot))
+/// Example:
+///
+/// `products/845/01.webp`
+fn image_object_key(key: &ImageKey) -> String {
+    format!("{}/{}/{:02}.webp", key.namespace, key.resource_id, key.slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+
+    use tempfile::TempDir;
+
+    /// Creates an isolated filesystem-backed OpenDAL image store.
+    ///
+    /// Each test gets its own temporary directory, so tests do not
+    /// modify the user's real image storage.
+    fn test_store() -> (TempDir, ImageStore) {
+        let temp_dir = tempfile::tempdir().expect("Could not create temporary directory");
+
+        let root = temp_dir.path().join("images");
+        let atomic_write_dir = temp_dir.path().join("tmp");
+
+        let options = HashMap::from([
+            ("root".to_string(), root.to_string_lossy().into_owned()),
+            (
+                "atomic_write_dir".to_string(),
+                atomic_write_dir.to_string_lossy().into_owned(),
+            ),
+        ]);
+
+        let operator =
+            Operator::via_iter("fs", options).expect("Could not create filesystem operator");
+
+        (temp_dir, ImageStore::new(operator))
+    }
+
+    fn test_key(slot: u8) -> ImageKey {
+        ImageKey::new("products".to_string(), "845".to_string(), slot)
+            .expect("Test image key should be valid")
+    }
+
+    #[test]
+    fn builds_backend_independent_object_key() {
+        let key = test_key(1);
+
+        let object_key = image_object_key(&key);
+
+        assert_eq!(object_key, "products/845/01.webp");
+    }
+
+    #[test]
+    fn formats_slots_with_two_digits() {
+        let key = test_key(5);
+
+        let object_key = image_object_key(&key);
+
+        assert_eq!(object_key, "products/845/05.webp");
+    }
+
+    #[tokio::test]
+    async fn writes_and_reads_image() {
+        let (_temp_dir, store) = test_store();
+
+        let key = test_key(1);
+
+        let expected = b"processed webp bytes";
+
+        store
+            .write(&key, expected)
+            .await
+            .expect("Image write should succeed");
+
+        let actual = store.read(&key).await.expect("Image read should succeed");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn replaces_existing_image_in_same_slot() {
+        let (_temp_dir, store) = test_store();
+
+        let key = test_key(1);
+
+        store
+            .write(&key, b"first image")
+            .await
+            .expect("Initial image write should succeed");
+
+        store
+            .write(&key, b"replacement image")
+            .await
+            .expect("Replacement image write should succeed");
+
+        let actual = store.read(&key).await.expect("Image read should succeed");
+
+        assert_eq!(actual, b"replacement image");
+    }
+
+    #[tokio::test]
+    async fn returns_not_found_for_missing_image() {
+        let (_temp_dir, store) = test_store();
+
+        let key = test_key(1);
+
+        let result = store.read(&key).await;
+
+        match result {
+            Err(ApiError::NotFound(message)) => {
+                assert_eq!(message, "Image not found");
+            }
+
+            Err(other) => {
+                panic!("Expected NotFound error, got: {other:?}");
+            }
+
+            Ok(_) => {
+                panic!("Expected missing image to return NotFound");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_image_using_expected_filesystem_layout() {
+        let (temp_dir, store) = test_store();
+
+        let key = test_key(1);
+
+        let expected = b"processed webp bytes";
+
+        store
+            .write(&key, expected)
+            .await
+            .expect("Image write should succeed");
+
+        let physical_path = temp_dir
+            .path()
+            .join("images")
+            .join("products")
+            .join("845")
+            .join("01.webp");
+
+        let actual = tokio::fs::read(physical_path)
+            .await
+            .expect("Stored image should exist on filesystem");
+
+        assert_eq!(actual, expected);
+    }
 }
