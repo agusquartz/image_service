@@ -48,3 +48,4 @@ serde = {
     version = "1",
     features = ["derive"],
 }
+opendal = { version = "0.57", features = ["services-fs", "services-s3"] }
