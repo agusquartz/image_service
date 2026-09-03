@@ -63,11 +63,17 @@ Uploaded files are constrained by several independent checks:
 
 The real image format is detected from file bytes rather than trusting the filename alone.
 
-## Path Safety
+## Storage Key Safety
 
-`namespace`, `resource_id`, and `slot` are validated before building filesystem paths.
+`namespace`, `resource_id`, and `slot` are validated before building storage object keys.
 
-Path separators and arbitrary filesystem characters are rejected. This prevents user-controlled route values from being used directly as unrestricted filesystem paths.
+Path separators and arbitrary storage-key characters are rejected.
+
+This prevents user-controlled route values from changing the intended
+storage hierarchy or escaping into unintended object-key namespaces.
+
+The same validation applies regardless of whether the configured backend
+is a local filesystem or S3-compatible object storage.
 
 See [Configuration](configuration.md) for the exact validation rules.
 

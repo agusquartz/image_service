@@ -73,7 +73,7 @@ Responsibilities:
 - Convert application results into HTTP responses.
 - Set response headers.
 
-The HTTP layer should not implement image compression or filesystem operations directly.
+The HTTP layer should not implement image compression or storage backend operations directly.
 
 ### Application / Service Layer
 
@@ -115,7 +115,7 @@ Responsibilities:
 - Move CPU-heavy work away from the async executor.
 - Respect the image-processing concurrency limit.
 
-This layer has no knowledge of HTTP routes, namespaces, storage paths, or Axum.
+This layer has no knowledge of HTTP routes, namespaces, storage backends, or Axum.
 
 Conceptually:
 
@@ -148,13 +148,16 @@ images/store.rs
 
 Responsibilities:
 
-- Convert an `ImageKey` into a physical path.
-- Create required directories.
-- Write image bytes.
-- Read image bytes.
-- Translate filesystem errors into application errors.
+- Convert ImageKey into a backend-independent object key.
+- Read image bytes through OpenDAL.
+- Write image bytes through OpenDAL.
+- Translate storage backend errors into application errors.
 
-The current backend is local storage.
+Example object key:
+
+```text
+products/845/01.webp
+```
 
 No compression logic belongs in this layer.
 
@@ -171,7 +174,7 @@ Responsibilities:
 
 - Load environment variables.
 - Define processing limits.
-- Configure storage location.
+- Configure the storage backend and backend-specific options.
 - Configure authentication.
 - Configure concurrency.
 - Configure the public base URL.
@@ -217,8 +220,8 @@ Reduction Layer
   v
 Storage Layer
   |
-  +----> Create directories
-  +----> Write .webp file
+  +----> Build backend-independent object key
+  +----> Write through OpenDAL
   |
   v
 UploadResponse
@@ -305,7 +308,7 @@ The project intentionally follows a few architectural rules.
 
 Handlers should deal primarily with HTTP concerns.
 
-They should not contain WebP algorithms, filesystem layout logic, or complex business behavior.
+They should not contain WebP algorithms, storage backend logic, or complex business behavior.
 
 ### Processing is transport-independent
 
@@ -334,7 +337,9 @@ The rest of the application should not care whether those bytes ultimately live 
 - Azure Blob Storage.
 - Google Cloud Storage.
 
-The current implementation only provides local storage, but the boundary is already present.
+The current implementation provides filesystem and S3/S3-compatible
+storage through OpenDAL. Additional backends can be introduced without
+changing the application service or HTTP layers.
 
 ### Configuration belongs in one place
 
