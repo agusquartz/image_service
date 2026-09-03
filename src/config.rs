@@ -1,4 +1,4 @@
-use std::{env, io, path::PathBuf};
+use std::{collections::HashMap, env, io, path::PathBuf};
 
 /// Maximum HTTP request size.
 ///
@@ -51,17 +51,30 @@ pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
 /// Maximum memory allocation allowed by the image decoder.
 pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
+#[derive(Clone)]
+pub struct StorageConfig {
+    /// OpenDAL storage scheme.
+    ///
+    /// Examples:
+    ///
+    /// - fs
+    /// - s3
+    pub scheme: String,
+
+    /// Backend-specific OpenDAL configuration.
+    pub options: HashMap<String, String>,
+}
+
 /// Runtime application configuration.
 ///
 /// Environment-specific values live here instead of being scattered
 /// through handlers or services.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppConfig {
     /// HTTP address on which the image service will listen.
     pub bind_address: String,
 
-    /// Physical directory used to persist processed images.
-    pub image_root: PathBuf,
+    pub storage: StorageConfig,
 
     /// Maximum number of CPU-intensive image processing jobs allowed
     /// to execute concurrently.
@@ -86,21 +99,50 @@ impl AppConfig {
     /// Supported variables:
     ///
     /// - `IMAGE_BIND`
-    /// - `IMAGE_SERVICE_DIR`
+    /// - `IMAGE_STORAGE_SCHEME`
+    /// - `IMAGE_STORAGE_*` backend-specific options
     /// - `IMAGE_MAX_CONCURRENCY`
     /// - `IMAGE_API_KEY`
     /// - `IMAGE_PUBLIC_BASE_URL`
     pub fn from_env() -> io::Result<Self> {
         let bind_address = env::var("IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
-        let image_root = if let Some(custom_path) = env::var_os("IMAGE_SERVICE_DIR") {
-            PathBuf::from(custom_path)
-        } else {
-            dirs::data_local_dir()
+        let storage_scheme = env::var("IMAGE_STORAGE_SCHEME").unwrap_or_else(|_| "fs".to_string());
+
+        let mut storage_options = HashMap::new();
+
+        for (key, value) in env::vars() {
+            let Some(option) = key.strip_prefix("IMAGE_STORAGE_") else {
+                continue;
+            };
+
+            if option == "SCHEME" || value.is_empty() {
+                continue;
+            }
+
+            storage_options.insert(option.to_ascii_lowercase(), value);
+        }
+
+        if storage_scheme == "fs" && !storage_options.contains_key("root") {
+            let root = dirs::data_local_dir()
                 .ok_or_else(|| io::Error::other("Could not determine the local data directory"))?
                 .join("image-service")
-                .join("images")
-        };
+                .join("images");
+
+            storage_options.insert("root".to_string(), root.to_string_lossy().into_owned());
+        }
+
+        if storage_scheme == "fs"
+            && !storage_options.contains_key("atomic_write_dir")
+            && let Some(root) = storage_options.get("root")
+        {
+            let atomic_write_dir = PathBuf::from(root).join(".tmp");
+
+            storage_options.insert(
+                "atomic_write_dir".to_string(),
+                atomic_write_dir.to_string_lossy().into_owned(),
+            );
+        }
 
         let max_concurrency = env::var("IMAGE_MAX_CONCURRENCY")
             .ok()
@@ -117,9 +159,14 @@ impl AppConfig {
             .map(|value| value.trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
 
+        let storage = StorageConfig {
+            scheme: storage_scheme,
+            options: storage_options,
+        };
+
         Ok(Self {
             bind_address,
-            image_root,
+            storage,
             max_concurrency,
             api_key,
             public_base_url,

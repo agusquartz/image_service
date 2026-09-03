@@ -8,7 +8,7 @@
 
 Image Service accepts uploaded images, validates and decodes them with defensive limits, converts them to WebP, progressively reduces quality and dimensions to satisfy the configured output-size target, and stores the processed image for later retrieval.
 
-The current implementation uses local filesystem storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so the service can evolve toward configurable processing policies and multiple storage backends.
+Storage is provided through OpenDAL. The currently compiled backends are local filesystem and S3/S3-compatible object storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so the service can evolve toward configurable processing policies and multiple storage backends.
 
 ## Why Image Service?
 
@@ -31,7 +31,7 @@ Image Service
 Optimized image
 ```
 
-This keeps image-specific infrastructure outside the consuming application while leaving room for future storage and processing backends.
+This keeps image-specific infrastructure outside the consuming application while leaving room for future storage and processing capabilities.
 
 ## Features
 
@@ -48,7 +48,9 @@ This keeps image-specific infrastructure outside the consuming application while
 - Limited concurrent image-processing jobs.
 - Resource-based image organization.
 - Up to five image slots per resource.
-- Local filesystem persistence.
+- Local filesystem persistence through OpenDAL.
+- S3 and S3-compatible object storage.
+- Runtime-selectable storage backend.
 - Optional public base URL generation.
 - JSON error responses.
 - Lightweight health endpoint.
@@ -113,7 +115,8 @@ The current runtime configuration includes:
 
 ```text
 IMAGE_BIND
-IMAGE_SERVICE_DIR
+IMAGE_STORAGE_SCHEME
+IMAGE_STORAGE_*
 IMAGE_MAX_CONCURRENCY
 IMAGE_API_KEY
 IMAGE_PUBLIC_BASE_URL
@@ -130,14 +133,13 @@ See [Configuration](docs/configuration.md).
 - [HTTP API](docs/api.md) — endpoints, responses, headers, status codes, and examples.
 - [Client Examples](docs/clients.md) — cURL, JavaScript Fetch, Java, Python, and Rust.
 - [Security](docs/security.md) — current safeguards, trust boundaries, and production security considerations.
-- [Deployment](docs/deployment.md) — running from source, release builds, filesystem locations, and deployment guidance.
-- [Roadmap](ROADMAP.md) — planned storage backends, processing profiles, configuration, observability, and future architecture.
+- [Deployment](docs/deployment.md) — running from source, release builds, storage configuration, and production deployment guidance.
+- [Roadmap](ROADMAP.md) — storage evolution, processing profiles, configuration, observability, and future architecture.
 
 ## Roadmap
 
 The long-term goal is to make deployment-specific behavior configurable without changing application code, including:
 
-- Local and S3-compatible storage backends.
 - Runtime-configurable image policies.
 - Additional output formats.
 - Processing profiles.

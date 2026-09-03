@@ -2,7 +2,7 @@
 
 [← Back to README](README.md)
 
-Image Service is intentionally small today. The long-term goal is to make deployment-specific behavior configurable while preserving a stable core pipeline:
+Image Service is intentionally small. The long-term goal is to make deployment-specific behavior configurable while preserving a stable core pipeline:
 
 ```text
 HTTP
@@ -15,121 +15,118 @@ Application Service
   +----> Storage
 ```
 
-The items below are planned directions, not promises that the functionality is already implemented.
-
-## Future Features
-
-The current implementation is intentionally small.
-
-The long-term direction is to make the service **completely configurable**, including storage, image policy, security, caching, URL generation, and processing behavior.
-
-The items below describe planned architectural directions, not currently implemented features.
+The project should remain simple where possible. New abstractions should be introduced only when they solve a real deployment or application requirement.
 
 ---
 
-### Pluggable Storage Backends
+## Current Capabilities
 
-The current:
-
-```text
-images/store.rs
-```
-
-can evolve into:
+The current implementation includes:
 
 ```text
-images/
-    store/
-        mod.rs
-        local.rs
-        s3.rs
-        minio.rs
-        r2.rs
+HTTP upload                    yes
+HTTP fetch                     yes
+
+Local filesystem storage       yes
+S3 storage                     yes
+S3-compatible storage          yes
+
+OpenDAL storage abstraction    yes
+Runtime-selectable storage     yes
+Atomic filesystem writes       yes
+
+WebP reduction                 yes
+Optional API key               yes
+
+Delete endpoint                no
+Database                       no
+Processing profiles            no
+Runtime processing policy      partial
 ```
 
-A common interface could look conceptually like:
+S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
 
-```rust
-trait ImageStore {
-    async fn write(
-        &self,
-        key: &ImageKey,
-        bytes: &[u8],
-    ) -> Result<(), StoreError>;
+Storage is implemented through OpenDAL.
 
-    async fn read(
-        &self,
-        key: &ImageKey,
-    ) -> Result<Vec<u8>, StoreError>;
-
-    async fn delete(
-        &self,
-        key: &ImageKey,
-    ) -> Result<(), StoreError>;
-}
-```
-
-Configuration could then select the backend:
-
-```dotenv
-IMAGE_STORAGE_BACKEND=local
-```
-
-or:
-
-```dotenv
-IMAGE_STORAGE_BACKEND=s3
-```
-
-#### Local backend
-
-Possible configuration:
-
-```dotenv
-IMAGE_STORAGE_BACKEND=local
-IMAGE_SERVICE_DIR=/var/lib/image-service/images
-```
-
-Implementation:
+The application uses backend-independent image object keys such as:
 
 ```text
-store/local.rs
+products/845/01.webp
 ```
 
-#### S3 backend
+The configured OpenDAL operator determines where those bytes are physically stored.
 
-Possible configuration:
-
-```dotenv
-IMAGE_STORAGE_BACKEND=s3
-
-IMAGE_S3_BUCKET=my-images
-IMAGE_S3_REGION=us-east-1
-IMAGE_S3_PREFIX=images/
-```
-
-Implementation:
+Conceptually:
 
 ```text
-store/s3.rs
+Image Service
+     |
+     v
+ ImageStore
+     |
+     v
+OpenDAL Operator
+     |
+     +----> Filesystem
+     |
+     +----> S3 / S3-compatible storage
 ```
 
-Authentication should preferably use the cloud provider's standard credential chain rather than custom credential parsing where possible.
+This means the HTTP, processing, and application layers do not need to know whether image bytes live on local disk, Amazon S3, or another compatible object store.
 
-#### MinIO backend
+---
 
-Possible configuration:
+## Future Features
 
-```dotenv
-IMAGE_STORAGE_BACKEND=minio
+The long-term direction is to make the service increasingly configurable, including image policy, security, caching, URL generation, processing behavior, storage operations, and observability.
 
-IMAGE_S3_ENDPOINT=http://minio:9000
-IMAGE_S3_BUCKET=images
-IMAGE_S3_REGION=us-east-1
-IMAGE_S3_FORCE_PATH_STYLE=true
+The items below describe planned architectural directions rather than functionality that should be assumed to exist today.
+
+---
+
+### Storage Evolution
+
+Filesystem and S3-compatible storage are already supported through OpenDAL.
+
+Future storage work should therefore focus on capabilities around the abstraction rather than implementing separate storage modules for every provider.
+
+Possible future improvements include:
+
+- Additional OpenDAL storage services when required.
+- Storage migration tooling.
+- Storage validation commands.
+- Per-namespace storage policies.
+- Storage observability.
+- Storage quotas.
+- Object prefixes.
+- Storage lifecycle integration.
+- Credential-management improvements.
+
+The current storage path should remain conceptually simple:
+
+```text
+ImageKey
+   |
+   v
+backend-independent object key
+   |
+   v
+ImageStore
+   |
+   v
+OpenDAL
 ```
 
-Because MinIO is S3-compatible, the S3 implementation may eventually support both rather than requiring a completely independent backend.
+Provider-specific implementations such as:
+
+```text
+local.rs
+s3.rs
+minio.rs
+r2.rs
+```
+
+should not be introduced unless OpenDAL cannot provide a required capability.
 
 ---
 
@@ -257,9 +254,9 @@ A future endpoint could support:
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 ```
 
-with optional logical deletion where required by the consuming application.
+The storage layer could delegate deletion to OpenDAL independently of the selected backend.
 
-The storage interface would then expose a delete operation independently of the selected backend.
+Logical deletion could be introduced separately if ownership, auditing, or retention requirements eventually require metadata persistence.
 
 ---
 
@@ -277,6 +274,8 @@ These could:
 - List existing slots.
 - Return image metadata.
 - Remove every image belonging to a resource.
+
+Any listing behavior should account for differences between filesystem and object-storage semantics while keeping those differences outside the HTTP and application layers.
 
 ---
 
@@ -300,7 +299,7 @@ Metadata storage should remain independent of image-byte storage.
 
 Possible implementations include:
 
-- Sidecar JSON files.
+- Sidecar JSON objects.
 - SQL database.
 - Key-value database.
 - Object-store metadata.
@@ -374,6 +373,7 @@ Possible namespace-specific configuration:
 - Processing profile.
 - Public/private read access.
 - Storage backend.
+- Storage prefix.
 - Retention rules.
 
 ---
@@ -407,6 +407,7 @@ Planned operational improvements may include:
 - Processing-duration metrics.
 - Compression-ratio metrics.
 - Storage latency.
+- Storage backend labels.
 - Failure counters.
 - OpenTelemetry.
 - Distributed tracing.
@@ -421,6 +422,7 @@ image_source_bytes
 image_output_bytes
 image_resize_rounds
 image_store_duration_seconds
+image_store_failed_total
 ```
 
 ---
@@ -440,7 +442,7 @@ Future deployments may need configurable limits for:
 
 ### Background Processing
 
-The current API processes the image synchronously before returning success.
+The current API processes images synchronously before returning success.
 
 A future optional mode could support queued processing:
 
@@ -448,7 +450,7 @@ A future optional mode could support queued processing:
 POST upload
     |
     v
-object storage
+source storage
     |
     v
 queue
@@ -460,13 +462,15 @@ worker
 processed derivative
 ```
 
-This could be useful for very large workloads while preserving the current synchronous mode for simpler deployments.
+This could be useful for large workloads while preserving the current synchronous mode for simpler deployments.
 
 ---
 
 ### Direct-to-Object-Storage Uploads
 
-For S3-compatible backends, a future architecture may support presigned uploads:
+Because S3-compatible storage is already supported, a future architecture could allow clients to upload source files directly to object storage through presigned URLs.
+
+Conceptually:
 
 ```text
 Client
@@ -475,18 +479,20 @@ Client
   |
   <----+ Presigned URL
   |
-  +----> S3 / MinIO directly
+  +----> Object storage directly
 ```
 
 A worker or callback could then process the source image.
 
-This avoids routing very large source files through the application server.
+This would avoid routing large source uploads through the application server.
+
+The current implementation does not provide presigned upload flows.
 
 ---
 
 ### Database Integration
 
-The image service currently does not require a database.
+Image Service currently does not require a database.
 
 A future optional database layer could support:
 
@@ -499,7 +505,7 @@ A future optional database layer could support:
 - Reference counting.
 - Expiration policies.
 
-The image binary itself should still preferably live in an object store or filesystem rather than a relational database unless a deployment has a specific reason to do otherwise.
+Image binaries should normally continue to live in object storage or filesystem storage rather than a relational database unless a deployment has a specific reason to do otherwise.
 
 ---
 
@@ -525,24 +531,36 @@ An alternative storage strategy could use hashes:
 ab/cd/abcdef....webp
 ```
 
-instead of resource-based paths.
+instead of resource-based object keys.
 
 The application layer could then map resource slots to content hashes.
+
+This would be a different logical storage strategy while still remaining compatible with the OpenDAL storage abstraction.
 
 ---
 
 ### Storage Migration
 
-Once multiple storage backends exist, migration tools could support:
+Because multiple storage backends now exist, migration tooling is a realistic future feature.
+
+Possible migrations include:
 
 ```text
-local -> S3
-S3 -> local
+filesystem -> S3
+S3 -> filesystem
 MinIO -> S3
+S3 -> R2
 bucket A -> bucket B
 ```
 
-without changing application-facing image URLs.
+A migration tool should preserve logical object keys so application-facing image URLs do not need to change.
+
+Possible commands could eventually include:
+
+```bash
+image-service migrate-storage
+image-service verify-storage
+```
 
 ---
 
@@ -561,9 +579,9 @@ Example direction:
 bind = "0.0.0.0:3000"
 
 [storage]
-backend = "s3"
+scheme = "s3"
 
-[storage.s3]
+[storage.options]
 bucket = "images"
 region = "us-east-1"
 
@@ -609,6 +627,7 @@ Other commands could include:
 image-service serve
 image-service validate-config
 image-service migrate-storage
+image-service verify-storage
 image-service inspect
 ```
 
@@ -628,12 +647,14 @@ Server
 └── request limits
 
 Storage
-├── backend
+├── scheme
 ├── path / bucket
 ├── region
 ├── endpoint
 ├── prefix
-└── credentials strategy
+├── credentials strategy
+├── migration behavior
+└── per-namespace policy
 
 Processing
 ├── source limits
@@ -676,11 +697,12 @@ Application Service
   +----> Processing
   |
   +----> Storage
+               |
+               v
+            OpenDAL
 ```
 
-while making the concrete implementations and policies configurable.
-
----
+while making deployment-specific behavior configurable.
 
 ---
 
@@ -718,35 +740,58 @@ src/
     │   ├── webp.rs
     │   └── resize.rs
     │
-    └── store/
-        ├── mod.rs
-        ├── local.rs
-        ├── s3.rs
-        └── minio.rs
+    └── store.rs
 ```
 
-This structure should only be introduced as complexity actually requires it. The current flatter design is intentionally simpler.
-
----
-
----
-
-## Current Status
-
-Current:
+If storage construction becomes sufficiently complex, a dedicated infrastructure module could be introduced:
 
 ```text
-HTTP upload        yes
-HTTP fetch         yes
-Local storage      yes
-WebP reduction     yes
-Optional API key   yes
-S3 storage         no
-MinIO storage      no
-Delete endpoint    no
-Database           no
-Processing profiles no
-Runtime-configurable processing policy partial
+src/
+├── storage.rs
 ```
 
-The architecture is intended to allow those capabilities to be added without collapsing HTTP, processing, and storage concerns into the same modules.
+or:
+
+```text
+src/
+├── storage/
+│   └── mod.rs
+```
+
+That module could construct and configure OpenDAL operators while `images/store.rs` remains concerned only with image object keys and image storage operations.
+
+Provider-specific modules should not be introduced unless they are actually necessary.
+
+---
+
+## Architectural Direction
+
+The current architecture already provides the storage boundary that the original roadmap anticipated.
+
+Future work should preserve this separation:
+
+```text
+HTTP
+  |
+  v
+Application Service
+  |
+  +----> Processing
+  |
+  +----> ImageStore
+             |
+             v
+          OpenDAL
+```
+
+Handlers should remain unaware of storage providers.
+
+Image processing should remain independent of storage.
+
+`ImageStore` should remain concerned with logical image storage rather than provider-specific infrastructure details.
+
+OpenDAL should absorb backend differences wherever possible.
+
+This allows storage capabilities to evolve without collapsing HTTP, processing, and infrastructure concerns into the same modules.
+
+---

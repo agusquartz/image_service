@@ -39,8 +39,6 @@ image = {
 
 webp = "0.3"
 
-atomic-write-file = "0.3"
-
 dirs = "5.0"
 dotenvy = "0.15.7"
 
@@ -48,3 +46,7 @@ serde = {
     version = "1",
     features = ["derive"],
 }
+opendal = { version = "0.57", features = ["services-fs", "services-s3"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -29,13 +29,19 @@ The corresponding API URL is:
 /api/images/products/845/2
 ```
 
-With the local filesystem backend, the image is stored as:
+The corresponding backend-independent storage key is:
+
+```text
+products/845/02.webp
+```
+
+With the filesystem backend, this resolves to:
 
 ```text
 <image-root>/products/845/02.webp
 ```
 
----
+With S3 storage, `products/845/02.webp` is used as the object key.
 
 ---
 
@@ -136,9 +142,7 @@ Common HTTP statuses include:
 500 Internal Server Error
 ```
 
-Internal filesystem or application details are not returned directly to clients.
-
----
+Internal storage-backend or application details are not returned directly to clients.
 
 ---
 
