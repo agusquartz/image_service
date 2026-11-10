@@ -31,11 +31,14 @@ src/
     │
     ├── dtos/
     │   ├── mod.rs
+    │   ├── image_list_response.rs
     │   └── upload_response.rs
     │
     └── handler/
         ├── mod.rs
+        ├── delete.rs
         ├── fetch.rs
+        ├── list.rs
         └── upload.rs
 ```
 
@@ -69,7 +72,7 @@ Responsibilities:
 - Extract path parameters.
 - Read request headers.
 - Parse multipart requests.
-- Perform write authorization.
+- Perform write authorization and optional read authorization.
 - Convert application results into HTTP responses.
 - Set response headers.
 
@@ -86,7 +89,7 @@ images/service.rs
 Responsibilities:
 
 - Coordinate the image upload use case.
-- Coordinate image retrieval.
+- Coordinate image retrieval, deletion, metadata stat, and resource listing.
 - Call the reduction layer.
 - Call the storage layer.
 - Build the final public image URL.
@@ -151,6 +154,8 @@ Responsibilities:
 - Convert ImageKey into a backend-independent object key.
 - Read image bytes through OpenDAL.
 - Write image bytes through OpenDAL.
+- Delete image objects through OpenDAL.
+- Read object metadata with `stat` and list slots under a resource prefix.
 - Translate storage backend errors into application errors.
 
 Example object key:
@@ -295,6 +300,16 @@ The response includes:
 Content-Type: image/webp
 X-Content-Type-Options: nosniff
 ```
+
+## Delete, HEAD, and Resource Listing
+
+These operations use the same validated `ImageKey` and OpenDAL-backed storage boundary:
+
+- `DELETE /api/images/{namespace}/{resource_id}/{slot}` uses write authorization when `IMAGE_API_KEY` is configured and treats a missing object as a successful idempotent delete.
+- `HEAD /api/images/{namespace}/{resource_id}/{slot}` calls `stat` to return content type and length without reading image bytes.
+- `GET /api/images/{namespace}/{resource_id}` lists valid `NN.webp` slots under the resource prefix and returns them in ascending order.
+
+Image reads are public by default. `GETMETHOD_AUTH=true` applies bearer authentication to GET, HEAD, and resource listing; the flag requires `IMAGE_API_KEY`.
 
 ---
 

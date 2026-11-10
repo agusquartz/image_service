@@ -535,11 +535,15 @@ When configured, upload requests must contain:
 Authorization: Bearer <IMAGE_API_KEY>
 ```
 
-GET image requests remain public in the current implementation.
+Image reads (`GET`, `HEAD`, and resource listing) remain public unless `GETMETHOD_AUTH=true`.
 
 If no API key is configured, uploads are accepted without authentication.
 
 Production deployments should make this choice deliberately.
+
+### `GETMETHOD_AUTH`
+
+When set to `true`, require `Authorization: Bearer <IMAGE_API_KEY>` for image GET, HEAD, and resource-list requests. It defaults to `false` for backwards compatibility. Startup fails if it is enabled without `IMAGE_API_KEY`.
 
 ### `IMAGE_PUBLIC_BASE_URL`
 
