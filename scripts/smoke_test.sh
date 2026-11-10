@@ -64,6 +64,17 @@ expect_status() {
     fi
 }
 
+expect_read_status() {
+    local expected="$1"
+    local output_file="$2"
+    shift 2
+    if [[ "$auth_mode" == "true" ]]; then
+        expect_status "$expected" "$output_file" "$@" -H "Authorization: Bearer $api_key"
+    else
+        expect_status "$expected" "$output_file" "$@"
+    fi
+}
+
 start_service() {
     local auth_mode="$1"
     local -a args=(
@@ -106,11 +117,6 @@ stop_service() {
 
 test_mode() {
     local auth_mode="$1"
-    local headers=()
-    if [[ "$auth_mode" == "true" ]]; then
-        headers=(-H "Authorization: Bearer $api_key")
-    fi
-
     start_service "$auth_mode"
     local resource="smoke-${auth_mode}"
     local route="$base_url/api/images/products/$resource"
@@ -128,12 +134,12 @@ test_mode() {
         expect_status 401 "$tmp_dir/unauthorized-list" "$route"
     fi
 
-    expect_status 200 "$tmp_dir/get" "${headers[@]}" "$image_route"
+    expect_read_status 200 "$tmp_dir/get" "$image_route"
     [[ -s "$tmp_dir/get" ]] || fail "GET returned an empty image body in $auth_mode mode"
-    expect_status 200 "$tmp_dir/head" --head "${headers[@]}" "$image_route"
+    expect_read_status 200 "$tmp_dir/head" --head "$image_route"
     grep -qi '^Content-Type: image/webp' "$tmp_dir/head" || fail "HEAD did not return image/webp"
     grep -qi '^Content-Length: [1-9][0-9]*' "$tmp_dir/head" || fail "HEAD did not return a positive Content-Length"
-    expect_status 200 "$tmp_dir/list" "${headers[@]}" "$route"
+    expect_read_status 200 "$tmp_dir/list" "$route"
     python3 - "$tmp_dir/list" <<'PY'
 import json
 import sys
@@ -147,8 +153,8 @@ PY
     expect_status 401 "$tmp_dir/unauthorized-delete" --request DELETE "$image_route"
     expect_status 204 "$tmp_dir/delete" --request DELETE -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 204 "$tmp_dir/delete-again" --request DELETE -H "Authorization: Bearer $api_key" "$image_route"
-    expect_status 404 "$tmp_dir/get-after-delete" "${headers[@]}" "$image_route"
-    expect_status 200 "$tmp_dir/empty-list" "${headers[@]}" "$route"
+    expect_read_status 404 "$tmp_dir/get-after-delete" "$image_route"
+    expect_read_status 200 "$tmp_dir/empty-list" "$route"
     python3 - "$tmp_dir/empty-list" <<'PY'
 import json
 import sys
