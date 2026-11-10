@@ -26,6 +26,9 @@ The current implementation includes:
 ```text
 HTTP upload                    yes
 HTTP fetch                     yes
+HTTP HEAD                      yes
+HTTP resource listing          yes
+HTTP image deletion            yes
 
 Local filesystem storage       yes
 S3 storage                     yes
@@ -37,8 +40,9 @@ Atomic filesystem writes       yes
 
 WebP reduction                 yes
 Optional API key               yes
+Optional read authentication   yes
 
-Delete endpoint                no
+Delete endpoint                yes
 Database                       no
 Processing profiles            no
 Runtime processing policy      partial
@@ -248,7 +252,26 @@ Possible processing capabilities include:
 
 ### Delete Operations
 
-A future endpoint could support:
+Implemented:
+
+```text
+DELETE /api/images/{namespace}/{resource_id}/{slot}
+```
+
+The operation uses the OpenDAL-backed `ImageStore`, requires write authentication when `IMAGE_API_KEY` is configured, and returns `204 No Content` for both existing and missing slots.
+
+### Resource Listing and HEAD
+
+Implemented APIs:
+
+```text
+GET  /api/images/{namespace}/{resource_id}
+HEAD /api/images/{namespace}/{resource_id}/{slot}
+```
+
+Resource listing returns existing WebP slots in ascending order. HEAD uses storage `stat` and returns content type and length without reading image bytes.
+
+Further resource operations could support:
 
 ```text
 DELETE /api/images/{namespace}/{resource_id}/{slot}
@@ -330,6 +353,8 @@ Other planned options may include:
 ### Configurable Authentication
 
 The current write authentication model is a single optional bearer token.
+
+Read authentication is implemented through `GETMETHOD_AUTH`. It is disabled by default to preserve existing public image URLs; when enabled, GET, HEAD, and resource listing require the configured `IMAGE_API_KEY`.
 
 Possible future strategies:
 

@@ -1,7 +1,7 @@
 use crate::{error::ApiError, state::AppState};
 
 use super::{
-    dtos::UploadResponse,
+    dtos::{ImageListResponse, ImageSummary, UploadResponse},
     model::{ImageKey, IncomingImage},
     reduction::reduce_to_webp,
 };
@@ -43,6 +43,42 @@ pub(crate) async fn upload(
 /// Validation has already occurred when constructing [`ImageKey`].
 pub(crate) async fn fetch(state: &AppState, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
     state.store.read(key).await
+}
+
+pub(crate) async fn delete(state: &AppState, key: &ImageKey) -> Result<(), ApiError> {
+    state.store.delete(key).await
+}
+
+pub(crate) async fn stat(state: &AppState, key: &ImageKey) -> Result<u64, ApiError> {
+    state.store.stat(key).await
+}
+
+pub(crate) async fn list_resource(
+    state: &AppState,
+    namespace: String,
+    resource_id: String,
+) -> Result<ImageListResponse, ApiError> {
+    let stored = state.store.list_resource(&namespace, &resource_id).await?;
+    let images = stored
+        .into_iter()
+        .map(|image| ImageSummary {
+            slot: image.slot,
+            url: public_image_url(
+                state,
+                &relative_image_url_for(&namespace, &resource_id, image.slot),
+            ),
+        })
+        .collect();
+
+    Ok(ImageListResponse {
+        namespace,
+        resource_id,
+        images,
+    })
+}
+
+fn relative_image_url_for(namespace: &str, resource_id: &str, slot: u8) -> String {
+    format!("/api/images/{namespace}/{resource_id}/{slot}")
 }
 
 /// Builds the API-relative URL for an image.

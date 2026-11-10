@@ -1,7 +1,7 @@
 use crate::{
     config::MAX_REQUEST_BYTES,
     health::health,
-    images::handler::{fetch_image, upload_image},
+    images::handler::{delete_image, fetch_image, head_image, list_images, upload_image},
     state::AppState,
 };
 
@@ -16,13 +16,20 @@ use axum::{Router, extract::DefaultBodyLimit, routing::get};
 ///
 /// GET  /api/images/{namespace}/{resource_id}/{slot}
 /// POST /api/images/{namespace}/{resource_id}/{slot}
+/// HEAD /api/images/{namespace}/{resource_id}/{slot}
+/// DELETE /api/images/{namespace}/{resource_id}/{slot}
+/// GET  /api/images/{namespace}/{resource_id}
 /// ```
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/images/{namespace}/{resource_id}", get(list_images))
         .route(
             "/api/images/{namespace}/{resource_id}/{slot}",
-            get(fetch_image).post(upload_image),
+            get(fetch_image)
+                .head(head_image)
+                .post(upload_image)
+                .delete(delete_image),
         )
         // Multipart parsing is still constrained by Axum's body limit.
         //

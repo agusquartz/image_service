@@ -14,38 +14,16 @@ readme = "README.md"
 
 
 [dependencies]
-axum = {
-    version = "0.8",
-    features = ["multipart"],
-}
-
-tokio = {
-    version = "1",
-    features = ["full"],
-}
-
-image = {
-    version = "0.25",
-    default-features = false,
-    features = [
-        "jpeg",
-        "png",
-        "webp",
-        "gif",
-        "bmp",
-        "tiff",
-    ],
-}
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 
 webp = "0.3"
 
 dirs = "5.0"
 dotenvy = "0.15.7"
 
-serde = {
-    version = "1",
-    features = ["derive"],
-}
+serde = { version = "1", features = ["derive"] }
 opendal = { version = "0.57", features = ["services-fs", "services-s3"] }
 
 [dev-dependencies]

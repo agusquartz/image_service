@@ -37,7 +37,9 @@ This keeps image-specific infrastructure outside the consuming application while
 
 - Multipart image uploads.
 - Public image retrieval over HTTP.
+- Resource image listing, HEAD metadata checks, and idempotent deletion.
 - Optional bearer-token protection for write operations.
+- Optional bearer-token protection for reads, disabled by default for backwards compatibility.
 - Source MIME validation against the detected file format.
 - JPEG, PNG, WebP, GIF, BMP, and TIFF input.
 - WebP output.
@@ -75,7 +77,10 @@ If `IMAGE_API_KEY` is configured, add:
 GET  /health
 
 GET  /api/images/{namespace}/{resource_id}/{slot}
+HEAD /api/images/{namespace}/{resource_id}/{slot}
 POST /api/images/{namespace}/{resource_id}/{slot}
+DELETE /api/images/{namespace}/{resource_id}/{slot}
+GET  /api/images/{namespace}/{resource_id}
 ```
 
 Example:
@@ -119,6 +124,7 @@ IMAGE_STORAGE_SCHEME
 IMAGE_STORAGE_*
 IMAGE_MAX_CONCURRENCY
 IMAGE_API_KEY
+GETMETHOD_AUTH
 IMAGE_PUBLIC_BASE_URL
 ```
 

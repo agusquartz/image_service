@@ -220,6 +220,16 @@ This is particularly important when processing large source images because sever
 
 Storage operations are handled asynchronously through OpenDAL and are independent of the image-processing semaphore.
 
+## Authentication
+
+`IMAGE_API_KEY` optionally protects write operations (`POST` and `DELETE`). When configured, clients send:
+
+```http
+Authorization: Bearer <IMAGE_API_KEY>
+```
+
+Image reads remain public by default for compatibility with existing clients. Set `GETMETHOD_AUTH=true` to also require the same bearer token for `GET`, `HEAD`, and resource listing. `GETMETHOD_AUTH` defaults to `false`; startup fails if it is enabled without `IMAGE_API_KEY`.
+
 ---
 
 ## Runtime Configuration
@@ -525,11 +535,15 @@ When configured, upload requests must contain:
 Authorization: Bearer <IMAGE_API_KEY>
 ```
 
-GET image requests remain public in the current implementation.
+Image reads (`GET`, `HEAD`, and resource listing) remain public unless `GETMETHOD_AUTH=true`.
 
 If no API key is configured, uploads are accepted without authentication.
 
 Production deployments should make this choice deliberately.
+
+### `GETMETHOD_AUTH`
+
+When set to `true`, require `Authorization: Bearer <IMAGE_API_KEY>` for image GET, HEAD, and resource-list requests. It defaults to `false` for backwards compatibility. Startup fails if it is enabled without `IMAGE_API_KEY`.
 
 ### `IMAGE_PUBLIC_BASE_URL`
 

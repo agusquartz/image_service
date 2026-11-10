@@ -4,6 +4,12 @@ use opendal::{ErrorKind, Operator};
 
 use super::model::ImageKey;
 
+/// One image slot discovered while listing a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredImage {
+    pub slot: u8,
+}
+
 /// The actual storage implementation is provided by OpenDAL.
 ///
 /// Currently enabled backends:
@@ -48,6 +54,65 @@ impl ImageStore {
 
             Err(error) => Err(ApiError::Storage(error.to_string())),
         }
+    }
+
+    /// Deletes an image. Missing objects are treated as successful deletion.
+    pub async fn delete(&self, key: &ImageKey) -> Result<(), ApiError> {
+        match self.operator.delete(&image_object_key(key)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
+    /// Returns the stored WebP length, or not-found when the slot is absent.
+    pub async fn stat(&self, key: &ImageKey) -> Result<u64, ApiError> {
+        self.operator
+            .stat(&image_object_key(key))
+            .await
+            .map(|metadata| metadata.content_length())
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    ApiError::NotFound("Image not found".to_string())
+                } else {
+                    ApiError::Storage(error.to_string())
+                }
+            })
+    }
+
+    /// Lists valid image slots stored under a namespace/resource prefix.
+    pub async fn list_resource(
+        &self,
+        namespace: &str,
+        resource_id: &str,
+    ) -> Result<Vec<StoredImage>, ApiError> {
+        let prefix = format!("{namespace}/{resource_id}/");
+        let entries = match self.operator.list(&prefix).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ApiError::Storage(error.to_string())),
+        };
+
+        let mut images = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let filename = path.strip_prefix(&prefix)?;
+                let slot_text = filename.strip_suffix(".webp")?;
+                if slot_text.len() != 2 {
+                    return None;
+                }
+                let slot = slot_text.parse::<u8>().ok()?;
+                if !(1..=5).contains(&slot) {
+                    return None;
+                }
+                Some(StoredImage { slot })
+            })
+            .collect::<Vec<_>>();
+
+        images.sort_by_key(|image| image.slot);
+        images.dedup_by_key(|image| image.slot);
+        Ok(images)
     }
 }
 

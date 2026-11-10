@@ -31,3 +31,17 @@ pub fn require_write_auth(headers: &HeaderMap, api_key: Option<&str>) -> Result<
 
     Ok(())
 }
+
+/// Verifies authorization for read operations when read authentication
+/// is enabled. Reads remain public by default for compatibility.
+pub fn require_read_auth(
+    headers: &HeaderMap,
+    enabled: bool,
+    api_key: Option<&str>,
+) -> Result<(), ApiError> {
+    if !enabled {
+        return Ok(());
+    }
+
+    require_write_auth(headers, api_key)
+}

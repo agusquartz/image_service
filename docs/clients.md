@@ -14,6 +14,8 @@ Image:       ./photo.jpg
 
 If API authentication is disabled, remove the `Authorization` header from upload examples.
 
+Image reads are public by default. If `GETMETHOD_AUTH=true`, send `Authorization: Bearer <IMAGE_API_KEY>` with GET, HEAD, and resource-list requests. Direct HTML `<img>` URLs cannot attach this bearer header; keep reads public for that use case or fetch through JavaScript and attach the header.
+
 ---
 
 ## cURL
@@ -56,6 +58,28 @@ Inspect the headers:
 curl \
   -I \
   "http://127.0.0.1:3000/api/images/products/845/1"
+```
+
+### List, check, and delete images
+
+List image slots for a resource:
+
+```bash
+curl "http://127.0.0.1:3000/api/images/products/845"
+```
+
+Check a slot without downloading its body:
+
+```bash
+curl -I "http://127.0.0.1:3000/api/images/products/845/1"
+```
+
+Delete a slot (include the bearer header when `IMAGE_API_KEY` is configured):
+
+```bash
+curl -X DELETE \
+  "http://127.0.0.1:3000/api/images/products/845/1" \
+  -H "Authorization: Bearer change-me"
 ```
 
 ---

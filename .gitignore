@@ -4,6 +4,9 @@ debug
 .env.*
 !.env.example
 
+# Local smoke-test fixture; never commit the test image.
+TEST_IMAGE_ORIGINAL.png
+
 *.log
 .DS_Store
 Thumbs.db

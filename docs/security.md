@@ -18,6 +18,7 @@ The service includes several defensive measures:
 - Bounded image-processing concurrency.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Optional bearer-token protection for writes.
+- Optional bearer-token protection for image reads.
 
 A production deployment should additionally consider:
 
@@ -47,7 +48,7 @@ Authorization: Bearer <IMAGE_API_KEY>
 
 If no API key is configured, write operations are currently allowed without authentication. Production deployments should make this choice deliberately and should not expose unauthenticated upload endpoints unintentionally.
 
-GET image requests are currently public.
+Image reads (`GET`, `HEAD`, and resource listing) are public by default to preserve existing integrations. Set `GETMETHOD_AUTH=true` to require the same bearer token for these endpoints. This setting requires `IMAGE_API_KEY`; the service rejects that configuration at startup if the key is missing. `/health` is not protected by this setting.
 
 ## Upload Validation Boundary
 

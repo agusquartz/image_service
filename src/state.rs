@@ -15,6 +15,8 @@ pub struct AppState {
 
     pub api_key: Option<String>,
 
+    pub getmethod_auth: bool,
+
     pub public_base_url: Option<String>,
 }
 
@@ -29,6 +31,8 @@ impl AppState {
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
 
             api_key: config.api_key.clone(),
+
+            getmethod_auth: config.getmethod_auth,
 
             public_base_url: config.public_base_url.clone(),
         })

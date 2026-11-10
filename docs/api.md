@@ -12,7 +12,10 @@ The service exposes the following endpoints:
 GET  /health
 
 GET  /api/images/{namespace}/{resource_id}/{slot}
+HEAD /api/images/{namespace}/{resource_id}/{slot}
 POST /api/images/{namespace}/{resource_id}/{slot}
+DELETE /api/images/{namespace}/{resource_id}/{slot}
+GET  /api/images/{namespace}/{resource_id}
 ```
 
 Example image identifier:
@@ -98,7 +101,44 @@ Content-Type: image/webp
 X-Content-Type-Options: nosniff
 ```
 
-The current GET endpoint is public.
+Reads are public by default for backwards compatibility. Set `GETMETHOD_AUTH=true` to require the configured `IMAGE_API_KEY` bearer token for GET, HEAD, and resource listing.
+
+---
+
+## List Images for a Resource
+
+```text
+GET /api/images/{namespace}/{resource_id}
+```
+
+Returns the existing WebP slots in ascending order. An empty resource returns `200 OK` with an empty `images` array.
+
+```json
+{
+  "namespace": "products",
+  "resource_id": "845",
+  "images": [
+    { "slot": 1, "url": "/api/images/products/845/1" },
+    { "slot": 2, "url": "/api/images/products/845/2" }
+  ]
+}
+```
+
+## Check an Image
+
+```text
+HEAD /api/images/{namespace}/{resource_id}/{slot}
+```
+
+Returns `200 OK`, `Content-Type: image/webp`, and `Content-Length` when the image exists. The response has no body. Missing images return `404 Not Found`.
+
+## Delete an Image
+
+```text
+DELETE /api/images/{namespace}/{resource_id}/{slot}
+```
+
+If write authentication is enabled, include `Authorization: Bearer <IMAGE_API_KEY>`. Deleting an existing or missing slot returns `204 No Content`, making the operation idempotent.
 
 ---
 
