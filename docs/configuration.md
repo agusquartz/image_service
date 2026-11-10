@@ -220,6 +220,16 @@ This is particularly important when processing large source images because sever
 
 Storage operations are handled asynchronously through OpenDAL and are independent of the image-processing semaphore.
 
+## Authentication
+
+`IMAGE_API_KEY` optionally protects write operations (`POST` and `DELETE`). When configured, clients send:
+
+```http
+Authorization: Bearer <IMAGE_API_KEY>
+```
+
+Image reads remain public by default for compatibility with existing clients. Set `GETMETHOD_AUTH=true` to also require the same bearer token for `GET`, `HEAD`, and resource listing. `GETMETHOD_AUTH` defaults to `false`; startup fails if it is enabled without `IMAGE_API_KEY`.
+
 ---
 
 ## Runtime Configuration

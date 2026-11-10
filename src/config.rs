@@ -83,6 +83,11 @@ pub struct AppConfig {
     /// Optional bearer token required for write operations.
     pub api_key: Option<String>,
 
+    /// Whether image reads require the configured bearer token.
+    ///
+    /// Defaults to `false` to preserve the existing public GET behavior.
+    pub getmethod_auth: bool,
+
     /// Optional externally visible base URL.
     ///
     /// Example:
@@ -103,6 +108,7 @@ impl AppConfig {
     /// - `IMAGE_STORAGE_*` backend-specific options
     /// - `IMAGE_MAX_CONCURRENCY`
     /// - `IMAGE_API_KEY`
+    /// - `GETMETHOD_AUTH`
     /// - `IMAGE_PUBLIC_BASE_URL`
     pub fn from_env() -> io::Result<Self> {
         let bind_address = env::var("IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
@@ -154,6 +160,18 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.is_empty());
 
+        let getmethod_auth = env::var("GETMETHOD_AUTH")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        if getmethod_auth && api_key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GETMETHOD_AUTH=true requires IMAGE_API_KEY to be configured",
+            ));
+        }
+
         let public_base_url = env::var("IMAGE_PUBLIC_BASE_URL")
             .ok()
             .map(|value| value.trim_end_matches('/').to_string())
@@ -169,6 +187,7 @@ impl AppConfig {
             storage,
             max_concurrency,
             api_key,
+            getmethod_auth,
             public_base_url,
         })
     }
