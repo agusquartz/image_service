@@ -102,6 +102,38 @@ target/release/
 
 The repository should commit `Cargo.lock`, and automated builds should use `--locked` so dependency resolution cannot silently change during CI or deployment.
 
+## Distroless Docker Image
+
+Build the multi-stage image:
+
+```bash
+docker build -t image-service:local .
+```
+
+The runtime stage uses Distroless and runs as its non-root user. The HTTP server must bind to `0.0.0.0` inside the container:
+
+```bash
+docker run --rm --read-only \
+  --publish 127.0.0.1:3000:3000 \
+  --tmpfs /tmp/image-storage:rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755 \
+  --env IMAGE_BIND=0.0.0.0:3000 \
+  --env IMAGE_STORAGE_SCHEME=fs \
+  --env IMAGE_STORAGE_ROOT=/tmp/image-storage \
+  --env IMAGE_STORAGE_ATOMIC_WRITE_DIR=/tmp/image-storage/.tmp \
+  image-service:local
+```
+
+This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
+
+The local endpoint smoke test exercises the default public-read behavior, explicit `GETMETHOD_AUTH=false`, protected reads with `GETMETHOD_AUTH=true`, upload, GET, HEAD, list, DELETE, and invalid auth configuration. It needs Docker, `curl`, Python 3, and a local test image:
+
+```bash
+docker build -t image-service:local .
+bash scripts/smoke_test.sh image-service:local ./TEST_IMAGE_ORIGINAL.png
+```
+
+The image file is a local fixture and is excluded from Git and the Docker build context. Pass another local PNG/JPEG path as the script's second argument when needed.
+
 ---
 
 ## Storage
