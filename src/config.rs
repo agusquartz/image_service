@@ -42,6 +42,58 @@ pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 /// Maximum presigned URL lifetime supported by the S3 API.
 pub const MAX_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Default read requests permitted per rate-limit window and client.
+pub const DEFAULT_READ_RATE_LIMIT_REQUESTS: u32 = 600;
+
+/// Default write requests permitted per rate-limit window and client.
+pub const DEFAULT_WRITE_RATE_LIMIT_REQUESTS: u32 = 60;
+
+/// Default rate-limit window length in seconds.
+pub const DEFAULT_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRequirement {
+    Required,
+    None,
+}
+
+impl AuthRequirement {
+    fn parse(name: &str, default: Self) -> io::Result<Self> {
+        match env::var(name) {
+            Ok(value) => Self::parse_value(name, &value),
+            Err(env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Could not read {name}: {error}"),
+            )),
+        }
+    }
+
+    fn parse_value(name: &str, value: &str) -> io::Result<Self> {
+        if value.eq_ignore_ascii_case("required") {
+            Ok(Self::Required)
+        } else if value.eq_ignore_ascii_case("none") {
+            Ok(Self::None)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be either 'required' or 'none'"),
+            ))
+        }
+    }
+
+    pub fn is_required(self) -> bool {
+        self == Self::Required
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitConfig {
+    pub read_requests: u32,
+    pub write_requests: u32,
+    pub window_seconds: u64,
+}
+
 #[derive(Clone)]
 pub struct StorageConfig {
     /// OpenDAL storage scheme.
@@ -114,13 +166,23 @@ pub struct AppConfig {
     /// Maximum valid image slot for each resource.
     pub max_slots: u8,
 
-    /// Optional bearer token required for write operations.
+    /// Bearer token used by authentication policies.
     pub api_key: Option<String>,
 
-    /// Whether image reads require the configured bearer token.
-    ///
-    /// Defaults to `false` to preserve the existing public GET behavior.
-    pub getmethod_auth: bool,
+    /// Whether read operations require the configured bearer token.
+    pub read_auth: AuthRequirement,
+
+    /// Whether write operations require the configured bearer token.
+    pub write_auth: AuthRequirement,
+
+    /// Read and write request budgets per client and rate-limit window.
+    pub rate_limit: RateLimitConfig,
+
+    /// Whether to expose the Prometheus metrics endpoint.
+    pub metrics_enabled: bool,
+
+    /// Whether requests to the Prometheus metrics endpoint require the API key.
+    pub metrics_auth: bool,
 
     /// Lifetime for presigned image-read URLs.
     pub presign_ttl_seconds: u64,
@@ -155,7 +217,12 @@ impl AppConfig {
     /// - `IMAGE_NAMESPACE_PROFILES` (JSON object)
     /// - `IMAGE_MAX_SLOTS`
     /// - `IMAGE_API_KEY`
-    /// - `GETMETHOD_AUTH`
+    /// - `IMAGE_READ_AUTH`
+    /// - `IMAGE_WRITE_AUTH`
+    /// - `IMAGE_RATE_LIMIT_READ_REQUESTS`
+    /// - `IMAGE_RATE_LIMIT_WRITE_REQUESTS`
+    /// - `IMAGE_RATE_LIMIT_WINDOW_SECONDS`
+    /// - `IMAGE_METRICS_ENABLED`
     /// - `IMAGE_PRESIGN_TTL_SECONDS`
     /// - `IMAGE_CACHE_CONTROL`
     /// - `IMAGE_CACHE_TTL_SECONDS`
@@ -245,19 +312,49 @@ impl AppConfig {
 
         let api_key = env::var("IMAGE_API_KEY")
             .ok()
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.trim().is_empty());
 
-        let getmethod_auth = env::var("GETMETHOD_AUTH")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        if getmethod_auth && api_key.is_none() {
+        if env::var_os("GETMETHOD_AUTH").is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GETMETHOD_AUTH=true requires IMAGE_API_KEY to be configured",
+                "GETMETHOD_AUTH has been removed; use IMAGE_READ_AUTH and IMAGE_WRITE_AUTH",
             ));
         }
+
+        let read_auth = AuthRequirement::parse("IMAGE_READ_AUTH", AuthRequirement::Required)?;
+        let write_auth = AuthRequirement::parse("IMAGE_WRITE_AUTH", AuthRequirement::Required)?;
+
+        if (read_auth.is_required() || write_auth.is_required()) && api_key.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IMAGE_API_KEY is required when IMAGE_READ_AUTH or IMAGE_WRITE_AUTH is 'required'",
+            ));
+        }
+
+        let rate_limit = RateLimitConfig {
+            read_requests: parse_bounded_u32(
+                "IMAGE_RATE_LIMIT_READ_REQUESTS",
+                DEFAULT_READ_RATE_LIMIT_REQUESTS,
+                0,
+                u32::MAX,
+            )?,
+            write_requests: parse_bounded_u32(
+                "IMAGE_RATE_LIMIT_WRITE_REQUESTS",
+                DEFAULT_WRITE_RATE_LIMIT_REQUESTS,
+                0,
+                u32::MAX,
+            )?,
+            window_seconds: parse_bounded_u64(
+                "IMAGE_RATE_LIMIT_WINDOW_SECONDS",
+                DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+                1,
+                86_400,
+            )?,
+        };
+
+        let metrics_enabled = parse_bool_env("IMAGE_METRICS_ENABLED", false)?;
+        let metrics_auth = parse_bool_env("IMAGE_METRICS_AUTH", true)?;
+        validate_metrics_auth(metrics_enabled, metrics_auth, api_key.as_deref())?;
 
         let presign_ttl_seconds = env::var("IMAGE_PRESIGN_TTL_SECONDS")
             .ok()
@@ -301,7 +398,11 @@ impl AppConfig {
             if cache_ttl_seconds == 0 {
                 "no-store".to_string()
             } else {
-                let visibility = if getmethod_auth { "private" } else { "public" };
+                let visibility = if read_auth.is_required() {
+                    "private"
+                } else {
+                    "public"
+                };
                 format!("{visibility}, max-age={cache_ttl_seconds}")
             }
         });
@@ -335,7 +436,11 @@ impl AppConfig {
             namespace_profiles,
             max_slots,
             api_key,
-            getmethod_auth,
+            read_auth,
+            write_auth,
+            rate_limit,
+            metrics_enabled,
+            metrics_auth,
             presign_ttl_seconds,
             cache_control,
             public_base_url,
@@ -529,9 +634,98 @@ fn parse_bounded_u32(name: &str, default: u32, min: u32, max: u32) -> io::Result
     Ok(value)
 }
 
+fn parse_bounded_u64(name: &str, default: u64, min: u64, max: u64) -> io::Result<u64> {
+    let value = env::var(name)
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer: {error}"),
+            )
+        })?
+        .unwrap_or(default);
+    if !(min..=max).contains(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be between {min} and {max}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_bool_env(name: &str, default: bool) -> io::Result<bool> {
+    match env::var(name) {
+        Ok(value) => parse_bool_value(name, Some(&value), default),
+        Err(env::VarError::NotPresent) => parse_bool_value(name, None, default),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Could not read {name}: {error}"),
+        )),
+    }
+}
+
+fn parse_bool_value(name: &str, value: Option<&str>, default: bool) -> io::Result<bool> {
+    match value {
+        Some(value) => value.parse::<bool>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be 'true' or 'false': {error}"),
+            )
+        }),
+        None => Ok(default),
+    }
+}
+
+fn validate_metrics_auth(
+    metrics_enabled: bool,
+    metrics_auth: bool,
+    api_key: Option<&str>,
+) -> io::Result<()> {
+    if metrics_enabled && metrics_auth && api_key.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IMAGE_METRICS_ENABLED=true with IMAGE_METRICS_AUTH=true requires IMAGE_API_KEY to be configured",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_policies_accept_required_and_explicit_none() {
+        assert_eq!(
+            AuthRequirement::parse_value("IMAGE_READ_AUTH", "required").unwrap(),
+            AuthRequirement::Required
+        );
+        assert_eq!(
+            AuthRequirement::parse_value("IMAGE_WRITE_AUTH", "none").unwrap(),
+            AuthRequirement::None
+        );
+        assert!(AuthRequirement::parse_value("IMAGE_READ_AUTH", "public").is_err());
+        assert!(AuthRequirement::Required.is_required());
+        assert!(!AuthRequirement::None.is_required());
+    }
+
+    #[test]
+    fn production_rate_limit_defaults_are_independent_and_bounded() {
+        assert_eq!(DEFAULT_READ_RATE_LIMIT_REQUESTS, 600);
+        assert_eq!(DEFAULT_WRITE_RATE_LIMIT_REQUESTS, 60);
+        assert_eq!(DEFAULT_RATE_LIMIT_WINDOW_SECONDS, 60);
+    }
+
+    #[test]
+    fn metrics_auth_defaults_to_required_and_only_requires_key_when_metrics_are_enabled() {
+        assert!(parse_bool_value("IMAGE_METRICS_AUTH", None, true).unwrap());
+        assert!(validate_metrics_auth(true, true, None).is_err());
+        assert!(validate_metrics_auth(false, true, None).is_ok());
+        assert!(validate_metrics_auth(true, false, None).is_ok());
+        assert!(validate_metrics_auth(true, true, Some("secret")).is_ok());
+    }
 
     #[test]
     fn unassigned_namespaces_keep_the_existing_global_processing_policy() {

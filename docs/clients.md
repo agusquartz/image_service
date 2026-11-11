@@ -12,9 +12,9 @@ Slot:        1
 Image:       ./photo.jpg
 ```
 
-If API authentication is disabled, remove the `Authorization` header from upload examples.
+The service requires authentication for reads and writes by default. Use the configured API key in the `Authorization` header for all examples unless the deployment explicitly sets the corresponding `IMAGE_READ_AUTH` or `IMAGE_WRITE_AUTH` policy to `none`.
 
-Image reads are public by default. If `GETMETHOD_AUTH=true`, send `Authorization: Bearer <IMAGE_API_KEY>` with GET, HEAD, and resource-list requests. Direct HTML `<img>` URLs cannot attach this bearer header; keep reads public for that use case or fetch through JavaScript and attach the header.
+Direct HTML `<img>` URLs cannot attach a bearer header. For those, configure `IMAGE_READ_AUTH=none` and keep `IMAGE_WRITE_AUTH=required`, or fetch images through JavaScript and attach the header.
 
 Uploads use the processing profile assigned to their namespace, if any. Clients do not need to change the upload request; namespaces without a profile keep the existing global processing settings. The image-info response reports the namespace's currently assigned profile.
 
@@ -104,7 +104,7 @@ Check a slot without downloading its body:
 curl -I "http://127.0.0.1:3000/api/images/products/845/1"
 ```
 
-Delete a slot (include the bearer header when `IMAGE_API_KEY` is configured):
+Delete a slot (the default write policy requires the bearer header):
 
 ```bash
 curl -X DELETE \
@@ -125,7 +125,7 @@ curl -X POST \
   "http://127.0.0.1:3000/api/images/products/845/1/presign"
 ```
 
-Add the bearer header to the metadata GET or presign POST when `GETMETHOD_AUTH=true`. The returned URL can be used as a normal GET URL until its `expires_in` lifetime ends.
+Add the bearer header to the metadata GET or presign POST unless `IMAGE_READ_AUTH=none`. The returned URL can be used as a normal GET URL until its `expires_in` lifetime ends.
 
 ---
 

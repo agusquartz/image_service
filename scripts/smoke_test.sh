@@ -31,6 +31,8 @@ tmp_dir="$(mktemp -d)"
 container_id=""
 storage_volume=""
 api_key="smoke-test-api-key"
+read_auth_policy="required"
+metrics_auth_required=true
 
 cleanup() {
     if [[ -n "$container_id" ]]; then
@@ -79,7 +81,7 @@ expect_read_status() {
     local expected="$1"
     local output_file="$2"
     shift 2
-    if [[ "$auth_mode" == "true" ]]; then
+    if [[ "$read_auth_policy" == "required" ]]; then
         expect_status "$expected" "$output_file" "$@" -H "Authorization: Bearer $api_key"
     else
         expect_status "$expected" "$output_file" "$@"
@@ -88,6 +90,8 @@ expect_read_status() {
 
 start_service() {
     local auth_mode="$1"
+    read_auth_policy="required"
+    metrics_auth_required=true
     local -a args=(docker run --detach --rm --read-only)
     if [[ "$auth_mode" == "max-slots" ]]; then
         storage_volume="image-service-smoke-$$-$RANDOM"
@@ -105,13 +109,33 @@ start_service() {
         --env IMAGE_STORAGE_SCHEME=fs
         --env IMAGE_STORAGE_ROOT=/tmp/image-storage
         --env IMAGE_STORAGE_ATOMIC_WRITE_DIR=/tmp/image-storage/.tmp
-        --env IMAGE_API_KEY="$api_key"
     )
 
     case "$auth_mode" in
-        default) ;;
-        false) args+=(--env GETMETHOD_AUTH=false --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
-        true) args+=(--env GETMETHOD_AUTH=true --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
+        none)
+            args+=(--env IMAGE_READ_AUTH=none --env IMAGE_WRITE_AUTH=none)
+            read_auth_policy="none"
+            ;;
+        public-read)
+            args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_READ_AUTH=none --env IMAGE_WRITE_AUTH=required --env IMAGE_METRICS_ENABLED=true)
+            read_auth_policy="none"
+            ;;
+        private-read-public-write)
+            args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_READ_AUTH=required --env IMAGE_WRITE_AUTH=none --env IMAGE_METRICS_ENABLED=true)
+            ;;
+        rate-limit)
+            args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_RATE_LIMIT_READ_REQUESTS=4 --env IMAGE_RATE_LIMIT_WRITE_REQUESTS=1 --env IMAGE_RATE_LIMIT_WINDOW_SECONDS=60)
+            ;;
+        metrics-public)
+            args+=(--env IMAGE_READ_AUTH=none --env IMAGE_WRITE_AUTH=none --env IMAGE_METRICS_ENABLED=true --env IMAGE_METRICS_AUTH=false)
+            read_auth_policy="none"
+            metrics_auth_required=false
+            ;;
+        *) args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_METRICS_ENABLED=true) ;;
+    esac
+
+    case "$auth_mode" in
+        default|public-read|private-read-public-write|none|rate-limit|metrics-public) ;;
         dimensions) args+=(--env IMAGE_OUTPUT_WIDTH=64 --env IMAGE_OUTPUT_HEIGHT=64) ;;
         profiles)
             args+=(
@@ -201,6 +225,30 @@ PY
     fi
 
     expect_status 204 "$tmp_dir/health" "$base_url/health"
+    if [[ "$metrics_auth_required" == "true" ]]; then
+        expect_status 401 "$tmp_dir/unauthorized-metrics" "$base_url/metrics"
+        expect_status 200 "$tmp_dir/metrics" -H "Authorization: Bearer $api_key" "$base_url/metrics"
+    else
+        expect_status 200 "$tmp_dir/unauthenticated-metrics" "$base_url/metrics"
+    fi
+    grep -q '^image_service_http_requests_total' "$tmp_dir/metrics" \
+        || fail "metrics endpoint omitted HTTP request counters"
+    curl --silent --dump-header "$tmp_dir/health.headers" --output /dev/null "$base_url/health"
+    local request_id
+    request_id="$(awk 'tolower($1) == "x-request-id:" {gsub(/\r/, ""); print $2; exit}' "$tmp_dir/health.headers")"
+    [[ "$request_id" =~ ^[[:xdigit:]-]{36}$ ]] || fail "health response did not include a UUID request ID"
+    docker logs "$container_id" >"$tmp_dir/structured-logs.jsonl" 2>&1
+    python3 - "$tmp_dir/structured-logs.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as log_file:
+    events = [json.loads(line) for line in log_file if line.strip()]
+requests = [event["fields"] for event in events if event.get("fields", {}).get("message") == "http request completed"]
+assert requests, events
+assert all("request_id" in event and "route" in event and "status" in event for event in requests), requests
+assert all("path" not in event for event in requests), requests
+PY
     expect_status 401 "$tmp_dir/unauthorized-upload" \
         --request POST --form "image=@$image_file" "$image_route"
     expect_status 201 "$tmp_dir/upload" \
@@ -219,7 +267,7 @@ PY
     expect_status 400 "$tmp_dir/put-create-over-slot-limit" \
         --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/$over_limit_slot"
 
-    if [[ "$auth_mode" == "true" ]]; then
+    if [[ "$read_auth_policy" == "required" ]]; then
         expect_status 401 "$tmp_dir/unauthorized-get" "$image_route"
         expect_status 401 "$tmp_dir/unauthorized-head" --head "$image_route"
         expect_status 401 "$tmp_dir/unauthorized-list" "$route"
@@ -228,7 +276,7 @@ PY
     fi
 
     local get_status
-    if [[ "$auth_mode" == "true" ]]; then
+    if [[ "$read_auth_policy" == "required" ]]; then
         get_status="$(request_status_with_headers "$tmp_dir/get" "$tmp_dir/get.headers" -H "Authorization: Bearer $api_key" "$image_route")"
     else
         get_status="$(request_status_with_headers "$tmp_dir/get" "$tmp_dir/get.headers" "$image_route")"
@@ -238,7 +286,7 @@ PY
     grep -qi '^ETag: "[[:xdigit:]]\{64\}"' "$tmp_dir/get.headers" || fail "GET did not return a SHA-256 ETag"
     grep -qi '^Last-Modified: ' "$tmp_dir/get.headers" || fail "GET did not return Last-Modified"
     local expected_cache_control='public, max-age=60'
-    [[ "$auth_mode" == "true" ]] && expected_cache_control='private, max-age=60'
+    [[ "$read_auth_policy" == "required" ]] && expected_cache_control='private, max-age=60'
     grep -qi "^Cache-Control: $expected_cache_control" "$tmp_dir/get.headers" || fail "unexpected default Cache-Control policy"
 
     local etag last_modified
@@ -417,7 +465,7 @@ PY
         local avatar_route="$base_url/api/images/avatars/profile-smoke/1"
         expect_status 201 "$tmp_dir/avatar-profile-upload" \
             --request POST --form "image=@$tmp_dir/tiny.png" -H "Authorization: Bearer $api_key" "$avatar_route"
-        expect_status 200 "$tmp_dir/avatar-profile-info" "$avatar_route/info"
+        expect_status 200 "$tmp_dir/avatar-profile-info" -H "Authorization: Bearer $api_key" "$avatar_route/info"
         python3 - "$tmp_dir/avatar-profile-info" <<'PY'
 import json
 import sys
@@ -434,7 +482,7 @@ PY
         local fallback_route="$base_url/api/images/misc/profile-smoke/1"
         expect_status 201 "$tmp_dir/default-profile-upload" \
             --request POST --form "image=@$tmp_dir/tiny.png" -H "Authorization: Bearer $api_key" "$fallback_route"
-        expect_status 200 "$tmp_dir/default-profile-info" "$fallback_route/info"
+        expect_status 200 "$tmp_dir/default-profile-info" -H "Authorization: Bearer $api_key" "$fallback_route/info"
         python3 - "$tmp_dir/default-profile-info" <<'PY'
 import json
 import sys
@@ -450,22 +498,79 @@ PY
     fi
 
     stop_service
-    echo "PASS: endpoint and auth smoke tests ($auth_mode GETMETHOD_AUTH)"
+    echo "PASS: endpoint and auth smoke tests ($auth_mode authentication policy)"
 }
 
-if docker run --rm --read-only --env GETMETHOD_AUTH=true "$image_name" >"$tmp_dir/invalid-config.log" 2>&1; then
-    fail "GETMETHOD_AUTH=true without IMAGE_API_KEY unexpectedly started"
+if docker run --rm --read-only "$image_name" >"$tmp_dir/missing-api-key.log" 2>&1; then
+    fail "default private read/write policy started without IMAGE_API_KEY"
 fi
-grep -q 'GETMETHOD_AUTH=true requires IMAGE_API_KEY' "$tmp_dir/invalid-config.log" \
-    || fail "invalid auth configuration did not report the expected startup error"
-echo "PASS: invalid auth configuration is rejected"
+grep -q 'IMAGE_API_KEY is required when IMAGE_READ_AUTH or IMAGE_WRITE_AUTH is' "$tmp_dir/missing-api-key.log" \
+    || fail "default auth policy did not report the missing API key"
+echo "PASS: default private read/write policy requires IMAGE_API_KEY"
 
-if docker run --rm --read-only --env IMAGE_PRESIGN_TTL_SECONDS=0 "$image_name" >"$tmp_dir/invalid-ttl.log" 2>&1; then
+for policy_pair in \
+    'IMAGE_READ_AUTH=none IMAGE_WRITE_AUTH=required' \
+    'IMAGE_READ_AUTH=required IMAGE_WRITE_AUTH=none'; do
+    read_policy="${policy_pair%% *}"
+    write_policy="${policy_pair##* }"
+    if docker run --rm --read-only --env "$read_policy" --env "$write_policy" "$image_name" \
+        >"$tmp_dir/missing-key-$read_policy.log" 2>&1; then
+        fail "$policy_pair unexpectedly started without IMAGE_API_KEY"
+    fi
+    grep -q 'IMAGE_API_KEY is required when IMAGE_READ_AUTH or IMAGE_WRITE_AUTH is' "$tmp_dir/missing-key-$read_policy.log" \
+        || fail "$policy_pair did not require IMAGE_API_KEY"
+done
+echo "PASS: each independently protected policy requires IMAGE_API_KEY"
+
+if docker run --rm --read-only --env GETMETHOD_AUTH=false "$image_name" >"$tmp_dir/removed-getmethod-auth.log" 2>&1; then
+    fail "removed GETMETHOD_AUTH was silently accepted"
+fi
+grep -q 'GETMETHOD_AUTH has been removed' "$tmp_dir/removed-getmethod-auth.log" \
+    || fail "removed GETMETHOD_AUTH did not report its replacement settings"
+echo "PASS: removed GETMETHOD_AUTH is rejected with migration guidance"
+
+if docker run --rm --read-only --env IMAGE_API_KEY="$api_key" --env IMAGE_READ_AUTH=invalid "$image_name" >"$tmp_dir/invalid-read-auth.log" 2>&1; then
+    fail "invalid IMAGE_READ_AUTH unexpectedly started"
+fi
+grep -q "IMAGE_READ_AUTH must be either 'required' or 'none'" "$tmp_dir/invalid-read-auth.log" \
+    || fail "invalid IMAGE_READ_AUTH did not report the expected startup error"
+if docker run --rm --read-only --env IMAGE_API_KEY="$api_key" --env IMAGE_WRITE_AUTH=invalid "$image_name" >"$tmp_dir/invalid-write-auth.log" 2>&1; then
+    fail "invalid IMAGE_WRITE_AUTH unexpectedly started"
+fi
+grep -q "IMAGE_WRITE_AUTH must be either 'required' or 'none'" "$tmp_dir/invalid-write-auth.log" \
+    || fail "invalid IMAGE_WRITE_AUTH did not report the expected startup error"
+echo "PASS: invalid read/write auth policies are rejected"
+
+if docker run --rm --read-only --env IMAGE_API_KEY="$api_key" --env IMAGE_PRESIGN_TTL_SECONDS=0 "$image_name" >"$tmp_dir/invalid-ttl.log" 2>&1; then
     fail "IMAGE_PRESIGN_TTL_SECONDS=0 unexpectedly started"
 fi
 grep -q 'IMAGE_PRESIGN_TTL_SECONDS must be between 1 and 604800' "$tmp_dir/invalid-ttl.log" \
     || fail "invalid presign TTL did not report the expected startup error"
 echo "PASS: invalid presigned URL TTL is rejected"
+
+if docker run --rm --read-only --env IMAGE_READ_AUTH=none --env IMAGE_WRITE_AUTH=none \
+    --env IMAGE_METRICS_ENABLED=true "$image_name" >"$tmp_dir/metrics-without-key.log" 2>&1; then
+    fail "metrics endpoint enabled without an API key unexpectedly started"
+fi
+grep -q 'IMAGE_METRICS_ENABLED=true with IMAGE_METRICS_AUTH=true requires IMAGE_API_KEY' "$tmp_dir/metrics-without-key.log" \
+    || fail "metrics without an API key did not report the expected startup error"
+echo "PASS: authenticated metrics require an API key by default"
+
+if docker run --rm --read-only --env IMAGE_READ_AUTH=none --env IMAGE_WRITE_AUTH=none \
+    --env IMAGE_METRICS_ENABLED=true --env IMAGE_METRICS_AUTH=invalid "$image_name" \
+    >"$tmp_dir/invalid-metrics-auth.log" 2>&1; then
+    fail "invalid IMAGE_METRICS_AUTH unexpectedly started"
+fi
+grep -q "IMAGE_METRICS_AUTH must be 'true' or 'false'" "$tmp_dir/invalid-metrics-auth.log" \
+    || fail "invalid IMAGE_METRICS_AUTH did not report the expected startup error"
+echo "PASS: metrics authentication setting is validated"
+
+if docker run --rm --read-only --env IMAGE_API_KEY="$api_key" --env IMAGE_RATE_LIMIT_WINDOW_SECONDS=0 "$image_name" >"$tmp_dir/invalid-rate-window.log" 2>&1; then
+    fail "zero rate-limit window unexpectedly started"
+fi
+grep -q 'IMAGE_RATE_LIMIT_WINDOW_SECONDS must be between 1 and 86400' "$tmp_dir/invalid-rate-window.log" \
+    || fail "invalid rate-limit window did not report the expected startup error"
+echo "PASS: rate-limit window configuration is validated"
 
 for setting in IMAGE_MAX_INPUT_BYTES IMAGE_MAX_OUTPUT_BYTES IMAGE_OUTPUT_WIDTH IMAGE_OUTPUT_HEIGHT IMAGE_MAX_SLOTS; do
     if docker run --rm --read-only --env "$setting=0" "$image_name" >"$tmp_dir/invalid-$setting.log" 2>&1; then
@@ -497,12 +602,55 @@ grep -q 'Profile avatar max_input_bytes must be greater than zero' "$tmp_dir/inv
 echo "PASS: processing profile input limits reject zero"
 
 test_mode default
-test_mode false
-test_mode true
+test_mode public-read
 test_mode dimensions
 test_mode profiles
 test_mode max-slots
 test_mode input-limit
 test_mode output-limit
+
+start_service private-read-public-write
+expect_status 201 "$tmp_dir/public-write" \
+    --request POST --form "image=@$image_file" "$base_url/api/images/products/public-write/1"
+expect_status 401 "$tmp_dir/private-read" "$base_url/api/images/products/public-write/1"
+expect_status 200 "$tmp_dir/private-read-authenticated" \
+    -H "Authorization: Bearer $api_key" "$base_url/api/images/products/public-write/1"
+stop_service
+echo "PASS: private reads and explicitly public writes can be configured independently"
+
+start_service none
+expect_status 201 "$tmp_dir/no-auth-write" \
+    --request POST --form "image=@$image_file" "$base_url/api/images/products/no-auth/1"
+expect_status 200 "$tmp_dir/no-auth-read" "$base_url/api/images/products/no-auth/1"
+expect_status 404 "$tmp_dir/no-auth-metrics-disabled" "$base_url/metrics"
+stop_service
+echo "PASS: explicitly unprotected read/write mode works without an API key"
+
+start_service rate-limit
+local_rate_route="$base_url/api/images/products/rate-limit"
+expect_status 201 "$tmp_dir/rate-limit-upload" \
+    --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$local_rate_route/1"
+status="$(curl --silent --dump-header "$tmp_dir/write-rate.headers" --output "$tmp_dir/write-rate.body" \
+    --write-out '%{http_code}' --request PUT --form "image=@$image_file" \
+    -H "Authorization: Bearer $api_key" "$local_rate_route/1")"
+[[ "$status" == 429 ]] || fail "write rate limit returned HTTP $status instead of 429"
+grep -qi '^Retry-After: [1-9]' "$tmp_dir/write-rate.headers" || fail "429 response omitted Retry-After"
+for attempt in 1 2 3 4; do
+    expect_status 200 "$tmp_dir/rate-limit-read-$attempt" \
+        -H "Authorization: Bearer $api_key" "$local_rate_route/1"
+done
+status="$(curl --silent --dump-header "$tmp_dir/read-rate.headers" --output "$tmp_dir/read-rate.body" \
+    --write-out '%{http_code}' -H "Authorization: Bearer $api_key" "$local_rate_route/1")"
+[[ "$status" == 429 ]] || fail "read rate limit returned HTTP $status instead of 429"
+grep -qi '^Retry-After: [1-9]' "$tmp_dir/read-rate.headers" || fail "read 429 response omitted Retry-After"
+stop_service
+echo "PASS: independent read/write rate limits return 429 with Retry-After"
+
+start_service metrics-public
+expect_status 200 "$tmp_dir/public-metrics-no-token" "$base_url/metrics"
+grep -q '^image_service_http_requests_total' "$tmp_dir/public-metrics-no-token" \
+    || fail "public metrics endpoint omitted HTTP request counters"
+stop_service
+echo "PASS: IMAGE_METRICS_AUTH=false permits metrics scraping without an API key"
 
 echo "All Image Service smoke tests passed. Containers used volatile tmpfs storage only."

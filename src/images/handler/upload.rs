@@ -1,4 +1,4 @@
-use crate::{auth::require_write_auth, error::ApiError, state::AppState};
+use crate::{auth::require_auth, error::ApiError, state::AppState};
 
 use axum::{
     Json,
@@ -65,7 +65,7 @@ async fn upload_image(
     replace_existing: bool,
 ) -> Result<(UploadResponse, bool), ApiError> {
     // Authorize before expensive multipart parsing and image processing.
-    require_write_auth(&headers, state.api_key.as_deref())?;
+    require_auth(&headers, state.write_auth, state.api_key.as_deref())?;
 
     // Validate the path before consuming a potentially large request body.
     let key = ImageKey::new(namespace, resource_id, slot)?;

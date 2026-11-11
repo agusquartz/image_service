@@ -1,47 +1,66 @@
-use crate::error::ApiError;
+use crate::{config::AuthRequirement, error::ApiError};
 
 use axum::http::{HeaderMap, header};
 
-/// Verifies authorization for write operations.
-///
-/// Authentication is optional:
-///
-/// - If no API key is configured, the operation is allowed.
-/// - If an API key exists, the request must contain:
-///
-///   `Authorization: Bearer <api-key>`
-///
-/// This function is intended for mutation handlers such as uploads.
-/// Public image reads do not require it.
-pub fn require_write_auth(headers: &HeaderMap, api_key: Option<&str>) -> Result<(), ApiError> {
-    let Some(api_key) = api_key else {
+/// Verifies a request against the configured authentication requirement.
+pub fn require_auth(
+    headers: &HeaderMap,
+    requirement: AuthRequirement,
+    api_key: Option<&str>,
+) -> Result<(), ApiError> {
+    if requirement == AuthRequirement::None {
         return Ok(());
+    }
+
+    let Some(api_key) = api_key else {
+        tracing::error!("authentication is required but no API key is configured");
+        return Err(ApiError::Internal(
+            "Authentication is misconfigured".to_string(),
+        ));
     };
 
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or(ApiError::Unauthorized)?;
+    let Some(provided_key) = authorization.strip_prefix("Bearer ") else {
+        return Err(ApiError::Unauthorized);
+    };
 
-    let expected = format!("Bearer {api_key}");
-
-    if authorization != expected {
+    let matches = bool::from(subtle::ConstantTimeEq::ct_eq(
+        provided_key.as_bytes(),
+        api_key.as_bytes(),
+    ));
+    if provided_key.len() != api_key.len() || !matches {
         return Err(ApiError::Unauthorized);
     }
 
     Ok(())
 }
 
-/// Verifies authorization for read operations when read authentication
-/// is enabled. Reads remain public by default for compatibility.
-pub fn require_read_auth(
-    headers: &HeaderMap,
-    enabled: bool,
-    api_key: Option<&str>,
-) -> Result<(), ApiError> {
-    if !enabled {
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_auth_rejects_missing_and_incorrect_bearer_tokens() {
+        let requirement = AuthRequirement::Required;
+        assert!(require_auth(&HeaderMap::new(), requirement, Some("secret")).is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer incorrect".parse().unwrap());
+        assert!(require_auth(&headers, requirement, Some("secret")).is_err());
     }
 
-    require_write_auth(headers, api_key)
+    #[test]
+    fn required_auth_accepts_the_configured_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(require_auth(&headers, AuthRequirement::Required, Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn disabled_auth_does_not_require_a_token() {
+        assert!(require_auth(&HeaderMap::new(), AuthRequirement::None, None).is_ok());
+    }
 }

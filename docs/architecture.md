@@ -17,6 +17,8 @@ src/
 ├── config.rs
 ├── error.rs
 ├── health.rs
+├── observability.rs
+├── rate_limit.rs
 ├── router.rs
 ├── state.rs
 │
@@ -66,6 +68,8 @@ Files:
 router.rs
 health.rs
 auth.rs
+observability.rs
+rate_limit.rs
 images/handler/
 images/multipart.rs
 ```
@@ -76,7 +80,10 @@ Responsibilities:
 - Extract path parameters.
 - Read request headers.
 - Parse multipart requests.
-- Perform write authorization and optional read authorization.
+- Apply independent read/write bearer-authentication policies.
+- Enforce per-client read/write rate limits before handlers run.
+- Add request IDs, structured request logs, and low-cardinality metrics.
+- Expose Prometheus metrics at `/metrics` when enabled, with independent authentication enabled by default.
 - Convert application results into HTTP responses.
 - Set response headers.
 
@@ -313,12 +320,12 @@ X-Content-Type-Options: nosniff
 
 These operations use the same validated `ImageKey` and OpenDAL-backed storage boundary:
 
-- `DELETE /api/images/{namespace}/{resource_id}/{slot}` uses write authorization when `IMAGE_API_KEY` is configured and treats a missing object as a successful idempotent delete.
-- `DELETE /api/images/{namespace}/{resource_id}` uses write authorization and deletes recursively under the exact resource prefix. OpenDAL keeps directory and object-prefix details inside the storage layer; empty and missing resources are idempotent.
+- `DELETE /api/images/{namespace}/{resource_id}/{slot}` follows `IMAGE_WRITE_AUTH` (required by default) and treats a missing object as a successful idempotent delete.
+- `DELETE /api/images/{namespace}/{resource_id}` follows `IMAGE_WRITE_AUTH` and deletes recursively under the exact resource prefix. OpenDAL keeps directory and object-prefix details inside the storage layer; empty and missing resources are idempotent.
 - `HEAD /api/images/{namespace}/{resource_id}/{slot}` calls `stat` to return content type and length without reading image bytes.
 - `GET /api/images/{namespace}/{resource_id}` lists existing `NN.webp` slots under the resource prefix in ascending order, includes available storage metadata, and returns `max_creatable_slot`. The list includes existing slots above `IMAGE_MAX_SLOTS` so lowering the limit never hides stored images. OpenDAL normalizes LocalFS and object-storage listing behavior before it reaches the application layer.
 
-Image reads are public by default. `GETMETHOD_AUTH=true` applies bearer authentication to GET, HEAD, resource listing, image-info, and presign requests; the flag requires `IMAGE_API_KEY`.
+`IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` independently control bearer authentication; both default to `required`, and startup requires `IMAGE_API_KEY` for either required policy. `GETMETHOD_AUTH` has been removed. `/health` remains public. `/metrics` is optional (`IMAGE_METRICS_ENABLED=false` by default) and has its own `IMAGE_METRICS_AUTH=true` default; startup requires an API key if metrics are enabled and metrics authentication remains on.
 
 ---
 

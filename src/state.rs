@@ -1,9 +1,11 @@
 use crate::{
     config::{
-        AppConfig, ProcessingPolicy, ProcessingProfile, max_configured_input_bytes,
-        resolve_processing_policy,
+        AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile,
+        max_configured_input_bytes, resolve_processing_policy,
     },
     images::ImageStore,
+    observability::HttpMetrics,
+    rate_limit::RateLimiter,
 };
 
 use opendal::Operator;
@@ -40,7 +42,17 @@ pub struct AppState {
 
     pub api_key: Option<String>,
 
-    pub getmethod_auth: bool,
+    pub read_auth: AuthRequirement,
+
+    pub write_auth: AuthRequirement,
+
+    pub rate_limiter: Arc<RateLimiter>,
+
+    pub metrics: Arc<HttpMetrics>,
+
+    pub metrics_enabled: bool,
+
+    pub metrics_auth: bool,
 
     pub presign_ttl_seconds: u64,
 
@@ -81,7 +93,17 @@ impl AppState {
 
             api_key: config.api_key.clone(),
 
-            getmethod_auth: config.getmethod_auth,
+            read_auth: config.read_auth,
+
+            write_auth: config.write_auth,
+
+            rate_limiter: Arc::new(RateLimiter::new(config.rate_limit)),
+
+            metrics: Arc::new(HttpMetrics::default()),
+
+            metrics_enabled: config.metrics_enabled,
+
+            metrics_auth: config.metrics_auth,
 
             presign_ttl_seconds: config.presign_ttl_seconds,
 
