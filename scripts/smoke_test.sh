@@ -113,6 +113,14 @@ start_service() {
         false) args+=(--env GETMETHOD_AUTH=false --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
         true) args+=(--env GETMETHOD_AUTH=true --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
         dimensions) args+=(--env IMAGE_OUTPUT_WIDTH=64 --env IMAGE_OUTPUT_HEIGHT=64) ;;
+        profiles)
+            args+=(
+                --env IMAGE_OUTPUT_WIDTH=64 --env IMAGE_OUTPUT_HEIGHT=64
+                --env IMAGE_MAX_INPUT_BYTES=1048576
+                --env 'IMAGE_PROCESSING_PROFILES={"compact":{"max_input_bytes":4194304,"max_output_bytes":51200},"avatar":{"max_output_bytes":25600,"output_width":32,"output_height":32}}'
+                --env 'IMAGE_NAMESPACE_PROFILES={"products":"compact","avatars":"avatar"}'
+            )
+            ;;
         max-slots) args+=(--env IMAGE_MAX_SLOTS=2) ;;
         input-limit) args+=(--env IMAGE_MAX_INPUT_BYTES=1024) ;;
         output-limit) args+=(--env IMAGE_MAX_OUTPUT_BYTES=1) ;;
@@ -148,6 +156,30 @@ test_mode() {
     local max_creatable_slot=5
     [[ "$auth_mode" == "max-slots" ]] && max_creatable_slot=2
     local over_limit_slot=$((max_creatable_slot + 1))
+    local upload_file="$image_file"
+    if [[ "$auth_mode" == "profiles" ]]; then
+        upload_file="$tmp_dir/profile-large.png"
+        python3 - "$upload_file" <<'PY'
+import random
+import struct
+import sys
+import zlib
+
+def chunk(kind, data):
+    checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+width = height = 1024
+rng = random.Random(2026)
+pixels = b"".join(bytes((0,)) + rng.randbytes(width * 3) for _ in range(height))
+png = bytes((137, 80, 78, 71, 13, 10, 26, 10))
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(pixels))
+png += chunk(b"IEND", b"")
+with open(sys.argv[1], "wb") as image_file:
+    image_file.write(png)
+PY
+    fi
     start_service "$auth_mode"
     local resource="smoke-${auth_mode}"
     local route="$base_url/api/images/products/$resource"
@@ -172,7 +204,7 @@ test_mode() {
     expect_status 401 "$tmp_dir/unauthorized-upload" \
         --request POST --form "image=@$image_file" "$image_route"
     expect_status 201 "$tmp_dir/upload" \
-        --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+        --request POST --form "image=@$upload_file" -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 409 "$tmp_dir/conflicting-upload" \
         --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 200 "$tmp_dir/put-upload" \
@@ -225,8 +257,14 @@ test_mode() {
 
     expect_read_status 200 "$tmp_dir/info" "$image_route/info"
     local max_dimension=1024
-    [[ "$auth_mode" == "dimensions" ]] && max_dimension=64
-    python3 - "$tmp_dir/info" "$max_dimension" <<'PY'
+    local expected_profile="default"
+    local expected_output_limit=102400
+    [[ "$auth_mode" == "dimensions" || "$auth_mode" == "profiles" ]] && max_dimension=64
+    if [[ "$auth_mode" == "profiles" ]]; then
+        expected_profile="compact"
+        expected_output_limit=51200
+    fi
+    python3 - "$tmp_dir/info" "$max_dimension" "$expected_profile" "$expected_output_limit" <<'PY'
 import json
 import sys
 
@@ -235,7 +273,7 @@ with open(sys.argv[1], encoding="utf-8") as response_file:
 assert payload["namespace"] == "products", payload
 assert payload["slot"] == 1, payload
 assert payload["format"] == "webp", payload
-assert payload["profile"] == "default", payload
+assert payload["profile"] == sys.argv[3], payload
 assert payload["size_bytes"] > 0, payload
 assert payload["width"] > 0 and payload["height"] > 0, payload
 max_dimension = int(sys.argv[2])
@@ -243,6 +281,7 @@ assert payload["width"] <= max_dimension and payload["height"] <= max_dimension,
 if max_dimension == 64:
     assert payload["width"] == 64 and payload["height"] == 64, payload
 assert payload["size_bytes"] <= 102400, payload
+assert payload["size_bytes"] <= int(sys.argv[4]), payload
 assert payload["etag"].startswith('"') and payload["etag"].endswith('"'), payload
 assert payload["last_modified"], payload
 PY
@@ -356,6 +395,60 @@ with open(sys.argv[1], encoding="utf-8") as response_file:
 assert payload["images"] == [], payload
 PY
 
+    if [[ "$auth_mode" == "profiles" ]]; then
+        python3 - "$tmp_dir/tiny.png" <<'PY'
+import struct
+import sys
+import zlib
+
+def chunk(kind, data):
+    checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+width = height = 16
+pixels = b"".join(bytes((0,)) + bytes((255, 0, 0)) * width for _ in range(height))
+png = bytes((137, 80, 78, 71, 13, 10, 26, 10))
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(pixels))
+png += chunk(b"IEND", b"")
+with open(sys.argv[1], "wb") as image_file:
+    image_file.write(png)
+PY
+        local avatar_route="$base_url/api/images/avatars/profile-smoke/1"
+        expect_status 201 "$tmp_dir/avatar-profile-upload" \
+            --request POST --form "image=@$tmp_dir/tiny.png" -H "Authorization: Bearer $api_key" "$avatar_route"
+        expect_status 200 "$tmp_dir/avatar-profile-info" "$avatar_route/info"
+        python3 - "$tmp_dir/avatar-profile-info" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["profile"] == "avatar", payload
+assert payload["width"] == 32 and payload["height"] == 32, payload
+assert payload["size_bytes"] <= 25600, payload
+PY
+        expect_status 413 "$tmp_dir/avatar-input-inherits-global-limit" \
+            --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$base_url/api/images/avatars/profile-smoke/2"
+
+        local fallback_route="$base_url/api/images/misc/profile-smoke/1"
+        expect_status 201 "$tmp_dir/default-profile-upload" \
+            --request POST --form "image=@$tmp_dir/tiny.png" -H "Authorization: Bearer $api_key" "$fallback_route"
+        expect_status 200 "$tmp_dir/default-profile-info" "$fallback_route/info"
+        python3 - "$tmp_dir/default-profile-info" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["profile"] == "default", payload
+assert payload["width"] == 64 and payload["height"] == 64, payload
+assert payload["size_bytes"] <= 102400, payload
+PY
+        expect_status 413 "$tmp_dir/unassigned-namespace-input-global-limit" \
+            --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$base_url/api/images/misc/profile-smoke/2"
+    fi
+
     stop_service
     echo "PASS: endpoint and auth smoke tests ($auth_mode GETMETHOD_AUTH)"
 }
@@ -383,10 +476,31 @@ for setting in IMAGE_MAX_INPUT_BYTES IMAGE_MAX_OUTPUT_BYTES IMAGE_OUTPUT_WIDTH I
 done
 echo "PASS: image limit configuration rejects zero values"
 
+if docker run --rm --read-only \
+    --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"output_width":512}}' \
+    --env 'IMAGE_NAMESPACE_PROFILES={"avatars":"missing"}' \
+    "$image_name" >"$tmp_dir/invalid-profile.log" 2>&1; then
+    fail "invalid processing profile configuration unexpectedly started"
+fi
+grep -Eq 'must set output_width and output_height together|references undefined image processing profile' "$tmp_dir/invalid-profile.log" \
+    || fail "invalid processing profile did not report a profile configuration error"
+echo "PASS: invalid processing profile configuration is rejected"
+
+if docker run --rm --read-only \
+    --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"max_input_bytes":0}}' \
+    --env 'IMAGE_NAMESPACE_PROFILES={"avatars":"avatar"}' \
+    "$image_name" >"$tmp_dir/invalid-profile-input-limit.log" 2>&1; then
+    fail "zero profile input limit unexpectedly started"
+fi
+grep -q 'Profile avatar max_input_bytes must be greater than zero' "$tmp_dir/invalid-profile-input-limit.log" \
+    || fail "zero profile input limit did not report the expected startup error"
+echo "PASS: processing profile input limits reject zero"
+
 test_mode default
 test_mode false
 test_mode true
 test_mode dimensions
+test_mode profiles
 test_mode max-slots
 test_mode input-limit
 test_mode output-limit

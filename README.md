@@ -50,6 +50,7 @@ This keeps image-specific infrastructure outside the consuming application while
 - Configurable input byte limit (15 MiB by default).
 - Configurable WebP output byte limit (100 KiB by default).
 - Configurable target output dimensions (1024×1024 by default, center-cropped without distortion; further downscaled only if needed to meet the byte limit).
+- Optional named WebP processing profiles assigned by namespace; profiles override only explicitly configured input/output limits or dimensions and inherit the existing global settings for the rest.
 - Lossy WebP quality search from the same resampled pixels to meet the maximum output byte limit.
 - Decoder width, height, and allocation limits.
 - Limited concurrent image-processing jobs.
@@ -137,6 +138,8 @@ IMAGE_MAX_INPUT_BYTES
 IMAGE_MAX_OUTPUT_BYTES
 IMAGE_OUTPUT_WIDTH
 IMAGE_OUTPUT_HEIGHT
+IMAGE_PROCESSING_PROFILES
+IMAGE_NAMESPACE_PROFILES
 IMAGE_MAX_SLOTS
 IMAGE_API_KEY
 GETMETHOD_AUTH
@@ -147,6 +150,8 @@ IMAGE_PUBLIC_BASE_URL
 ```
 
 Input/output byte limits, target output dimensions, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder allocation and source-dimension safeguards remain compile-time limits. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
+
+Processing profiles are optional. With no profile assigned, the current global environment settings remain in effect. A profile can override the input byte limit, WebP output byte limit, and/or target dimensions for selected namespaces; omitted profile fields inherit the corresponding global value, which itself falls back to the built-in default. See [Configuration](docs/configuration.md) for the JSON environment variable format.
 
 See [Configuration](docs/configuration.md).
 
@@ -166,7 +171,7 @@ The long-term goal is to make deployment-specific behavior configurable without 
 
 - Runtime-configurable image policies.
 - Additional output formats.
-- Processing profiles.
+- Additional processing profile options and selection rules.
 - Cache and CDN behavior.
 - Authentication strategies.
 - Per-namespace policies.

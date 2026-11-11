@@ -9,7 +9,7 @@ pub(crate) struct ImageInfoResponse {
     pub format: &'static str,
     pub width: u32,
     pub height: u32,
-    pub profile: &'static str,
+    pub profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

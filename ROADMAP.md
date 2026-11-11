@@ -49,8 +49,8 @@ Optional read authentication   yes
 
 Delete endpoint                yes
 Database                       no
-Processing profiles            no
-Runtime processing policy      partial (byte/dimension limits; profiles remain planned)
+Processing profiles            yes (optional namespace-specific WebP settings)
+Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
 ```
 
 S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
@@ -84,6 +84,12 @@ OpenDAL Operator
 This means the HTTP, processing, and application layers do not need to know whether image bytes live on local disk, Amazon S3, or another compatible object store.
 
 ---
+
+## Implemented: Processing Profiles
+
+Phase 3 adds optional named WebP processing profiles through `IMAGE_PROCESSING_PROFILES`, assigned to namespaces with `IMAGE_NAMESPACE_PROFILES`. A profile can override the input byte limit, output byte limit, and target dimensions. Each omitted field inherits its matching global setting, then the built-in default. Namespaces without a profile keep the existing global behavior, so profiles remain opt-in and backward compatible.
+
+Verification covers profile overrides and fallback behavior in unit tests, profile-specific input limits and inherited global limits in LocalFS smoke tests, and namespace profile processing in MinIO smoke tests. The tested Docker containers use ephemeral storage and are removed after the run. See [configuration](docs/configuration.md#per-namespace-processing-profiles) and [deployment testing](docs/deployment.md) for configuration and commands.
 
 ## Future Features
 
@@ -174,47 +180,14 @@ jpeg
 png
 ```
 
-Different namespaces could eventually use different processing profiles.
+Namespace-selected WebP processing profiles are implemented; unmapped namespaces keep the current global settings, and profile fields can override input/output byte limits and exact target dimensions. Selecting a different output format remains future work.
 
 For example:
 
 ```text
-products -> WebP, max 1 MB, 1024 × 1024 center crop
-avatars  -> WebP, max 120 KB, square crop
-banners  -> AVIF, max width 1920
+products -> WebP, max 400 KiB, 2000 × 2000
+avatars  -> WebP, max 100 KiB, 512 × 512
 ```
-
----
-
-### Processing Profiles
-
-Instead of one global policy, configuration may define named profiles:
-
-```text
-product
-thumbnail
-avatar
-hero
-original
-```
-
-Conceptually:
-
-```toml
-[profiles.product]
-format = "webp"
-max_output_kb = 400
-max_width = 2000
-
-[profiles.avatar]
-format = "webp"
-max_output_kb = 100
-width = 512
-height = 512
-fit = "cover"
-```
-
-Namespaces or routes could then choose a profile.
 
 ---
 
@@ -381,10 +354,9 @@ documents
 Possible namespace-specific configuration:
 
 - Allowed source formats.
-- Maximum source size.
-- Maximum output size.
+- Maximum source and output sizes beyond the limits available in processing profiles.
 - Number of slots.
-- Processing profile.
+- Processing profile selection (basic namespace assignment is implemented; richer namespace policies remain future work).
 - Public/private read access.
 - Storage backend.
 - Storage prefix.

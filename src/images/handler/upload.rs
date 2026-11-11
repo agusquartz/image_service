@@ -69,6 +69,7 @@ async fn upload_image(
 
     // Validate the path before consuming a potentially large request body.
     let key = ImageKey::new(namespace, resource_id, slot)?;
+    let policy = state.processing_policy_for(&key.namespace);
 
     if slot > state.max_slots {
         if !replace_existing {
@@ -90,7 +91,7 @@ async fn upload_image(
         }
     }
 
-    let incoming = read_multipart_image(multipart, state.max_source_bytes).await?;
+    let incoming = read_multipart_image(multipart, policy.max_input_bytes).await?;
 
     service::upload(&state, &key, incoming, replace_existing).await
 }

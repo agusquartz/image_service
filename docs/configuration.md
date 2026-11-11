@@ -171,6 +171,19 @@ Maximum decoder allocation:  256 MiB
 
 Input and output byte limits, target output dimensions, and the global slot maximum are runtime-configurable. Decoder dimension and allocation limits remain compile-time safety bounds.
 
+### Per-namespace processing profiles
+
+Processing profiles are optional. If neither profile variable is configured, processing remains exactly on the existing global policy. Profiles currently support WebP output and can override the input byte limit, output byte limit, and target dimensions for selected namespaces. Every omitted profile field inherits its matching global setting (`IMAGE_MAX_INPUT_BYTES`, `IMAGE_MAX_OUTPUT_BYTES`, `IMAGE_OUTPUT_WIDTH`, or `IMAGE_OUTPUT_HEIGHT`). Each global setting in turn uses its built-in default when unset. Slot maximum and processing concurrency remain global.
+
+Configure profile definitions and namespace assignments as JSON objects:
+
+```dotenv
+IMAGE_PROCESSING_PROFILES='{"product":{"max_input_bytes":18874368,"max_output_bytes":409600,"output_width":2000,"output_height":2000},"avatar":{"max_output_bytes":102400,"output_width":512,"output_height":512}}'
+IMAGE_NAMESPACE_PROFILES='{"products":"product","users":"avatar"}'
+```
+
+The first object maps profile names to partial processing policies. The second maps a validated namespace to a profile name. For any field the precedence is: profile value, then the matching global environment setting, then the built-in default. For example, an unset input limit defaults to 15 MiB; setting `IMAGE_MAX_INPUT_BYTES=17825792` makes the global value 17 MiB; a profile with `max_input_bytes: 18874368` raises only its assigned namespaces to 18 MiB. A profile without `max_input_bytes` inherits the global value. The HTTP body limit accounts for the largest input limit assigned to any namespace plus multipart overhead; the selected namespace's source-image limit is checked separately. Namespaces without an assignment keep the global policy and report `"profile": "default"` in image information. Profile names use lowercase letters, digits, `-`, and `_`; `default` is reserved. Profile width and height must be set together and each must be `1..=12000`; input and output byte limits must be positive. Invalid JSON, unknown profile fields, invalid identifiers, or references to undefined profiles reject startup. Changing a profile affects future uploads; stored images are not automatically reprocessed.
+
 ---
 
 ## Concurrency Model
@@ -528,6 +541,10 @@ Default: `102400` bytes (100 KiB).
 Exact output width and height in pixels. The service center-crops the input to match this aspect ratio and resamples once to these dimensions without distortion. Each value must be between `1` and `12000`, the decoder's compile-time safety bound.
 
 Defaults: `1024` pixels for both width and height.
+
+### `IMAGE_PROCESSING_PROFILES` and `IMAGE_NAMESPACE_PROFILES`
+
+Optional JSON objects that define named WebP processing profiles and assign them to namespaces. Profiles may set `max_input_bytes`, `max_output_bytes`, `output_width`, and `output_height`. Omitted values inherit the corresponding global environment setting, which falls back to its built-in default when unset. See [Per-namespace processing profiles](#per-namespace-processing-profiles) for a complete example and validation behavior.
 
 ### `IMAGE_API_KEY`
 

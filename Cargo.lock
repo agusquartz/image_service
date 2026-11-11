@@ -944,6 +944,7 @@ dependencies = [
  "image",
  "opendal",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

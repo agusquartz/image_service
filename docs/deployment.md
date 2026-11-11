@@ -125,7 +125,7 @@ docker run --rm --read-only \
 
 This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
 
-The filesystem endpoint smoke test exercises public-read compatibility, authenticated reads, POST create-only behavior, PUT replacement, GET, HEAD, info, listing metadata and limits, legacy slots above the configured limit, slot and resource-level DELETE, custom target dimensions, byte limits, and invalid configuration. Resource-level DELETE is checked for idempotence and exact-prefix isolation so similarly named resources remain intact. It needs Docker, `curl`, Python 3, and a local test image:
+The filesystem endpoint smoke test exercises public-read compatibility, authenticated reads, POST create-only behavior, PUT replacement, GET, HEAD, info, listing metadata and limits, legacy slots above the configured limit, slot and resource-level DELETE, custom target dimensions, byte limits, optional namespace profiles, profile input-limit overrides, fallback to global input limits for profiles and unassigned namespaces, and invalid configuration. Resource-level DELETE is checked for idempotence and exact-prefix isolation so similarly named resources remain intact. It needs Docker, `curl`, Python 3, and a local test image:
 
 ```bash
 docker build -t image-service:local .
@@ -136,7 +136,7 @@ The image file is a local fixture and is excluded from Git and the Docker build 
 
 ### MinIO S3-compatible smoke test
 
-The MinIO test starts a MinIO-compatible server and Image Service on a private Docker network. Both use ephemeral containers and a `tmpfs` object directory; the script removes the containers and network on exit. It checks create-only and replace uploads, S3 GET/HEAD and conditional GET, metadata-bearing listings including a legacy slot above the configured limit, direct download through a presigned URL, slot deletion, and recursive resource-level deletion. The resource deletion test verifies idempotence and confirms that objects under a similarly named resource are preserved.
+The MinIO test starts a MinIO-compatible server and Image Service on a private Docker network. Both use ephemeral containers and a `tmpfs` object directory; the script removes the containers and network on exit. It checks create-only and replace uploads, S3 GET/HEAD and conditional GET, metadata-bearing listings including a legacy slot above the configured limit, a namespace-specific processing profile, direct download through a presigned URL, slot deletion, and recursive resource-level deletion. The resource deletion test verifies idempotence and confirms that objects under a similarly named resource are preserved.
 
 ```bash
 bash scripts/verify_phase1_phase2.sh ./TEST_IMAGE_ORIGINAL.png

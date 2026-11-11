@@ -11,6 +11,7 @@ The service includes several defensive measures:
 - Configurable request-body limits (`IMAGE_MAX_INPUT_BYTES` plus 1 MiB multipart framing).
 - Configurable source-file size limits (`IMAGE_MAX_INPUT_BYTES`).
 - Configurable WebP byte and target-dimension limits (`IMAGE_MAX_OUTPUT_BYTES`, `IMAGE_OUTPUT_WIDTH`, and `IMAGE_OUTPUT_HEIGHT`).
+- Optional namespace-specific input/output byte and output-dimension limits through validated processing profiles; unspecified profile fields inherit global limits.
 - MIME-to-format verification.
 - Maximum decode dimensions.
 - Decoder memory-allocation limits.
