@@ -1,4 +1,4 @@
-use crate::{config::MAX_SOURCE_BYTES, error::ApiError};
+use crate::error::ApiError;
 
 use axum::extract::Multipart;
 
@@ -25,14 +25,17 @@ use super::model::IncomingImage;
 /// - The image exceeds the configured source size limit.
 pub(crate) async fn read_multipart_image(
     mut multipart: Multipart,
+    max_source_bytes: usize,
 ) -> Result<IncomingImage, ApiError> {
     let mut image: Option<IncomingImage> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("Invalid multipart request: {error}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        if error.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge(error.body_text())
+        } else {
+            ApiError::BadRequest(format!("Invalid multipart request: {error}"))
+        }
+    })? {
         let name = field.name().unwrap_or("").to_string();
 
         if name != "image" {
@@ -51,10 +54,13 @@ pub(crate) async fn read_multipart_image(
             )
         })?;
 
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|error| ApiError::BadRequest(format!("Could not read image data: {error}")))?;
+        let bytes = field.bytes().await.map_err(|error| {
+            if error.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+                ApiError::PayloadTooLarge(error.body_text())
+            } else {
+                ApiError::BadRequest(format!("Could not read image data: {error}"))
+            }
+        })?;
 
         if bytes.is_empty() {
             return Err(ApiError::BadRequest(
@@ -62,10 +68,10 @@ pub(crate) async fn read_multipart_image(
             ));
         }
 
-        if bytes.len() > MAX_SOURCE_BYTES {
+        if bytes.len() > max_source_bytes {
             return Err(ApiError::PayloadTooLarge(format!(
                 "The source image exceeds the {} MB limit",
-                MAX_SOURCE_BYTES / 1024 / 1024
+                max_source_bytes.div_ceil(1024 * 1024)
             )));
         }
 

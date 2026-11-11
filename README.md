@@ -6,7 +6,7 @@
 
 **A self-hosted image processing and storage service built with Rust and Axum.**
 
-Image Service accepts uploaded images, validates and decodes them with defensive limits, converts them to WebP, progressively reduces quality and dimensions to satisfy the configured output-size target, and stores the processed image for later retrieval.
+Image Service accepts uploaded images, validates and decodes them with defensive limits, center-crops to the configured aspect ratio, and encodes WebP under the configured output-size limit. It uses the configured target dimensions unless further downscaling is needed to meet that byte limit.
 
 Storage is provided through OpenDAL. The currently compiled backends are local filesystem and S3/S3-compatible object storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so the service can evolve toward configurable processing policies and multiple storage backends.
 
@@ -37,23 +37,29 @@ This keeps image-specific infrastructure outside the consuming application while
 
 - Multipart image uploads.
 - Public image retrieval over HTTP.
+- Image information with storage and WebP dimensions metadata.
+- Presigned read URLs when the storage backend supports them.
+- ETag and Last-Modified validators with conditional GET/HEAD requests.
 - Resource image listing, HEAD metadata checks, and idempotent deletion.
+- POST creates only in an unused slot; PUT creates or replaces the complete image.
 - Optional bearer-token protection for write operations.
 - Optional bearer-token protection for reads, disabled by default for backwards compatibility.
 - Source MIME validation against the detected file format.
 - JPEG, PNG, WebP, GIF, BMP, and TIFF input.
 - WebP output.
-- Progressive WebP quality reduction.
-- Progressive dimension reduction when quality alone is insufficient.
-- Maximum source-size protection.
+- Configurable input byte limit (15 MiB by default).
+- Configurable WebP output byte limit (100 KiB by default).
+- Configurable target output dimensions (1024×1024 by default, center-cropped without distortion; further downscaled only if needed to meet the byte limit).
+- Lossy WebP quality search from the same resampled pixels to meet the maximum output byte limit.
 - Decoder width, height, and allocation limits.
 - Limited concurrent image-processing jobs.
 - Resource-based image organization.
-- Up to five image slots per resource.
+- Configurable maximum slot number for new images (5 by default; valid range 1..=255).
 - Local filesystem persistence through OpenDAL.
 - S3 and S3-compatible object storage.
 - Runtime-selectable storage backend.
 - Optional public base URL generation.
+- Configurable Cache-Control with a 60-second default lifetime.
 - JSON error responses.
 - Lightweight health endpoint.
 
@@ -77,10 +83,14 @@ If `IMAGE_API_KEY` is configured, add:
 GET  /health
 
 GET  /api/images/{namespace}/{resource_id}/{slot}
+GET  /api/images/{namespace}/{resource_id}/{slot}/info
 HEAD /api/images/{namespace}/{resource_id}/{slot}
 POST /api/images/{namespace}/{resource_id}/{slot}
+PUT  /api/images/{namespace}/{resource_id}/{slot}
+POST /api/images/{namespace}/{resource_id}/{slot}/presign
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}
+DELETE /api/images/{namespace}/{resource_id}
 ```
 
 Example:
@@ -123,12 +133,20 @@ IMAGE_BIND
 IMAGE_STORAGE_SCHEME
 IMAGE_STORAGE_*
 IMAGE_MAX_CONCURRENCY
+IMAGE_MAX_INPUT_BYTES
+IMAGE_MAX_OUTPUT_BYTES
+IMAGE_OUTPUT_WIDTH
+IMAGE_OUTPUT_HEIGHT
+IMAGE_MAX_SLOTS
 IMAGE_API_KEY
 GETMETHOD_AUTH
+IMAGE_PRESIGN_TTL_SECONDS
+IMAGE_CACHE_TTL_SECONDS
+IMAGE_CACHE_CONTROL
 IMAGE_PUBLIC_BASE_URL
 ```
 
-Processing limits such as the maximum source size, target WebP size, decoder allocation limit, resize scale, and slot range are currently compile-time constants.
+Input/output byte limits, target output dimensions, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder allocation and source-dimension safeguards remain compile-time limits. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
 
 See [Configuration](docs/configuration.md).
 

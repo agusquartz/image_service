@@ -2,9 +2,7 @@
 
 # Configuration
 
-Image Service combines runtime environment configuration with compile-time image-processing policy constants.
-
-Runtime values are loaded from the environment. Image-processing limits such as output size, resize rounds, WebP qualities, and decoder limits currently live in `src/config.rs` and are intended to become fully runtime-configurable over time.
+Image Service combines runtime environment configuration with a small set of compile-time safety limits. Upload byte limits, output dimensions, and resize behavior are configurable through environment variables.
 
 Storage is provided through OpenDAL. The currently compiled storage backends are:
 
@@ -64,9 +62,9 @@ With local filesystem storage, the resulting layout looks like:
         └── 01.webp
 ```
 
-The service currently supports slots `1` through `5`.
+Slot numbers are one-based values from `1` through `255`. `IMAGE_MAX_SLOTS` defaults to `5` and limits the highest slot number that may be created; it does not hide existing higher-numbered slots.
 
-Uploading to an existing slot replaces the previous image.
+`POST` creates an image only in an empty slot and within the configured limit. `PUT` creates within the limit or replaces an existing image, including one above the limit.
 
 ---
 
@@ -128,10 +126,14 @@ This prevents route values from changing the intended storage hierarchy.
 
 ### Slot
 
-Valid slots currently range from:
+Slot numbers are one-based `u8` values (`1..=255`). `IMAGE_MAX_SLOTS` defaults to `5` and sets the highest slot number allowed when creating a new image. It is global, not namespace-specific.
+
+The setting does not hide or block access to existing slots above the configured value. GET, HEAD, image info, presigned reads, resource listings, and DELETE continue to work for those images. PUT may replace an existing high-numbered slot, but returns `400 Bad Request` if that slot does not exist and would have to be created. POST above the configured maximum returns `400 Bad Request`.
+
+For example, allowing new images in slots 1 through 12:
 
 ```text
-1..=5
+IMAGE_MAX_SLOTS=12
 ```
 
 Slots use two-digit formatting in storage object keys:
@@ -140,59 +142,34 @@ Slots use two-digit formatting in storage object keys:
 1 -> 01.webp
 2 -> 02.webp
 5 -> 05.webp
+12 -> 12.webp
 ```
 
 ---
 
 ## Image Processing Strategy
 
-The service attempts to produce a WebP file no larger than:
+The service targets the configured WebP dimensions and enforces a maximum encoded byte size. Defaults are:
 
 ```text
-400 KB
+1024 × 1024 px; 100 KiB
 ```
 
-The current algorithm starts with the original dimensions and tries the following WebP quality levels:
+The source is center-cropped to the target aspect ratio and resampled to the configured target dimensions. This crops the sides when needed and never distorts the image by changing its aspect ratio. The same resampled pixels are encoded repeatedly at different lossy WebP qualities; a binary search selects the highest quality that fits the byte limit. If quality 0 still exceeds the limit, the service reduces dimensions in further steps, always resizing from the original cropped pixels and keeping the target aspect ratio.
+
+WebP quality can be reduced all the way to `0`. The service reduces dimensions only when needed to fit the byte limit, and returns `422` only if the configured limit is too small even for a 1×1 WebP image.
+
+The default processing limits are:
 
 ```text
-88
-80
-72
-64
-56
-48
-42
+Maximum source image:         15 MiB
+Maximum output image:        100 KiB
+Target output dimensions:    1024 × 1024 px
+Maximum decoder dimension:   12,000 px
+Maximum decoder allocation:  256 MiB
 ```
 
-If none of those results fits within the target size, the image dimensions are reduced to approximately:
-
-```text
-85%
-```
-
-of the previous width and height.
-
-The quality sequence is then attempted again.
-
-This process continues until:
-
-- The encoded image satisfies the size target.
-- The resize-round limit is reached.
-- The longest side reaches the configured minimum.
-
-Current relevant limits are:
-
-```text
-Maximum HTTP request:         16 MB
-Maximum source image:         15 MB
-Maximum output image:        400 KB
-Maximum dimension:         12,000 px
-Maximum decoder allocation:  256 MB
-Minimum longest side:        512 px
-Maximum resize rounds:        10
-```
-
-These values are currently compile-time configuration constants.
+Input and output byte limits, target output dimensions, and the global slot maximum are runtime-configurable. Decoder dimension and allocation limits remain compile-time safety bounds.
 
 ---
 
@@ -214,6 +191,11 @@ A semaphore limits how many image-processing jobs may execute simultaneously:
 
 ```dotenv
 IMAGE_MAX_CONCURRENCY=2
+IMAGE_MAX_INPUT_BYTES=15728640
+IMAGE_MAX_OUTPUT_BYTES=102400
+IMAGE_OUTPUT_WIDTH=1024
+IMAGE_OUTPUT_HEIGHT=1024
+IMAGE_MAX_SLOTS=5
 ```
 
 This is particularly important when processing large source images because several concurrent decodes may consume significant CPU and memory.
@@ -222,13 +204,23 @@ Storage operations are handled asynchronously through OpenDAL and are independen
 
 ## Authentication
 
-`IMAGE_API_KEY` optionally protects write operations (`POST` and `DELETE`). When configured, clients send:
+`IMAGE_API_KEY` optionally protects write operations (`POST`, `PUT`, and `DELETE`). When configured, clients send:
 
 ```http
 Authorization: Bearer <IMAGE_API_KEY>
 ```
 
-Image reads remain public by default for compatibility with existing clients. Set `GETMETHOD_AUTH=true` to also require the same bearer token for `GET`, `HEAD`, and resource listing. `GETMETHOD_AUTH` defaults to `false`; startup fails if it is enabled without `IMAGE_API_KEY`.
+Image reads remain public by default for compatibility with existing clients. Set `GETMETHOD_AUTH=true` to also require the same bearer token for `GET`, `HEAD`, resource listing, image information, and presigned URL creation. `GETMETHOD_AUTH` defaults to `false`; startup fails if it is enabled without `IMAGE_API_KEY`.
+
+## Cache and Presigned Read URLs
+
+Image GET and HEAD responses use a 60-second cache lifetime by default. Public reads get `Cache-Control: public, max-age=60`; when `GETMETHOD_AUTH=true`, the default is `private, max-age=60` so shared caches cannot expose authenticated images. Set `IMAGE_CACHE_TTL_SECONDS` to change the lifetime; `0` emits `Cache-Control: no-store`. `IMAGE_CACHE_CONTROL` overrides the complete header, so do not set it to `public` for protected images unless a shared-cache design explicitly accounts for authorization. A fresh cached response may remain visible for the configured TTL after a PUT. ETag and Last-Modified let a cache validate after the response becomes stale; they do not invalidate a still-fresh response. Avoid `immutable` while a slot can be overwritten at the same URL.
+
+The current GET implementation buffers the stored WebP before responding. With the default 100 KiB output limit, that is usually simpler than streaming. If deployments raise the output limit substantially or expect many concurrent large downloads, consider an optional `IMAGE_STREAM_GET` setting, disabled by default, backed by OpenDAL's reader stream and Axum's streaming response body. This setting is a future recommendation, not implemented yet. Streaming can bound per-request buffering, but memory still depends on stream buffers and concurrent requests; errors that occur after response headers are sent also terminate the response rather than becoming a normal JSON error.
+
+For a storefront or other public image catalog, the 60-second public default lets shared caches and CDNs reuse popular images during traffic spikes. A replacement at the same URL can remain stale for up to that minute. For private ERP images, the default is `private` and only user-agent caches may reuse them; use `no-store` for sensitive content. A versioned URL avoids that freshness tradeoff by changing the URL whenever the image is replaced, so each URL continues to identify the same bytes.
+
+`IMAGE_PRESIGN_TTL_SECONDS` controls the validity period of presigned read URLs. It defaults to `3600` seconds and accepts values from `1` through `604800` seconds. Presigning only works when the configured OpenDAL backend supports `presign_read`; filesystem storage returns `501 Not Implemented`.
 
 ---
 
@@ -519,6 +511,24 @@ IMAGE_MAX_CONCURRENCY=4
 
 Invalid, empty, or zero values fall back to the default.
 
+### `IMAGE_MAX_INPUT_BYTES`
+
+Maximum source image payload size accepted by upload methods (`POST` and `PUT`), in bytes. The multipart request limit adds 1 MiB for headers and framing. Must be a positive integer.
+
+Default: `15728640` bytes (15 MiB), preserving the previous limit.
+
+### `IMAGE_MAX_OUTPUT_BYTES`
+
+Maximum size of the processed WebP object stored by the service, in bytes. Lossy quality is binary-searched from 100 to 0 using the same resampled image pixels. Must be a positive integer.
+
+Default: `102400` bytes (100 KiB).
+
+### `IMAGE_OUTPUT_WIDTH` and `IMAGE_OUTPUT_HEIGHT`
+
+Exact output width and height in pixels. The service center-crops the input to match this aspect ratio and resamples once to these dimensions without distortion. Each value must be between `1` and `12000`, the decoder's compile-time safety bound.
+
+Defaults: `1024` pixels for both width and height.
+
 ### `IMAGE_API_KEY`
 
 Optional bearer token protecting write operations.
@@ -543,7 +553,19 @@ Production deployments should make this choice deliberately.
 
 ### `GETMETHOD_AUTH`
 
-When set to `true`, require `Authorization: Bearer <IMAGE_API_KEY>` for image GET, HEAD, and resource-list requests. It defaults to `false` for backwards compatibility. Startup fails if it is enabled without `IMAGE_API_KEY`.
+When set to `true`, require `Authorization: Bearer <IMAGE_API_KEY>` for image GET, HEAD, resource-list, image-info, and presign requests. It defaults to `false` for backwards compatibility. Startup fails if it is enabled without `IMAGE_API_KEY`.
+
+### `IMAGE_PRESIGN_TTL_SECONDS`
+
+Lifetime in seconds for presigned GET URLs. Defaults to `3600`; valid values are `1..=604800`.
+
+### `IMAGE_CACHE_CONTROL`
+
+Optional full Cache-Control override for image GET and HEAD responses. By default, cache lifetime comes from `IMAGE_CACHE_TTL_SECONDS` (60 seconds); responses use `public` when reads are unauthenticated and `private` when `GETMETHOD_AUTH=true`. Do not use `immutable` while slot URLs can be overwritten.
+
+### `IMAGE_CACHE_TTL_SECONDS`
+
+Cache lifetime in seconds for image GET and HEAD responses. Defaults to `60`. Set to `0` to emit `Cache-Control: no-store`. `IMAGE_CACHE_CONTROL`, when set, overrides this generated policy.
 
 ### `IMAGE_PUBLIC_BASE_URL`
 

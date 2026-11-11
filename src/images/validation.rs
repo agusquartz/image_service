@@ -1,5 +1,5 @@
 use crate::{
-    config::{MAX_SLOT, MIN_SLOT},
+    config::{MAX_SLOT_NUMBER, MIN_SLOT},
     error::ApiError,
 };
 
@@ -66,11 +66,11 @@ pub(crate) fn validate_resource_id(resource_id: &str) -> Result<(), ApiError> {
 
 /// Validates the image slot.
 ///
-/// Slots are one-based and limited by the configured image policy.
+/// Slots are one-based and fit the storage/API slot number type.
 pub(crate) fn validate_slot(slot: u8) -> Result<(), ApiError> {
-    if !(MIN_SLOT..=MAX_SLOT).contains(&slot) {
+    if !(MIN_SLOT..=MAX_SLOT_NUMBER).contains(&slot) {
         return Err(ApiError::BadRequest(format!(
-            "slot must be between {MIN_SLOT} and {MAX_SLOT}"
+            "slot must be between {MIN_SLOT} and {MAX_SLOT_NUMBER}"
         )));
     }
 

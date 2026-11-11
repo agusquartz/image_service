@@ -125,7 +125,7 @@ docker run --rm --read-only \
 
 This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
 
-The local endpoint smoke test exercises the default public-read behavior, explicit `GETMETHOD_AUTH=false`, protected reads with `GETMETHOD_AUTH=true`, upload, GET, HEAD, list, DELETE, and invalid auth configuration. It needs Docker, `curl`, Python 3, and a local test image:
+The filesystem endpoint smoke test exercises public-read compatibility, authenticated reads, POST create-only behavior, PUT replacement, GET, HEAD, info, listing metadata and limits, legacy slots above the configured limit, slot and resource-level DELETE, custom target dimensions, byte limits, and invalid configuration. Resource-level DELETE is checked for idempotence and exact-prefix isolation so similarly named resources remain intact. It needs Docker, `curl`, Python 3, and a local test image:
 
 ```bash
 docker build -t image-service:local .
@@ -133,6 +133,16 @@ bash scripts/smoke_test.sh image-service:local ./TEST_IMAGE_ORIGINAL.png
 ```
 
 The image file is a local fixture and is excluded from Git and the Docker build context. Pass another local PNG/JPEG path as the script's second argument when needed.
+
+### MinIO S3-compatible smoke test
+
+The MinIO test starts a MinIO-compatible server and Image Service on a private Docker network. Both use ephemeral containers and a `tmpfs` object directory; the script removes the containers and network on exit. It checks create-only and replace uploads, S3 GET/HEAD and conditional GET, metadata-bearing listings including a legacy slot above the configured limit, direct download through a presigned URL, slot deletion, and recursive resource-level deletion. The resource deletion test verifies idempotence and confirms that objects under a similarly named resource are preserved.
+
+```bash
+bash scripts/verify_phase1_phase2.sh ./TEST_IMAGE_ORIGINAL.png
+```
+
+The combined script builds the Distroless service image, runs the filesystem smoke test, pulls the MinIO-compatible test image if needed, and runs the S3-compatible smoke test. Both test backends use volatile storage and clean up their containers. Set `MINIO_IMAGE` to use a different MinIO-compatible image and `IMAGE_SERVICE_IMAGE` to choose the service image tag. The individual scripts can also be run separately.
 
 ---
 

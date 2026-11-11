@@ -29,6 +29,10 @@ HTTP fetch                     yes
 HTTP HEAD                      yes
 HTTP resource listing          yes
 HTTP image deletion            yes
+HTTP image information         yes
+Presigned read URLs            yes (backend capability required)
+Cache validators               yes
+Upload methods                 POST (create-only), PUT (create or replace)
 
 Local filesystem storage       yes
 S3 storage                     yes
@@ -39,13 +43,14 @@ Runtime-selectable storage     yes
 Atomic filesystem writes       yes
 
 WebP reduction                 yes
+Configurable image limits      yes (input/output bytes, output width/height)
 Optional API key               yes
 Optional read authentication   yes
 
 Delete endpoint                yes
 Database                       no
 Processing profiles            no
-Runtime processing policy      partial
+Runtime processing policy      partial (byte/dimension limits; profiles remain planned)
 ```
 
 S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
@@ -134,30 +139,16 @@ should not be introduced unless OpenDAL cannot provide a required capability.
 
 ---
 
-### Fully Configurable Image Policy
+### Processing Policy Beyond Global Output Settings
 
-Values that are currently compile-time constants could become runtime configuration.
+Global input/output byte limits and target output dimensions are now runtime-configurable. If the byte limit cannot be met at the target dimensions, output dimensions are reduced while preserving the target aspect ratio. Remaining compile-time policies that could become configurable include decoder allocation, accepted source dimensions, supported formats, and processing concurrency policy.
 
 For example:
 
 ```dotenv
-IMAGE_MAX_REQUEST_MB=16
-IMAGE_MAX_SOURCE_MB=15
-IMAGE_MAX_OUTPUT_KB=400
-
-IMAGE_MAX_WIDTH=12000
-IMAGE_MAX_HEIGHT=12000
 IMAGE_MAX_DECODE_MEMORY_MB=256
-
-IMAGE_MIN_LONGEST_SIDE=512
-IMAGE_RESIZE_SCALE=0.85
-IMAGE_MAX_RESIZE_ROUNDS=10
-```
-
-WebP qualities could also become configurable:
-
-```dotenv
-IMAGE_WEBP_QUALITIES=88,80,72,64,56,48,42
+IMAGE_MAX_SOURCE_DIMENSION=12000
+IMAGE_SUPPORTED_FORMATS=jpeg,png,webp,gif,bmp,tiff
 ```
 
 This would allow the same binary to run under different image policies without recompilation.
@@ -188,7 +179,7 @@ Different namespaces could eventually use different processing profiles.
 For example:
 
 ```text
-products -> WebP, max 400 KB
+products -> WebP, max 1 MB, 1024 × 1024 center crop
 avatars  -> WebP, max 120 KB, square crop
 banners  -> AVIF, max width 1920
 ```
@@ -256,6 +247,7 @@ Implemented:
 
 ```text
 DELETE /api/images/{namespace}/{resource_id}/{slot}
+DELETE /api/images/{namespace}/{resource_id}
 ```
 
 The operation uses the OpenDAL-backed `ImageStore`, requires write authentication when `IMAGE_API_KEY` is configured, and returns `204 No Content` for both existing and missing slots.
@@ -271,12 +263,6 @@ HEAD /api/images/{namespace}/{resource_id}/{slot}
 
 Resource listing returns existing WebP slots in ascending order. HEAD uses storage `stat` and returns content type and length without reading image bytes.
 
-Further resource operations could support:
-
-```text
-DELETE /api/images/{namespace}/{resource_id}/{slot}
-```
-
 The storage layer could delegate deletion to OpenDAL independently of the selected backend.
 
 Logical deletion could be introduced separately if ownership, auditing, or retention requirements eventually require metadata persistence.
@@ -285,26 +271,31 @@ Logical deletion could be introduced separately if ownership, auditing, or reten
 
 ### Resource-Level Operations
 
-Potential APIs:
+Implemented APIs:
 
 ```text
 GET    /api/images/{namespace}/{resource_id}
 DELETE /api/images/{namespace}/{resource_id}
 ```
 
-These could:
+These:
 
-- List existing slots.
-- Return image metadata.
-- Remove every image belonging to a resource.
+- List existing slots in ascending order with available byte size, ETag, and Last-Modified metadata; use the per-image `/info` route for dimensions.
+- Remove every object under the exact resource prefix, idempotently.
 
-Any listing behavior should account for differences between filesystem and object-storage semantics while keeping those differences outside the HTTP and application layers.
+OpenDAL handles the filesystem directory and object-storage prefix semantics inside the storage layer, outside the HTTP and application layers.
 
 ---
 
+### Presigned Read URLs
+
+Implemented at `POST /api/images/{namespace}/{resource_id}/{slot}/presign`. The endpoint signs GET only, uses `IMAGE_PRESIGN_TTL_SECONDS` (default 3600, maximum 604800), and checks OpenDAL's `presign_read` capability. Filesystem storage returns `501 Not Implemented`; presigned writes remain out of scope because they would bypass image processing.
+
 ### Metadata
 
-A future version may persist metadata such as:
+On-demand image information is implemented at `GET /api/images/{namespace}/{resource_id}/{slot}/info`. It returns WebP dimensions, size, ETag, and Last-Modified when available. Durable metadata persistence and source-format history remain future work.
+
+Future versions may persist additional metadata such as:
 
 ```json
 {
@@ -332,21 +323,19 @@ Possible implementations include:
 
 ### Cache Configuration
 
-HTTP caching could become configurable.
+Image GET and HEAD support ETag, Last-Modified when available, and conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`. Cache responses default to 60 seconds, public for unauthenticated reads and private when GET auth is enabled. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
 
-For example:
+Example:
 
 ```dotenv
-IMAGE_CACHE_CONTROL=public,max-age=31536000,immutable
+IMAGE_CACHE_TTL_SECONDS=60
 ```
 
-Other planned options may include:
+Future cache work may include:
 
-- ETag generation.
-- Last-Modified.
-- Conditional requests.
 - CDN-aware cache headers.
-- Immutable versioned image URLs.
+- **Versioned URLs for immutable caching (optional):** add a URL keyed by the SHA-256 digest of the final stored WebP and preserve the existing mutable slot URL for compatibility. Return the versioned URL additively from uploads so storefronts can store and use it. Apply a long lifetime such as `public, max-age=31536000, immutable` only to versioned URLs; keep a short TTL on the mutable URL. Before implementation, define retention and deletion for old versions, including storage lifecycle/cost and how resource deletion affects cached copies. Do not use an object-store ETag as the content hash unless the backend guarantees that meaning.
+- Optional `IMAGE_STREAM_GET` responses for deployments with larger image limits or high concurrent download volume.
 
 ---
 
@@ -405,19 +394,13 @@ Possible namespace-specific configuration:
 
 ### Configurable Slot Limits
 
-The current global limit is:
-
-```text
-1..=5
-```
-
-A future configuration could expose:
+Implemented as the global `IMAGE_MAX_SLOTS` setting. It defaults to `5` and accepts `1..=255`. It limits creation: POST cannot create above the configured maximum; PUT may replace an existing higher slot but cannot create one. GET, HEAD, info, presign, list, and DELETE continue to work for existing slots above the setting. Resource listings report `max_creatable_slot`. Namespace-specific slot limits remain future work.
 
 ```dotenv
 IMAGE_MAX_SLOTS=5
 ```
 
-or namespace-specific values.
+Reducing the configured limit does not hide or delete existing higher-numbered slots. They remain accessible and can be deleted or replaced with PUT; new slots above the limit are rejected.
 
 ---
 

@@ -31,14 +31,18 @@ src/
     │
     ├── dtos/
     │   ├── mod.rs
+    │   ├── image_info_response.rs
     │   ├── image_list_response.rs
+    │   ├── presign_response.rs
     │   └── upload_response.rs
     │
     └── handler/
         ├── mod.rs
         ├── delete.rs
         ├── fetch.rs
+        ├── info.rs
         ├── list.rs
+        ├── presign.rs
         └── upload.rs
 ```
 
@@ -156,6 +160,7 @@ Responsibilities:
 - Write image bytes through OpenDAL.
 - Delete image objects through OpenDAL.
 - Read object metadata with `stat` and list slots under a resource prefix.
+- Generate presigned read requests only when the backend advertises that capability.
 - Translate storage backend errors into application errors.
 
 Example object key:
@@ -183,6 +188,7 @@ Responsibilities:
 - Configure authentication.
 - Configure concurrency.
 - Configure the public base URL.
+- Configure presigned URL lifetime and optional cache headers.
 - Construct dependencies shared by handlers.
 
 ---
@@ -196,7 +202,7 @@ An upload request follows this path:
 ```text
 Client
   |
-  | POST multipart/form-data
+  | POST (create) / PUT (replace) multipart/form-data
   v
 Router
   |
@@ -220,7 +226,8 @@ Reduction Layer
   +----> Decode with safety limits
   +----> Encode as WebP
   +----> Reduce quality
-  +----> Resize if necessary
+  +----> Center-crop to target aspect ratio and resample once to exact dimensions
+  +----> Find a lossy WebP quality that fits the output byte limit
   |
   v
 Storage Layer
@@ -306,10 +313,11 @@ X-Content-Type-Options: nosniff
 These operations use the same validated `ImageKey` and OpenDAL-backed storage boundary:
 
 - `DELETE /api/images/{namespace}/{resource_id}/{slot}` uses write authorization when `IMAGE_API_KEY` is configured and treats a missing object as a successful idempotent delete.
+- `DELETE /api/images/{namespace}/{resource_id}` uses write authorization and deletes recursively under the exact resource prefix. OpenDAL keeps directory and object-prefix details inside the storage layer; empty and missing resources are idempotent.
 - `HEAD /api/images/{namespace}/{resource_id}/{slot}` calls `stat` to return content type and length without reading image bytes.
-- `GET /api/images/{namespace}/{resource_id}` lists valid `NN.webp` slots under the resource prefix and returns them in ascending order.
+- `GET /api/images/{namespace}/{resource_id}` lists existing `NN.webp` slots under the resource prefix in ascending order, includes available storage metadata, and returns `max_creatable_slot`. The list includes existing slots above `IMAGE_MAX_SLOTS` so lowering the limit never hides stored images. OpenDAL normalizes LocalFS and object-storage listing behavior before it reaches the application layer.
 
-Image reads are public by default. `GETMETHOD_AUTH=true` applies bearer authentication to GET, HEAD, and resource listing; the flag requires `IMAGE_API_KEY`.
+Image reads are public by default. `GETMETHOD_AUTH=true` applies bearer authentication to GET, HEAD, resource listing, image-info, and presign requests; the flag requires `IMAGE_API_KEY`.
 
 ---
 
