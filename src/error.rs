@@ -22,9 +22,13 @@ pub enum ApiError {
 
     Unauthorized,
 
+    Conflict(String),
+
     NotFound(String),
 
     UnsupportedMediaType(String),
+
+    NotImplemented(String),
 
     PayloadTooLarge(String),
 
@@ -47,9 +51,13 @@ impl IntoResponse for ApiError {
 
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
 
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
+
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
 
             Self::UnsupportedMediaType(message) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, message),
+
+            Self::NotImplemented(message) => (StatusCode::NOT_IMPLEMENTED, message),
 
             Self::PayloadTooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message),
 

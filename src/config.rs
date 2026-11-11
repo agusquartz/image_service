@@ -1,46 +1,29 @@
 use std::{collections::HashMap, env, io, path::PathBuf};
 
-/// Maximum HTTP request size.
-///
-/// This is slightly larger than [`MAX_SOURCE_BYTES`] to leave enough
-/// room for multipart headers and boundaries.
-pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-
-/// Maximum accepted source image size.
+/// Default maximum accepted source image size.
 ///
 /// Images larger than this value are rejected before processing.
-pub const MAX_SOURCE_BYTES: usize = 15 * 1024 * 1024;
+pub const DEFAULT_MAX_SOURCE_BYTES: usize = 15 * 1024 * 1024;
 
-/// Maximum encoded output size.
+/// Default maximum encoded output size.
 ///
 /// Every successfully processed image must fit within this limit.
-pub const MAX_OUTPUT_BYTES: usize = 400 * 1024;
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 100 * 1024;
+
+/// Default freshness lifetime for image responses, in seconds.
+pub const DEFAULT_IMAGE_CACHE_TTL_SECONDS: u64 = 60;
+
+/// Maximum HTTP request overhead for multipart headers and boundaries.
+pub const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 
 /// Minimum valid image slot.
 pub const MIN_SLOT: u8 = 1;
 
-/// Maximum valid image slot.
-///
-/// Each resource can therefore have up to five images.
-pub const MAX_SLOT: u8 = 5;
+/// Default maximum number of slots available to each resource.
+pub const DEFAULT_MAX_SLOTS: u8 = 5;
 
-/// WebP quality levels tried before reducing image dimensions.
-///
-/// The encoder starts with the highest quality and progressively
-/// lowers it until the result fits within [`MAX_OUTPUT_BYTES`].
-pub const WEBP_QUALITIES: [f32; 7] = [88.0, 80.0, 72.0, 64.0, 56.0, 48.0, 42.0];
-
-/// Scale applied after all WebP quality levels have been exhausted.
-///
-/// A value of `0.85` reduces both width and height to 85% of their
-/// previous dimensions.
-pub const RESIZE_SCALE: f32 = 0.85;
-
-/// Maximum number of resize iterations.
-pub const MAX_RESIZE_ROUNDS: usize = 10;
-
-/// Stop reducing dimensions when the longest side reaches this value.
-pub const MIN_LONGEST_SIDE: u32 = 512;
+/// Slot path parameters and storage keys use an unsigned 8-bit slot number.
+pub const MAX_SLOT_NUMBER: u8 = u8::MAX;
 
 /// Maximum accepted width or height during image decoding.
 ///
@@ -48,8 +31,15 @@ pub const MIN_LONGEST_SIDE: u32 = 512;
 /// crafted images.
 pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
 
+/// Maximum source image dimensions accepted for converted output.
+pub const DEFAULT_OUTPUT_WIDTH: u32 = 1024;
+pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1024;
+
 /// Maximum memory allocation allowed by the image decoder.
 pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Maximum presigned URL lifetime supported by the S3 API.
+pub const MAX_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct StorageConfig {
@@ -80,6 +70,21 @@ pub struct AppConfig {
     /// to execute concurrently.
     pub max_concurrency: usize,
 
+    /// Maximum uploaded image payload size, in bytes.
+    pub max_source_bytes: usize,
+
+    /// Maximum encoded WebP size, in bytes.
+    pub max_output_bytes: usize,
+
+    /// Exact width of processed images in pixels.
+    pub output_width: u32,
+
+    /// Exact height of processed images in pixels.
+    pub output_height: u32,
+
+    /// Maximum valid image slot for each resource.
+    pub max_slots: u8,
+
     /// Optional bearer token required for write operations.
     pub api_key: Option<String>,
 
@@ -87,6 +92,12 @@ pub struct AppConfig {
     ///
     /// Defaults to `false` to preserve the existing public GET behavior.
     pub getmethod_auth: bool,
+
+    /// Lifetime for presigned image-read URLs.
+    pub presign_ttl_seconds: u64,
+
+    /// Cache-Control value applied to image GET and HEAD responses.
+    pub cache_control: String,
 
     /// Optional externally visible base URL.
     ///
@@ -107,8 +118,16 @@ impl AppConfig {
     /// - `IMAGE_STORAGE_SCHEME`
     /// - `IMAGE_STORAGE_*` backend-specific options
     /// - `IMAGE_MAX_CONCURRENCY`
+    /// - `IMAGE_MAX_INPUT_BYTES`
+    /// - `IMAGE_MAX_OUTPUT_BYTES`
+    /// - `IMAGE_OUTPUT_WIDTH`
+    /// - `IMAGE_OUTPUT_HEIGHT`
+    /// - `IMAGE_MAX_SLOTS`
     /// - `IMAGE_API_KEY`
     /// - `GETMETHOD_AUTH`
+    /// - `IMAGE_PRESIGN_TTL_SECONDS`
+    /// - `IMAGE_CACHE_CONTROL`
+    /// - `IMAGE_CACHE_TTL_SECONDS`
     /// - `IMAGE_PUBLIC_BASE_URL`
     pub fn from_env() -> io::Result<Self> {
         let bind_address = env::var("IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
@@ -156,6 +175,37 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .unwrap_or(2);
 
+        let max_source_bytes = parse_bounded_usize(
+            "IMAGE_MAX_INPUT_BYTES",
+            DEFAULT_MAX_SOURCE_BYTES,
+            1,
+            usize::MAX,
+        )?;
+        let max_output_bytes = parse_bounded_usize(
+            "IMAGE_MAX_OUTPUT_BYTES",
+            DEFAULT_MAX_OUTPUT_BYTES,
+            1,
+            usize::MAX,
+        )?;
+        let output_width = parse_bounded_u32(
+            "IMAGE_OUTPUT_WIDTH",
+            DEFAULT_OUTPUT_WIDTH,
+            1,
+            MAX_IMAGE_DIMENSION,
+        )?;
+        let output_height = parse_bounded_u32(
+            "IMAGE_OUTPUT_HEIGHT",
+            DEFAULT_OUTPUT_HEIGHT,
+            1,
+            MAX_IMAGE_DIMENSION,
+        )?;
+        let max_slots = parse_bounded_u32(
+            "IMAGE_MAX_SLOTS",
+            u32::from(DEFAULT_MAX_SLOTS),
+            1,
+            u32::from(MAX_SLOT_NUMBER),
+        )? as u8;
+
         let api_key = env::var("IMAGE_API_KEY")
             .ok()
             .filter(|value| !value.is_empty());
@@ -169,6 +219,60 @@ impl AppConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "GETMETHOD_AUTH=true requires IMAGE_API_KEY to be configured",
+            ));
+        }
+
+        let presign_ttl_seconds = env::var("IMAGE_PRESIGN_TTL_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("IMAGE_PRESIGN_TTL_SECONDS must be a positive integer: {error}"),
+                )
+            })?
+            .unwrap_or(3600);
+
+        if presign_ttl_seconds == 0 || presign_ttl_seconds > MAX_PRESIGN_TTL_SECONDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "IMAGE_PRESIGN_TTL_SECONDS must be between 1 and {MAX_PRESIGN_TTL_SECONDS}"
+                ),
+            ));
+        }
+
+        let cache_control = env::var("IMAGE_CACHE_CONTROL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let cache_ttl_seconds = env::var("IMAGE_CACHE_TTL_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("IMAGE_CACHE_TTL_SECONDS must be a non-negative integer: {error}"),
+                )
+            })?
+            .unwrap_or(DEFAULT_IMAGE_CACHE_TTL_SECONDS);
+
+        let cache_control = cache_control.unwrap_or_else(|| {
+            if cache_ttl_seconds == 0 {
+                "no-store".to_string()
+            } else {
+                let visibility = if getmethod_auth { "private" } else { "public" };
+                format!("{visibility}, max-age={cache_ttl_seconds}")
+            }
+        });
+
+        if axum::http::HeaderValue::from_str(&cache_control).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IMAGE_CACHE_CONTROL must be a valid HTTP header value",
             ));
         }
 
@@ -186,9 +290,58 @@ impl AppConfig {
             bind_address,
             storage,
             max_concurrency,
+            max_source_bytes,
+            max_output_bytes,
+            output_width,
+            output_height,
+            max_slots,
             api_key,
             getmethod_auth,
+            presign_ttl_seconds,
+            cache_control,
             public_base_url,
         })
     }
+}
+
+fn parse_bounded_usize(name: &str, default: usize, min: usize, max: usize) -> io::Result<usize> {
+    let value = env::var(name)
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer: {error}"),
+            )
+        })?
+        .unwrap_or(default);
+    if !(min..=max).contains(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be between {min} and {max}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_bounded_u32(name: &str, default: u32, min: u32, max: u32) -> io::Result<u32> {
+    let value = env::var(name)
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer: {error}"),
+            )
+        })?
+        .unwrap_or(default);
+    if !(min..=max).contains(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be between {min} and {max}"),
+        ));
+    }
+    Ok(value)
 }

@@ -1,8 +1,5 @@
 use crate::{
-    config::{
-        MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION, MAX_OUTPUT_BYTES, MAX_RESIZE_ROUNDS,
-        MIN_LONGEST_SIDE, RESIZE_SCALE, WEBP_QUALITIES,
-    },
+    config::{MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION},
     error::ApiError,
 };
 
@@ -28,6 +25,9 @@ use super::model::IncomingImage;
 pub(crate) async fn reduce_to_webp(
     semaphore: Arc<Semaphore>,
     incoming: IncomingImage,
+    max_output_bytes: usize,
+    output_width: u32,
+    output_height: u32,
 ) -> Result<Vec<u8>, ApiError> {
     let permit = semaphore.acquire_owned().await.map_err(|error| {
         ApiError::Internal(format!("Image processing semaphore closed: {error}"))
@@ -38,7 +38,13 @@ pub(crate) async fn reduce_to_webp(
         // blocking image-processing operation.
         let _permit = permit;
 
-        process_image_blocking(&incoming.bytes, &incoming.mime)
+        process_image_blocking(
+            &incoming.bytes,
+            &incoming.mime,
+            max_output_bytes,
+            output_width,
+            output_height,
+        )
     })
     .await
     .map_err(|error| ApiError::Internal(format!("Image processing task failed: {error}")))?
@@ -48,7 +54,13 @@ pub(crate) async fn reduce_to_webp(
 ///
 /// This function is synchronous because the image library and WebP
 /// encoder perform CPU-bound work.
-fn process_image_blocking(bytes: &[u8], declared_mime: &str) -> Result<Vec<u8>, ApiError> {
+fn process_image_blocking(
+    bytes: &[u8],
+    declared_mime: &str,
+    max_output_bytes: usize,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<u8>, ApiError> {
     let format = image::guess_format(bytes)
         .map_err(|_| ApiError::UnsupportedMediaType("Unknown image format".to_string()))?;
 
@@ -97,7 +109,7 @@ fn process_image_blocking(bytes: &[u8], declared_mime: &str) -> Result<Vec<u8>, 
     // metadata from becoming rotated after conversion to WebP.
     image.apply_orientation(orientation);
 
-    compress_webp(image)
+    compress_webp(image, max_output_bytes, output_width, output_height)
 }
 
 /// Returns whether the detected source format is accepted by the
@@ -153,74 +165,126 @@ fn declared_mime_is_acceptable(declared_mime: &str, format: ImageFormat) -> bool
     }
 }
 
-/// Encodes an image as WebP while attempting to keep the output under
-/// [`MAX_OUTPUT_BYTES`].
-///
-/// The reduction strategy has two phases.
-///
-/// ## Phase 1: quality reduction
-///
-/// For the current dimensions, several WebP quality levels are tested,
-/// from highest to lowest.
-///
-/// The first result satisfying the output limit is returned.
-///
-/// ## Phase 2: dimension reduction
-///
-/// If none of the configured quality levels fits, width and height are
-/// reduced by [`RESIZE_SCALE`] and the quality sequence is attempted
-/// again.
-///
-/// This continues until one of the following happens:
-///
-/// - The output fits.
-/// - The maximum number of resize rounds is reached.
-/// - The longest side reaches [`MIN_LONGEST_SIDE`].
-fn compress_webp(mut image: DynamicImage) -> Result<Vec<u8>, ApiError> {
-    for resize_round in 0..=MAX_RESIZE_ROUNDS {
-        let width = image.width();
+/// Center-crops to the configured aspect ratio and resamples to the requested
+/// dimensions. It finds the highest WebP quality that fits the byte limit. If
+/// even quality 0 is too large, it progressively reduces dimensions, always
+/// resizing from the same cropped source pixels.
+fn compress_webp(
+    image: DynamicImage,
+    max_output_bytes: usize,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<u8>, ApiError> {
+    let cropped = crop_to_target_ratio(image, output_width, output_height);
+    let (mut width, mut height) = (output_width, output_height);
 
-        let height = image.height();
-
-        let rgba = image.to_rgba8();
-
-        let encoder = Encoder::from_rgba(rgba.as_raw(), width, height);
-
-        // First try progressively lower WebP quality levels without
-        // changing image dimensions.
-        for quality in WEBP_QUALITIES {
-            let encoded = encoder.encode(quality);
-
-            if encoded.len() <= MAX_OUTPUT_BYTES {
-                return Ok(encoded.to_vec());
-            }
+    loop {
+        let target = cropped.resize_exact(width, height, FilterType::Lanczos3);
+        if let Some(encoded) = encode_webp_with_limit(&target, max_output_bytes, width, height) {
+            return Ok(encoded);
         }
 
-        // All quality levels failed. Decide whether another resize is
-        // allowed.
-        if resize_round >= MAX_RESIZE_ROUNDS {
-            break;
+        if width == 1 && height == 1 {
+            return Err(ApiError::UnprocessableEntity(format!(
+                "The configured output byte limit ({max_output_bytes}) is too small for even a 1x1 WebP image"
+            )));
         }
 
-        if width.max(height) <= MIN_LONGEST_SIDE {
-            break;
+        let next_width = ((width as f32 * 0.8).floor() as u32).max(1);
+        let next_height = ((height as f32 * 0.8).floor() as u32).max(1);
+        if (next_width, next_height) == (width, height) {
+            return Err(ApiError::UnprocessableEntity(format!(
+                "The configured output byte limit ({max_output_bytes}) is too small for a WebP image"
+            )));
         }
+        (width, height) = (next_width, next_height);
+    }
+}
 
-        let new_width = (width as f32 * RESIZE_SCALE).round().max(1.0) as u32;
+/// Encodes at the highest quality that fits, returning `None` if quality 0 is
+/// still too large. All quality candidates use this exact pixel buffer.
+fn encode_webp_with_limit(
+    image: &DynamicImage,
+    max_output_bytes: usize,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let rgba = image.to_rgba8();
+    let encoder = Encoder::from_rgba(rgba.as_raw(), width, height);
 
-        let new_height = (height as f32 * RESIZE_SCALE).round().max(1.0) as u32;
-
-        // Defensive check against a scale operation that would no
-        // longer modify the dimensions.
-        if new_width == width && new_height == height {
-            break;
-        }
-
-        image = image.resize_exact(new_width, new_height, FilterType::Lanczos3);
+    let highest_quality = encoder.encode(100.0);
+    if highest_quality.len() <= max_output_bytes {
+        return Some(highest_quality.to_vec());
     }
 
-    Err(ApiError::UnprocessableEntity(format!(
-        "Could not reduce the image below {} KB",
-        MAX_OUTPUT_BYTES / 1024
-    )))
+    let mut low = 0i32;
+    let mut high = 99i32;
+    let mut best: Option<Vec<u8>> = None;
+    while low <= high {
+        let quality = low + (high - low) / 2;
+        let encoded = encoder.encode(quality as f32);
+        if encoded.len() <= max_output_bytes {
+            best = Some(encoded.to_vec());
+            low = quality + 1;
+        } else {
+            high = quality - 1;
+        }
+    }
+    best
+}
+
+fn crop_to_target_ratio(
+    image: DynamicImage,
+    output_width: u32,
+    output_height: u32,
+) -> DynamicImage {
+    let (source_width, source_height) = (image.width(), image.height());
+    let source_ratio = source_width as u64 * output_height as u64;
+    let target_ratio = source_height as u64 * output_width as u64;
+
+    let (crop_x, crop_y, crop_width, crop_height) = if source_ratio > target_ratio {
+        let width = ((source_height as u64 * output_width as u64) / output_height as u64)
+            .clamp(1, source_width as u64) as u32;
+        ((source_width - width) / 2, 0, width, source_height)
+    } else {
+        let height = ((source_width as u64 * output_height as u64) / output_width as u64)
+            .clamp(1, source_height as u64) as u32;
+        (0, (source_height - height) / 2, source_width, height)
+    };
+
+    image.crop_imm(crop_x, crop_y, crop_width, crop_height)
+}
+
+#[cfg(test)]
+fn crop_and_resize(image: DynamicImage, output_width: u32, output_height: u32) -> DynamicImage {
+    crop_to_target_ratio(image, output_width, output_height).resize_exact(
+        output_width,
+        output_height,
+        FilterType::Lanczos3,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compress_webp, crop_and_resize};
+
+    #[test]
+    fn center_crops_sides_to_match_the_target_aspect_ratio() {
+        let source = image::RgbImage::from_fn(4, 2, |x, y| image::Rgb([x as u8, y as u8, 0]));
+        let output = crop_and_resize(image::DynamicImage::ImageRgb8(source.clone()), 2, 2);
+        assert_eq!((output.width(), output.height()), (2, 2));
+        assert_eq!(output.to_rgb8().get_pixel(0, 0), source.get_pixel(1, 0));
+        assert_eq!(output.to_rgb8().get_pixel(1, 1), source.get_pixel(2, 1));
+    }
+
+    #[test]
+    fn encodes_at_exact_dimensions_and_within_configured_byte_limit() {
+        let image = image::DynamicImage::new_rgb8(2000, 1000);
+        let output = compress_webp(image, 1024 * 1024, 1024, 1024)
+            .expect("image should fit the configured byte limit");
+        let decoded = image::load_from_memory_with_format(&output, image::ImageFormat::WebP)
+            .expect("output should be valid WebP");
+        assert_eq!((decoded.width(), decoded.height()), (1024, 1024));
+        assert!(output.len() <= 1024 * 1024);
+    }
 }

@@ -3,69 +3,94 @@ use crate::{auth::require_write_auth, error::ApiError, state::AppState};
 use axum::{
     Json,
     extract::{Multipart, Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
 };
 
 use super::super::{
     dtos::UploadResponse, model::ImageKey, multipart::read_multipart_image, service,
 };
 
-/// Uploads or replaces an image.
-///
-/// # Endpoint
-///
-/// ```text
-/// POST /api/images/{namespace}/{resource_id}/{slot}
-/// ```
-///
-/// # Request
-///
-/// The request must use `multipart/form-data` and contain exactly one
-/// image field named:
-///
-/// ```text
-/// image
-/// ```
-///
-/// # Authentication
-///
-/// If `IMAGE_API_KEY` is configured, the request must contain:
-///
-/// ```text
-/// Authorization: Bearer <IMAGE_API_KEY>
-/// ```
-///
-/// # Behavior
-///
-/// The image is:
-///
-/// 1. Validated.
-/// 2. Decoded.
-/// 3. Converted to WebP.
-/// 4. Reduced until it satisfies the configured output size limit.
-/// 5. Stored in the requested resource slot.
-///
-/// Uploading another image to the same slot replaces the existing file.
-pub(crate) async fn upload_image(
+/// Creates an image in an unused slot.
+pub(crate) async fn create_image(
     State(state): State<AppState>,
-
     Path((namespace, resource_id, slot)): Path<(String, String, u8)>,
-
     headers: HeaderMap,
-
     multipart: Multipart,
-) -> Result<Json<UploadResponse>, ApiError> {
-    // Authorization happens before expensive image parsing and
-    // processing.
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
+    let (response, _) = upload_image(
+        state,
+        namespace,
+        resource_id,
+        slot,
+        headers,
+        multipart,
+        false,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Creates or replaces the complete image in a slot.
+pub(crate) async fn replace_image(
+    State(state): State<AppState>,
+    Path((namespace, resource_id, slot)): Path<(String, String, u8)>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
+    let (response, was_created) = upload_image(
+        state,
+        namespace,
+        resource_id,
+        slot,
+        headers,
+        multipart,
+        true,
+    )
+    .await?;
+    let status = if was_created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
+async fn upload_image(
+    state: AppState,
+    namespace: String,
+    resource_id: String,
+    slot: u8,
+    headers: HeaderMap,
+    multipart: Multipart,
+    replace_existing: bool,
+) -> Result<(UploadResponse, bool), ApiError> {
+    // Authorize before expensive multipart parsing and image processing.
     require_write_auth(&headers, state.api_key.as_deref())?;
 
-    // Validate path parameters before consuming and processing a
-    // potentially large multipart body.
+    // Validate the path before consuming a potentially large request body.
     let key = ImageKey::new(namespace, resource_id, slot)?;
 
-    let incoming = read_multipart_image(multipart).await?;
+    if slot > state.max_slots {
+        if !replace_existing {
+            return Err(ApiError::BadRequest(format!(
+                "cannot create slot {slot}: IMAGE_MAX_SLOTS is {}",
+                state.max_slots
+            )));
+        }
 
-    let response = service::upload(&state, &key, incoming).await?;
+        match state.store.stat(&key).await {
+            Ok(_) => {}
+            Err(ApiError::NotFound(_)) => {
+                return Err(ApiError::BadRequest(format!(
+                    "cannot create slot {slot}: IMAGE_MAX_SLOTS is {}",
+                    state.max_slots
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
-    Ok(Json(response))
+    let incoming = read_multipart_image(multipart, state.max_source_bytes).await?;
+
+    service::upload(&state, &key, incoming, replace_existing).await
 }
