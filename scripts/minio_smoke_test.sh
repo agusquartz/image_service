@@ -61,6 +61,8 @@ docker run --detach --rm \
     --network "$network" \
     --publish 127.0.0.1::3000 \
     --env IMAGE_BIND=0.0.0.0:3000 \
+    --env IMAGE_READ_AUTH=none \
+    --env IMAGE_WRITE_AUTH=none \
     --env IMAGE_STORAGE_SCHEME=s3 \
     --env IMAGE_STORAGE_BUCKET="$bucket" \
     --env IMAGE_STORAGE_REGION=us-east-1 \
