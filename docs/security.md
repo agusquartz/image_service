@@ -8,8 +8,9 @@ Image Service processes untrusted binary uploads, so input validation and resour
 
 The service includes several defensive measures:
 
-- Request-body size limits.
-- Source-file size limits.
+- Configurable request-body limits (`IMAGE_MAX_INPUT_BYTES` plus 1 MiB multipart framing).
+- Configurable source-file size limits (`IMAGE_MAX_INPUT_BYTES`).
+- Configurable WebP byte and target-dimension limits (`IMAGE_MAX_OUTPUT_BYTES`, `IMAGE_OUTPUT_WIDTH`, and `IMAGE_OUTPUT_HEIGHT`).
 - MIME-to-format verification.
 - Maximum decode dimensions.
 - Decoder memory-allocation limits.
@@ -40,7 +41,7 @@ A production deployment should additionally consider:
 
 Write authentication is currently optional.
 
-If `IMAGE_API_KEY` is configured, mutation requests must provide:
+If `IMAGE_API_KEY` is configured, mutation requests (`POST`, `PUT`, and `DELETE`) must provide:
 
 ```http
 Authorization: Bearer <IMAGE_API_KEY>
@@ -49,6 +50,8 @@ Authorization: Bearer <IMAGE_API_KEY>
 If no API key is configured, write operations are currently allowed without authentication. Production deployments should make this choice deliberately and should not expose unauthenticated upload endpoints unintentionally.
 
 Image reads (`GET`, `HEAD`, and resource listing) are public by default to preserve existing integrations. Set `GETMETHOD_AUTH=true` to require the same bearer token for these endpoints. This setting requires `IMAGE_API_KEY`; the service rejects that configuration at startup if the key is missing. `/health` is not protected by this setting.
+
+The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
 ## Upload Validation Boundary
 

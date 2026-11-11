@@ -20,7 +20,9 @@ Image reads are public by default. If `GETMETHOD_AUTH=true`, send `Authorization
 
 ## cURL
 
-### Upload
+### Create (POST)
+
+POST creates an image only in an unused slot and returns `201 Created`. It returns `409 Conflict` if the slot already contains an image.
 
 ```bash
 curl \
@@ -40,6 +42,18 @@ Example response:
   "url": "/api/images/products/845/1",
   "size_bytes": 193284
 }
+```
+
+### Replace (PUT)
+
+PUT creates the image when the slot is empty and replaces the complete existing image otherwise. Use PUT when intentionally updating a slot:
+
+```bash
+curl \
+  -X PUT \
+  "http://127.0.0.1:3000/api/images/products/845/1" \
+  -H "Authorization: Bearer change-me" \
+  -F "image=@./photo.jpg"
 ```
 
 ### Fetch
@@ -68,6 +82,20 @@ List image slots for a resource:
 curl "http://127.0.0.1:3000/api/images/products/845"
 ```
 
+The response includes existing slots and the current creation ceiling. Existing slots can be above the ceiling; they remain readable and deletable. `max_creatable_slot` does not indicate that the slot is currently empty.
+
+```json
+{
+  "namespace": "products",
+  "resource_id": "845",
+  "max_creatable_slot": 5,
+  "images": [
+    { "slot": 1, "url": "/api/images/products/845/1" },
+    { "slot": 7, "url": "/api/images/products/845/7" }
+  ]
+}
+```
+
 Check a slot without downloading its body:
 
 ```bash
@@ -81,6 +109,21 @@ curl -X DELETE \
   "http://127.0.0.1:3000/api/images/products/845/1" \
   -H "Authorization: Bearer change-me"
 ```
+
+Read image metadata:
+
+```bash
+curl "http://127.0.0.1:3000/api/images/products/845/1/info"
+```
+
+Request a temporary direct-read URL (supported by backends with OpenDAL `presign_read`, such as S3):
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:3000/api/images/products/845/1/presign"
+```
+
+Add the bearer header to the metadata GET or presign POST when `GETMETHOD_AUTH=true`. The returned URL can be used as a normal GET URL until its `expires_in` lifetime ends.
 
 ---
 
