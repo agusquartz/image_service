@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::{collections::HashMap, env, io, path::PathBuf};
 
 /// Default maximum accepted source image size.
@@ -55,6 +56,28 @@ pub struct StorageConfig {
     pub options: HashMap<String, String>,
 }
 
+/// Optional per-namespace processing overrides.
+///
+/// Omitted fields inherit the existing global processing settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessingProfile {
+    pub max_input_bytes: Option<usize>,
+    pub max_output_bytes: Option<usize>,
+    pub output_width: Option<u32>,
+    pub output_height: Option<u32>,
+}
+
+/// Fully resolved processing policy for one upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessingPolicy {
+    pub profile_name: String,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
 /// Runtime application configuration.
 ///
 /// Environment-specific values live here instead of being scattered
@@ -81,6 +104,12 @@ pub struct AppConfig {
 
     /// Exact height of processed images in pixels.
     pub output_height: u32,
+
+    /// Named processing profiles; individual fields override global values.
+    pub processing_profiles: HashMap<String, ProcessingProfile>,
+
+    /// Namespace-to-profile assignments.
+    pub namespace_profiles: HashMap<String, String>,
 
     /// Maximum valid image slot for each resource.
     pub max_slots: u8,
@@ -122,6 +151,8 @@ impl AppConfig {
     /// - `IMAGE_MAX_OUTPUT_BYTES`
     /// - `IMAGE_OUTPUT_WIDTH`
     /// - `IMAGE_OUTPUT_HEIGHT`
+    /// - `IMAGE_PROCESSING_PROFILES` (JSON object)
+    /// - `IMAGE_NAMESPACE_PROFILES` (JSON object)
     /// - `IMAGE_MAX_SLOTS`
     /// - `IMAGE_API_KEY`
     /// - `GETMETHOD_AUTH`
@@ -199,6 +230,12 @@ impl AppConfig {
             1,
             MAX_IMAGE_DIMENSION,
         )?;
+
+        let processing_profiles =
+            parse_json_env::<HashMap<String, ProcessingProfile>>("IMAGE_PROCESSING_PROFILES")?;
+        let namespace_profiles =
+            parse_json_env::<HashMap<String, String>>("IMAGE_NAMESPACE_PROFILES")?;
+        validate_processing_profiles(&processing_profiles, &namespace_profiles)?;
         let max_slots = parse_bounded_u32(
             "IMAGE_MAX_SLOTS",
             u32::from(DEFAULT_MAX_SLOTS),
@@ -294,6 +331,8 @@ impl AppConfig {
             max_output_bytes,
             output_width,
             output_height,
+            processing_profiles,
+            namespace_profiles,
             max_slots,
             api_key,
             getmethod_auth,
@@ -302,6 +341,150 @@ impl AppConfig {
             public_base_url,
         })
     }
+}
+
+fn parse_json_env<T>(name: &str) -> io::Result<T>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    let Ok(value) = env::var(name) else {
+        return Ok(T::default());
+    };
+    if value.trim().is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(&value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must contain a valid JSON object: {error}"),
+        )
+    })
+}
+
+fn validate_processing_profiles(
+    profiles: &HashMap<String, ProcessingProfile>,
+    namespace_profiles: &HashMap<String, String>,
+) -> io::Result<()> {
+    for (name, profile) in profiles {
+        if name == "default" || !is_valid_profile_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid or reserved processing profile name: {name}"),
+            ));
+        }
+        if profile.max_input_bytes == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Profile {name} max_input_bytes must be greater than zero"),
+            ));
+        }
+        if profile.max_output_bytes == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Profile {name} max_output_bytes must be greater than zero"),
+            ));
+        }
+        if profile.output_width.is_some() != profile.output_height.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Profile {name} must set output_width and output_height together"),
+            ));
+        }
+        for (dimension_name, dimension) in [
+            ("output_width", profile.output_width),
+            ("output_height", profile.output_height),
+        ] {
+            if let Some(dimension) = dimension
+                && !(1..=MAX_IMAGE_DIMENSION).contains(&dimension)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Profile {name} {dimension_name} must be between 1 and {MAX_IMAGE_DIMENSION}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    for (namespace, profile_name) in namespace_profiles {
+        if namespace.is_empty()
+            || namespace.len() > 32
+            || !namespace.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'
+                    || character == '_'
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid namespace in IMAGE_NAMESPACE_PROFILES: {namespace}"),
+            ));
+        }
+        if !profiles.contains_key(profile_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Namespace {namespace} references undefined image processing profile: {profile_name}"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '_'
+        })
+}
+
+pub(crate) fn resolve_processing_policy(
+    namespace: &str,
+    global_max_input_bytes: usize,
+    global_max_output_bytes: usize,
+    global_output_width: u32,
+    global_output_height: u32,
+    profiles: &HashMap<String, ProcessingProfile>,
+    namespace_profiles: &HashMap<String, String>,
+) -> ProcessingPolicy {
+    let Some(profile_name) = namespace_profiles.get(namespace) else {
+        return ProcessingPolicy {
+            profile_name: "default".to_string(),
+            max_input_bytes: global_max_input_bytes,
+            max_output_bytes: global_max_output_bytes,
+            output_width: global_output_width,
+            output_height: global_output_height,
+        };
+    };
+
+    let profile = &profiles[profile_name];
+    ProcessingPolicy {
+        profile_name: profile_name.clone(),
+        max_input_bytes: profile.max_input_bytes.unwrap_or(global_max_input_bytes),
+        max_output_bytes: profile.max_output_bytes.unwrap_or(global_max_output_bytes),
+        output_width: profile.output_width.unwrap_or(global_output_width),
+        output_height: profile.output_height.unwrap_or(global_output_height),
+    }
+}
+
+pub(crate) fn max_configured_input_bytes(
+    global_max_input_bytes: usize,
+    profiles: &HashMap<String, ProcessingProfile>,
+    namespace_profiles: &HashMap<String, String>,
+) -> usize {
+    namespace_profiles
+        .values()
+        .filter_map(|profile_name| profiles.get(profile_name))
+        .filter_map(|profile| profile.max_input_bytes)
+        .fold(global_max_input_bytes, usize::max)
 }
 
 fn parse_bounded_usize(name: &str, default: usize, min: usize, max: usize) -> io::Result<usize> {
@@ -344,4 +527,178 @@ fn parse_bounded_u32(name: &str, default: u32, min: u32, max: u32) -> io::Result
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unassigned_namespaces_keep_the_existing_global_processing_policy() {
+        let policy = resolve_processing_policy(
+            "products",
+            DEFAULT_MAX_SOURCE_BYTES,
+            100_000,
+            1024,
+            1024,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            policy,
+            ProcessingPolicy {
+                profile_name: "default".to_string(),
+                max_input_bytes: DEFAULT_MAX_SOURCE_BYTES,
+                max_output_bytes: 100_000,
+                output_width: 1024,
+                output_height: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn profile_overrides_only_explicit_fields_and_only_for_mapped_namespaces() {
+        let profiles = HashMap::from([(
+            "avatar".to_string(),
+            ProcessingProfile {
+                max_input_bytes: None,
+                max_output_bytes: Some(50_000),
+                output_width: Some(512),
+                output_height: Some(512),
+            },
+        )]);
+        let assignments = HashMap::from([("users".to_string(), "avatar".to_string())]);
+
+        let avatar = resolve_processing_policy(
+            "users",
+            17 * 1024 * 1024,
+            100_000,
+            1024,
+            768,
+            &profiles,
+            &assignments,
+        );
+        assert_eq!(avatar.profile_name, "avatar");
+        assert_eq!(avatar.max_input_bytes, 17 * 1024 * 1024);
+        assert_eq!(avatar.max_output_bytes, 50_000);
+        assert_eq!((avatar.output_width, avatar.output_height), (512, 512));
+
+        let product = resolve_processing_policy(
+            "products",
+            17 * 1024 * 1024,
+            100_000,
+            1024,
+            768,
+            &profiles,
+            &assignments,
+        );
+        assert_eq!(product.profile_name, "default");
+        assert_eq!(product.max_input_bytes, 17 * 1024 * 1024);
+        assert_eq!(product.max_output_bytes, 100_000);
+        assert_eq!((product.output_width, product.output_height), (1024, 768));
+    }
+
+    #[test]
+    fn partial_profile_fields_inherit_global_values() {
+        let profiles = HashMap::from([(
+            "compact".to_string(),
+            ProcessingProfile {
+                max_input_bytes: Some(18 * 1024 * 1024),
+                max_output_bytes: Some(40_000),
+                output_width: None,
+                output_height: None,
+            },
+        )]);
+        let assignments = HashMap::from([("products".to_string(), "compact".to_string())]);
+
+        let policy = resolve_processing_policy(
+            "products",
+            17 * 1024 * 1024,
+            100_000,
+            1024,
+            768,
+            &profiles,
+            &assignments,
+        );
+
+        assert_eq!(policy.max_input_bytes, 18 * 1024 * 1024);
+        assert_eq!(policy.max_output_bytes, 40_000);
+        assert_eq!((policy.output_width, policy.output_height), (1024, 768));
+    }
+
+    #[test]
+    fn rejects_invalid_profile_dimensions_and_unknown_assignments() {
+        let partial_dimensions = HashMap::from([(
+            "avatar".to_string(),
+            ProcessingProfile {
+                max_input_bytes: None,
+                max_output_bytes: None,
+                output_width: Some(512),
+                output_height: None,
+            },
+        )]);
+        assert!(validate_processing_profiles(&partial_dimensions, &HashMap::new()).is_err());
+
+        let profiles = HashMap::from([("avatar".to_string(), ProcessingProfile::default())]);
+        let unknown_assignment = HashMap::from([("users".to_string(), "missing".to_string())]);
+        assert!(validate_processing_profiles(&profiles, &unknown_assignment).is_err());
+
+        let reserved_name = HashMap::from([("default".to_string(), ProcessingProfile::default())]);
+        assert!(validate_processing_profiles(&reserved_name, &HashMap::new()).is_err());
+
+        let zero_input_limit = HashMap::from([(
+            "tiny".to_string(),
+            ProcessingProfile {
+                max_input_bytes: Some(0),
+                ..ProcessingProfile::default()
+            },
+        )]);
+        assert!(validate_processing_profiles(&zero_input_limit, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn profile_input_body_limit_accepts_the_largest_configured_profile_cap() {
+        let global_input_bytes = 17 * 1024 * 1024;
+        let profiles = HashMap::from([
+            (
+                "larger".to_string(),
+                ProcessingProfile {
+                    max_input_bytes: Some(18 * 1024 * 1024),
+                    ..ProcessingProfile::default()
+                },
+            ),
+            (
+                "smaller".to_string(),
+                ProcessingProfile {
+                    max_input_bytes: Some(8 * 1024 * 1024),
+                    ..ProcessingProfile::default()
+                },
+            ),
+            (
+                "unassigned-large".to_string(),
+                ProcessingProfile {
+                    max_input_bytes: Some(128 * 1024 * 1024),
+                    ..ProcessingProfile::default()
+                },
+            ),
+        ]);
+
+        let assignments = HashMap::from([("products".to_string(), "larger".to_string())]);
+        assert_eq!(
+            max_configured_input_bytes(global_input_bytes, &profiles, &assignments),
+            18 * 1024 * 1024
+        );
+        assert_eq!(
+            max_configured_input_bytes(DEFAULT_MAX_SOURCE_BYTES, &profiles, &HashMap::new()),
+            DEFAULT_MAX_SOURCE_BYTES
+        );
+
+        let smaller_assignment = HashMap::from([("avatars".to_string(), "smaller".to_string())]);
+        assert_eq!(
+            max_configured_input_bytes(global_input_bytes, &profiles, &smaller_assignment),
+            global_input_bytes,
+            "a lower assigned profile must not reduce the router's cap below the global limit"
+        );
+    }
 }

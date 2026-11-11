@@ -1,8 +1,14 @@
-use crate::{config::AppConfig, images::ImageStore};
+use crate::{
+    config::{
+        AppConfig, ProcessingPolicy, ProcessingProfile, max_configured_input_bytes,
+        resolve_processing_policy,
+    },
+    images::ImageStore,
+};
 
 use opendal::Operator;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::Semaphore;
 
@@ -15,11 +21,20 @@ pub struct AppState {
 
     pub max_source_bytes: usize,
 
+    /// Largest input limit across the global policy and configured profiles.
+    /// Axum uses this for its outer request-body limit; the selected policy
+    /// still enforces the narrower per-namespace image limit.
+    pub max_request_source_bytes: usize,
+
     pub max_output_bytes: usize,
 
     pub output_width: u32,
 
     pub output_height: u32,
+
+    pub processing_profiles: HashMap<String, ProcessingProfile>,
+
+    pub namespace_profiles: HashMap<String, String>,
 
     pub max_slots: u8,
 
@@ -46,11 +61,21 @@ impl AppState {
 
             max_source_bytes: config.max_source_bytes,
 
+            max_request_source_bytes: max_configured_input_bytes(
+                config.max_source_bytes,
+                &config.processing_profiles,
+                &config.namespace_profiles,
+            ),
+
             max_output_bytes: config.max_output_bytes,
 
             output_width: config.output_width,
 
             output_height: config.output_height,
+
+            processing_profiles: config.processing_profiles.clone(),
+
+            namespace_profiles: config.namespace_profiles.clone(),
 
             max_slots: config.max_slots,
 
@@ -64,5 +89,17 @@ impl AppState {
 
             public_base_url: config.public_base_url.clone(),
         })
+    }
+
+    pub fn processing_policy_for(&self, namespace: &str) -> ProcessingPolicy {
+        resolve_processing_policy(
+            namespace,
+            self.max_source_bytes,
+            self.max_output_bytes,
+            self.output_width,
+            self.output_height,
+            &self.processing_profiles,
+            &self.namespace_profiles,
+        )
     }
 }

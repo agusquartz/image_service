@@ -31,12 +31,13 @@ pub(crate) async fn upload(
     incoming: IncomingImage,
     replace_existing: bool,
 ) -> Result<(UploadResponse, bool), ApiError> {
+    let policy = state.processing_policy_for(&key.namespace);
     let webp = reduce_to_webp(
         state.image_jobs.clone(),
         incoming,
-        state.max_output_bytes,
-        state.output_width,
-        state.output_height,
+        policy.max_output_bytes,
+        policy.output_width,
+        policy.output_height,
     )
     .await?;
 
@@ -102,6 +103,7 @@ pub(crate) async fn stat(state: &AppState, key: &ImageKey) -> Result<StoredMetad
 }
 
 pub(crate) async fn info(state: &AppState, key: &ImageKey) -> Result<ImageInfoResponse, ApiError> {
+    let policy = state.processing_policy_for(&key.namespace);
     let metadata = state.store.stat(key).await?;
     let bytes = state.store.read(key).await?;
     let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::WebP)
@@ -118,7 +120,7 @@ pub(crate) async fn info(state: &AppState, key: &ImageKey) -> Result<ImageInfoRe
         format: "webp",
         width: dimensions.0,
         height: dimensions.1,
-        profile: "default",
+        profile: policy.profile_name,
         etag: Some(
             metadata
                 .etag

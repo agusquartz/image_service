@@ -29,7 +29,7 @@ use axum::{Router, extract::DefaultBodyLimit, routing::get};
 /// ```
 pub fn build_router(state: AppState) -> Router {
     let max_request_bytes = state
-        .max_source_bytes
+        .max_request_source_bytes
         .saturating_add(MULTIPART_OVERHEAD_BYTES);
     Router::new()
         .route("/health", get(health))
