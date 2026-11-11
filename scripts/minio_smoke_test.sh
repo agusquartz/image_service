@@ -71,6 +71,8 @@ docker run --detach --rm \
     --env IMAGE_MAX_SLOTS=1 \
     --env IMAGE_OUTPUT_WIDTH=1024 \
     --env IMAGE_OUTPUT_HEIGHT=1024 \
+    --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"max_output_bytes":25600,"output_width":32,"output_height":32}}' \
+    --env 'IMAGE_NAMESPACE_PROFILES={"profile-smoke":"avatar"}' \
     "$image_name" >/dev/null
 
 service_port="$(docker port "$service_name" 3000/tcp | awk -F: 'NR == 1 {print $NF}')"
@@ -121,6 +123,23 @@ assert metadata["format"] == "webp", metadata
 assert metadata["size_bytes"] > 0, metadata
 assert metadata["size_bytes"] <= 102400, metadata
 assert 0 < metadata["width"] <= 1024 and 0 < metadata["height"] <= 1024, metadata
+PY
+
+profile_route="$service_url/api/images/profile-smoke/1/1"
+status="$(curl --silent --output "$tmp_dir/profile-upload.json" --write-out '%{http_code}' \
+    --form "image=@$image_file" "$profile_route")"
+[[ "$status" == 201 ]] || fail "MinIO profile upload returned HTTP $status"
+status="$(curl --silent --output "$tmp_dir/profile-info.json" --write-out '%{http_code}' "$profile_route/info")"
+[[ "$status" == 200 ]] || fail "MinIO profile info returned HTTP $status"
+python3 - "$tmp_dir/profile-info.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["profile"] == "avatar", payload
+assert payload["width"] == 32 and payload["height"] == 32, payload
+assert payload["size_bytes"] <= 25600, payload
 PY
 
 status="$(curl --silent --output "$tmp_dir/list.json" --write-out '%{http_code}' \
@@ -244,5 +263,5 @@ with open(sys.argv[1], encoding="utf-8") as response_file:
 assert listing["images"] == [], listing
 PY
 
-echo "PASS: MinIO S3-compatible POST/PUT limits, replacement, GET/HEAD, conditional GET, metadata, listing, presigned GET, and slot/resource DELETE"
+echo "PASS: MinIO S3-compatible POST/PUT limits, replacement, GET/HEAD, conditional GET, metadata, listing, namespace profile, presigned GET, and slot/resource DELETE"
 echo "Both containers used ephemeral storage; all test data was removed during cleanup."
