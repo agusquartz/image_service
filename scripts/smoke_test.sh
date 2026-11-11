@@ -29,11 +29,15 @@ fi
 
 tmp_dir="$(mktemp -d)"
 container_id=""
+storage_volume=""
 api_key="smoke-test-api-key"
 
 cleanup() {
     if [[ -n "$container_id" ]]; then
         docker rm --force "$container_id" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$storage_volume" ]]; then
+        docker volume rm "$storage_volume" >/dev/null 2>&1 || true
     fi
     rm -rf "$tmp_dir"
 }
@@ -51,6 +55,13 @@ request_status() {
     local output_file="$1"
     shift
     curl --silent --show-error --output "$output_file" --write-out '%{http_code}' "$@"
+}
+
+request_status_with_headers() {
+    local output_file="$1"
+    local headers_file="$2"
+    shift 2
+    curl --silent --show-error --output "$output_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@"
 }
 
 expect_status() {
@@ -77,9 +88,18 @@ expect_read_status() {
 
 start_service() {
     local auth_mode="$1"
-    local -a args=(
-        docker run --detach --rm --read-only
-        --tmpfs /tmp/image-storage:rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755
+    local -a args=(docker run --detach --rm --read-only)
+    if [[ "$auth_mode" == "max-slots" ]]; then
+        storage_volume="image-service-smoke-$$-$RANDOM"
+        docker volume create --driver local \
+            --opt type=tmpfs --opt device=tmpfs \
+            --opt o=rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755 \
+            "$storage_volume" >/dev/null
+        args+=(--mount "type=volume,source=$storage_volume,target=/tmp/image-storage")
+    else
+        args+=(--tmpfs /tmp/image-storage:rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755)
+    fi
+    args+=(
         --publish 127.0.0.1::3000
         --env IMAGE_BIND=0.0.0.0:3000
         --env IMAGE_STORAGE_SCHEME=fs
@@ -90,8 +110,12 @@ start_service() {
 
     case "$auth_mode" in
         default) ;;
-        false) args+=(--env GETMETHOD_AUTH=false) ;;
-        true) args+=(--env GETMETHOD_AUTH=true) ;;
+        false) args+=(--env GETMETHOD_AUTH=false --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
+        true) args+=(--env GETMETHOD_AUTH=true --env IMAGE_PRESIGN_TTL_SECONDS=600 --env IMAGE_CACHE_TTL_SECONDS=60) ;;
+        dimensions) args+=(--env IMAGE_OUTPUT_WIDTH=64 --env IMAGE_OUTPUT_HEIGHT=64) ;;
+        max-slots) args+=(--env IMAGE_MAX_SLOTS=2) ;;
+        input-limit) args+=(--env IMAGE_MAX_INPUT_BYTES=1024) ;;
+        output-limit) args+=(--env IMAGE_MAX_OUTPUT_BYTES=1) ;;
         *) fail "unknown auth mode: $auth_mode" ;;
     esac
 
@@ -113,49 +137,217 @@ start_service() {
 stop_service() {
     docker rm --force "$container_id" >/dev/null
     container_id=""
+    if [[ -n "$storage_volume" ]]; then
+        docker volume rm "$storage_volume" >/dev/null
+        storage_volume=""
+    fi
 }
 
 test_mode() {
     local auth_mode="$1"
+    local max_creatable_slot=5
+    [[ "$auth_mode" == "max-slots" ]] && max_creatable_slot=2
+    local over_limit_slot=$((max_creatable_slot + 1))
     start_service "$auth_mode"
     local resource="smoke-${auth_mode}"
     local route="$base_url/api/images/products/$resource"
     local image_route="$route/1"
 
+    if [[ "$auth_mode" == "input-limit" ]]; then
+        expect_status 413 "$tmp_dir/input-too-large" \
+            --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+        stop_service
+        echo "PASS: IMAGE_MAX_INPUT_BYTES rejects oversized uploads"
+        return
+    fi
+    if [[ "$auth_mode" == "output-limit" ]]; then
+        expect_status 422 "$tmp_dir/output-too-large" \
+            --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+        stop_service
+        echo "PASS: IMAGE_MAX_OUTPUT_BYTES rejects output that cannot fit"
+        return
+    fi
+
     expect_status 204 "$tmp_dir/health" "$base_url/health"
     expect_status 401 "$tmp_dir/unauthorized-upload" \
         --request POST --form "image=@$image_file" "$image_route"
-    expect_status 200 "$tmp_dir/upload" \
+    expect_status 201 "$tmp_dir/upload" \
         --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+    expect_status 409 "$tmp_dir/conflicting-upload" \
+        --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+    expect_status 200 "$tmp_dir/put-upload" \
+        --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+    expect_status 201 "$tmp_dir/put-create" \
+        --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/2"
+    expect_status 204 "$tmp_dir/put-create-cleanup" \
+        --request DELETE -H "Authorization: Bearer $api_key" "$route/2"
+
+    expect_status 400 "$tmp_dir/post-over-slot-limit" \
+        --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/$over_limit_slot"
+    expect_status 400 "$tmp_dir/put-create-over-slot-limit" \
+        --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/$over_limit_slot"
 
     if [[ "$auth_mode" == "true" ]]; then
         expect_status 401 "$tmp_dir/unauthorized-get" "$image_route"
         expect_status 401 "$tmp_dir/unauthorized-head" --head "$image_route"
         expect_status 401 "$tmp_dir/unauthorized-list" "$route"
+        expect_status 401 "$tmp_dir/unauthorized-info" "$image_route/info"
+        expect_status 401 "$tmp_dir/unauthorized-presign" --request POST "$image_route/presign"
     fi
 
-    expect_read_status 200 "$tmp_dir/get" "$image_route"
+    local get_status
+    if [[ "$auth_mode" == "true" ]]; then
+        get_status="$(request_status_with_headers "$tmp_dir/get" "$tmp_dir/get.headers" -H "Authorization: Bearer $api_key" "$image_route")"
+    else
+        get_status="$(request_status_with_headers "$tmp_dir/get" "$tmp_dir/get.headers" "$image_route")"
+    fi
+    [[ "$get_status" == "200" ]] || fail "expected HTTP 200 for image GET, got $get_status"
     [[ -s "$tmp_dir/get" ]] || fail "GET returned an empty image body in $auth_mode mode"
+    grep -qi '^ETag: "[[:xdigit:]]\{64\}"' "$tmp_dir/get.headers" || fail "GET did not return a SHA-256 ETag"
+    grep -qi '^Last-Modified: ' "$tmp_dir/get.headers" || fail "GET did not return Last-Modified"
+    local expected_cache_control='public, max-age=60'
+    [[ "$auth_mode" == "true" ]] && expected_cache_control='private, max-age=60'
+    grep -qi "^Cache-Control: $expected_cache_control" "$tmp_dir/get.headers" || fail "unexpected default Cache-Control policy"
+
+    local etag last_modified
+    etag="$(awk 'tolower($1) == "etag:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$tmp_dir/get.headers")"
+    last_modified="$(awk 'tolower($1) == "last-modified:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$tmp_dir/get.headers")"
+    expect_read_status 304 "$tmp_dir/etag-not-modified" -H "If-None-Match: $etag" "$image_route"
+    [[ ! -s "$tmp_dir/etag-not-modified" ]] || fail "304 ETag response included a body"
+    expect_read_status 304 "$tmp_dir/date-not-modified" -H "If-Modified-Since: $last_modified" "$image_route"
+    [[ ! -s "$tmp_dir/date-not-modified" ]] || fail "304 date response included a body"
+    expect_read_status 304 "$tmp_dir/head-not-modified" --head -H "If-Modified-Since: $last_modified" "$image_route"
+
     expect_read_status 200 "$tmp_dir/head" --head "$image_route"
     grep -qi '^Content-Type: image/webp' "$tmp_dir/head" || fail "HEAD did not return image/webp"
     grep -qi '^Content-Length: [1-9][0-9]*' "$tmp_dir/head" || fail "HEAD did not return a positive Content-Length"
-    expect_read_status 200 "$tmp_dir/list" "$route"
-    python3 - "$tmp_dir/list" <<'PY'
+    grep -qi "^Cache-Control: $expected_cache_control" "$tmp_dir/head" || fail "HEAD omitted default Cache-Control policy"
+
+    expect_read_status 200 "$tmp_dir/info" "$image_route/info"
+    local max_dimension=1024
+    [[ "$auth_mode" == "dimensions" ]] && max_dimension=64
+    python3 - "$tmp_dir/info" "$max_dimension" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as response_file:
     payload = json.load(response_file)
 assert payload["namespace"] == "products", payload
-assert payload["images"][0]["slot"] == 1, payload
+assert payload["slot"] == 1, payload
+assert payload["format"] == "webp", payload
+assert payload["profile"] == "default", payload
+assert payload["size_bytes"] > 0, payload
+assert payload["width"] > 0 and payload["height"] > 0, payload
+max_dimension = int(sys.argv[2])
+assert payload["width"] <= max_dimension and payload["height"] <= max_dimension, payload
+if max_dimension == 64:
+    assert payload["width"] == 64 and payload["height"] == 64, payload
+assert payload["size_bytes"] <= 102400, payload
+assert payload["etag"].startswith('"') and payload["etag"].endswith('"'), payload
+assert payload["last_modified"], payload
+PY
+
+    expect_read_status 200 "$tmp_dir/list" "$route"
+    python3 - "$tmp_dir/list" "$max_creatable_slot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["namespace"] == "products", payload
+assert payload["max_creatable_slot"] == int(sys.argv[2]), payload
+assert [image["slot"] for image in payload["images"]] == [1], payload
+assert payload["images"][0]["size_bytes"] > 0, payload
+if "etag" in payload["images"][0]:
+    assert payload["images"][0]["etag"].startswith('"'), payload
+PY
+
+    if [[ "$auth_mode" == "max-slots" ]]; then
+        local slot_filename
+        printf -v slot_filename '%02d.webp' "$over_limit_slot"
+        mkdir -p "$tmp_dir/seed/products/$resource"
+        cp "$tmp_dir/get" "$tmp_dir/seed/products/$resource/$slot_filename"
+        docker run --rm \
+            --mount "type=volume,source=$storage_volume,target=/storage" \
+            --mount "type=bind,source=$tmp_dir/seed,target=/seed,readonly" \
+            rust:1.88-bookworm \
+            sh -c "mkdir -p /storage/products/$resource && cp /seed/products/$resource/$slot_filename /storage/products/$resource/$slot_filename" \
+            || fail "could not seed a pre-existing slot above IMAGE_MAX_SLOTS"
+        local high_slot_route="$route/$over_limit_slot"
+        expect_read_status 200 "$tmp_dir/get-over-limit-existing" "$high_slot_route"
+        expect_read_status 200 "$tmp_dir/head-over-limit-existing" --head "$high_slot_route"
+        expect_read_status 200 "$tmp_dir/info-over-limit-existing" "$high_slot_route/info"
+
+        expect_read_status 200 "$tmp_dir/list-with-over-limit-existing" "$route"
+        python3 - "$tmp_dir/list-with-over-limit-existing" "$max_creatable_slot" "$over_limit_slot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["max_creatable_slot"] == int(sys.argv[2]), payload
+assert [image["slot"] for image in payload["images"]] == [1, int(sys.argv[3])], payload
+PY
+
+        expect_status 200 "$tmp_dir/put-replace-over-limit-existing" \
+            --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$high_slot_route"
+        expect_status 204 "$tmp_dir/delete-over-limit-existing" \
+            --request DELETE -H "Authorization: Bearer $api_key" "$high_slot_route"
+        expect_read_status 404 "$tmp_dir/get-deleted-over-limit-existing" "$high_slot_route"
+        expect_read_status 200 "$tmp_dir/list-after-high-delete" "$route"
+        python3 - "$tmp_dir/list-after-high-delete" "$max_creatable_slot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["max_creatable_slot"] == int(sys.argv[2]), payload
+assert [image["slot"] for image in payload["images"]] == [1], payload
+PY
+    fi
+
+    expect_read_status 501 "$tmp_dir/presign-unsupported" --request POST "$image_route/presign"
+    python3 - "$tmp_dir/presign-unsupported" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["error"] == "Presigned reads are not supported by this storage backend", payload
 PY
 
     expect_status 401 "$tmp_dir/unauthorized-delete" --request DELETE "$image_route"
     expect_status 204 "$tmp_dir/delete" --request DELETE -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 204 "$tmp_dir/delete-again" --request DELETE -H "Authorization: Bearer $api_key" "$image_route"
     expect_read_status 404 "$tmp_dir/get-after-delete" "$image_route"
-    expect_read_status 200 "$tmp_dir/empty-list" "$route"
-    python3 - "$tmp_dir/empty-list" <<'PY'
+    expect_read_status 200 "$tmp_dir/list-after-delete" "$route"
+    python3 - "$tmp_dir/list-after-delete" "$max_creatable_slot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response_file:
+    payload = json.load(response_file)
+assert payload["max_creatable_slot"] == int(sys.argv[2]), payload
+assert payload["images"] == [], payload
+PY
+
+    local resource_delete_route="$base_url/api/images/products/resource-delete-${auth_mode}"
+    local sibling_route="$base_url/api/images/products/resource-delete-${auth_mode}-sibling"
+    for slot in 1 2; do
+        if (( slot <= max_creatable_slot )); then
+            expect_status 201 "$tmp_dir/resource-delete-upload-$slot" \
+                --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$resource_delete_route/$slot"
+        fi
+    done
+    expect_status 201 "$tmp_dir/resource-sibling-upload" \
+        --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$sibling_route/1"
+    expect_status 401 "$tmp_dir/unauthorized-resource-delete" --request DELETE "$resource_delete_route"
+    expect_status 204 "$tmp_dir/resource-delete" --request DELETE -H "Authorization: Bearer $api_key" "$resource_delete_route"
+    expect_status 204 "$tmp_dir/resource-delete-again" --request DELETE -H "Authorization: Bearer $api_key" "$resource_delete_route"
+    expect_read_status 404 "$tmp_dir/resource-delete-get" "$resource_delete_route/1"
+    expect_read_status 200 "$tmp_dir/resource-sibling-preserved" "$sibling_route/1"
+    expect_read_status 200 "$tmp_dir/resource-delete-empty-list" "$resource_delete_route"
+    python3 - "$tmp_dir/resource-delete-empty-list" <<'PY'
 import json
 import sys
 
@@ -175,8 +367,28 @@ grep -q 'GETMETHOD_AUTH=true requires IMAGE_API_KEY' "$tmp_dir/invalid-config.lo
     || fail "invalid auth configuration did not report the expected startup error"
 echo "PASS: invalid auth configuration is rejected"
 
+if docker run --rm --read-only --env IMAGE_PRESIGN_TTL_SECONDS=0 "$image_name" >"$tmp_dir/invalid-ttl.log" 2>&1; then
+    fail "IMAGE_PRESIGN_TTL_SECONDS=0 unexpectedly started"
+fi
+grep -q 'IMAGE_PRESIGN_TTL_SECONDS must be between 1 and 604800' "$tmp_dir/invalid-ttl.log" \
+    || fail "invalid presign TTL did not report the expected startup error"
+echo "PASS: invalid presigned URL TTL is rejected"
+
+for setting in IMAGE_MAX_INPUT_BYTES IMAGE_MAX_OUTPUT_BYTES IMAGE_OUTPUT_WIDTH IMAGE_OUTPUT_HEIGHT IMAGE_MAX_SLOTS; do
+    if docker run --rm --read-only --env "$setting=0" "$image_name" >"$tmp_dir/invalid-$setting.log" 2>&1; then
+        fail "$setting=0 unexpectedly started"
+    fi
+    grep -q "$setting must be between 1" "$tmp_dir/invalid-$setting.log" \
+        || fail "invalid $setting did not report the expected startup error"
+done
+echo "PASS: image limit configuration rejects zero values"
+
 test_mode default
 test_mode false
 test_mode true
+test_mode dimensions
+test_mode max-slots
+test_mode input-limit
+test_mode output-limit
 
 echo "All Image Service smoke tests passed. Containers used volatile tmpfs storage only."
