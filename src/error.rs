@@ -22,6 +22,8 @@ pub enum ApiError {
 
     Unauthorized,
 
+    RateLimited(u64),
+
     Conflict(String),
 
     NotFound(String),
@@ -51,6 +53,22 @@ impl IntoResponse for ApiError {
 
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
 
+            Self::RateLimited(retry_after) => {
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ErrorResponse {
+                        error: "Rate limit exceeded".to_string(),
+                    }),
+                )
+                    .into_response();
+                if let Ok(value) = retry_after.to_string().parse() {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, value);
+                }
+                return response;
+            }
+
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
 
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
@@ -64,7 +82,7 @@ impl IntoResponse for ApiError {
             Self::UnprocessableEntity(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
 
             Self::Storage(detail) => {
-                eprintln!("Storage error: {detail}");
+                tracing::error!(error = %detail, "storage operation failed");
 
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,7 +91,7 @@ impl IntoResponse for ApiError {
             }
 
             Self::Internal(detail) => {
-                eprintln!("Internal error: {detail}");
+                tracing::error!(error = %detail, "internal operation failed");
 
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

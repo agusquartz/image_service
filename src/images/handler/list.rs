@@ -3,7 +3,7 @@ use super::super::{
     service,
     validation::{validate_namespace, validate_resource_id},
 };
-use crate::{auth::require_read_auth, error::ApiError, state::AppState};
+use crate::{auth::require_auth, error::ApiError, state::AppState};
 use axum::{
     Json,
     extract::{Path, State},
@@ -15,7 +15,7 @@ pub(crate) async fn list_images(
     Path((namespace, resource_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<ImageListResponse>, ApiError> {
-    require_read_auth(&headers, state.getmethod_auth, state.api_key.as_deref())?;
+    require_auth(&headers, state.read_auth, state.api_key.as_deref())?;
     validate_namespace(&namespace)?;
     validate_resource_id(&resource_id)?;
     Ok(Json(

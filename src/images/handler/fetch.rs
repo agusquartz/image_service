@@ -1,4 +1,4 @@
-use crate::{auth::require_read_auth, error::ApiError, state::AppState};
+use crate::{auth::require_auth, error::ApiError, state::AppState};
 
 use axum::{
     body::Body,
@@ -32,7 +32,7 @@ pub(crate) async fn fetch_image(
 
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    require_read_auth(&headers, state.getmethod_auth, state.api_key.as_deref())?;
+    require_auth(&headers, state.read_auth, state.api_key.as_deref())?;
 
     let key = ImageKey::new(namespace, resource_id, slot)?;
 
@@ -77,7 +77,7 @@ pub(crate) async fn head_image(
     Path((namespace, resource_id, slot)): Path<(String, String, u8)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    require_read_auth(&headers, state.getmethod_auth, state.api_key.as_deref())?;
+    require_auth(&headers, state.read_auth, state.api_key.as_deref())?;
     let key = ImageKey::new(namespace, resource_id, slot)?;
     let metadata = service::stat(&state, &key).await?;
     let etag = metadata.etag.map(service::normalize_etag);

@@ -3,13 +3,15 @@ mod config;
 mod error;
 mod health;
 mod images;
+mod observability;
+mod rate_limit;
 mod router;
 mod state;
 
 use config::AppConfig;
 use state::AppState;
 
-use std::error::Error;
+use std::{error::Error, net::SocketAddr};
 
 use tokio::net::TcpListener;
 
@@ -29,6 +31,14 @@ use tokio::net::TcpListener;
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
     let config = AppConfig::from_env()?;
 
     let state = AppState::from_config(&config)?;
@@ -37,11 +47,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(&config.bind_address).await?;
 
-    println!("Image service listening on {}", config.bind_address);
+    tracing::info!(address = %config.bind_address, "image service listening");
+    tracing::info!(backend = %config.storage.scheme, "image storage configured");
 
-    println!("Image storage backend: {}", config.storage.scheme);
-
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

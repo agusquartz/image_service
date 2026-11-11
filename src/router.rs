@@ -5,10 +5,11 @@ use crate::{
         create_image, delete_image, delete_resource, fetch_image, head_image, image_info,
         list_images, presign_image_read, replace_image,
     },
+    observability::{metrics, observe_request},
     state::AppState,
 };
 
-use axum::{Router, extract::DefaultBodyLimit, routing::get};
+use axum::{Router, extract::DefaultBodyLimit, middleware, routing::get};
 
 /// Builds the complete HTTP router for the image service.
 ///
@@ -31,7 +32,8 @@ pub fn build_router(state: AppState) -> Router {
     let max_request_bytes = state
         .max_request_source_bytes
         .saturating_add(MULTIPART_OVERHEAD_BYTES);
-    Router::new()
+    let metrics_enabled = state.metrics_enabled;
+    let mut router = Router::new()
         .route("/health", get(health))
         .route(
             "/api/images/{namespace}/{resource_id}",
@@ -58,6 +60,16 @@ pub fn build_router(state: AppState) -> Router {
         // The limit is intentionally slightly larger than the maximum
         // source image size because multipart requests include
         // additional metadata and boundary bytes.
-        .layer(DefaultBodyLimit::max(max_request_bytes))
+        .layer(DefaultBodyLimit::max(max_request_bytes));
+
+    if metrics_enabled {
+        router = router.route("/metrics", get(metrics));
+    }
+
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            observe_request,
+        ))
         .with_state(state)
 }
