@@ -217,17 +217,25 @@ Storage operations are handled asynchronously through OpenDAL and are independen
 
 ## Authentication
 
-`IMAGE_API_KEY` optionally protects write operations (`POST`, `PUT`, and `DELETE`). When configured, clients send:
+Reads and writes are protected by default. The service fails at startup unless `IMAGE_API_KEY` is configured whenever either policy is `required`.
 
 ```http
 Authorization: Bearer <IMAGE_API_KEY>
 ```
 
-Image reads remain public by default for compatibility with existing clients. Set `GETMETHOD_AUTH=true` to also require the same bearer token for `GET`, `HEAD`, resource listing, image information, and presigned URL creation. `GETMETHOD_AUTH` defaults to `false`; startup fails if it is enabled without `IMAGE_API_KEY`.
+Use `IMAGE_READ_AUTH=none` for public GET, HEAD, resource listing, image information, and presign requests. Use `IMAGE_WRITE_AUTH=none` to allow POST, PUT, and DELETE without a key. Setting both to `none` disables API authentication and should be limited to controlled environments. The policies are independent; a required policy always requires `IMAGE_API_KEY`.
+
+`GETMETHOD_AUTH` is no longer supported. If it is present, startup fails and directs you to the separate read/write settings. Existing deployments must migrate their configuration explicitly.
+
+## Rate limits and observability
+
+Read and write requests use independent fixed-window limits per client socket IP. Defaults are 600 reads and 60 writes per 60 seconds. A limit of `0` disables that request class. Excess requests return `429 Too Many Requests` and `Retry-After`. Limits are local to one process; replicas do not share counters. Client-supplied forwarded-IP headers are not trusted.
+
+Every response includes a server-generated `X-Request-ID`. Structured JSON logs use `tracing`; set `RUST_LOG` to adjust the filter (for example, `RUST_LOG=image_service=debug`). Set `IMAGE_METRICS_ENABLED=true` to expose Prometheus metrics at `/metrics`. Authentication is independently controlled by `IMAGE_METRICS_AUTH`, which defaults to `true`.
 
 ## Cache and Presigned Read URLs
 
-Image GET and HEAD responses use a 60-second cache lifetime by default. Public reads get `Cache-Control: public, max-age=60`; when `GETMETHOD_AUTH=true`, the default is `private, max-age=60` so shared caches cannot expose authenticated images. Set `IMAGE_CACHE_TTL_SECONDS` to change the lifetime; `0` emits `Cache-Control: no-store`. `IMAGE_CACHE_CONTROL` overrides the complete header, so do not set it to `public` for protected images unless a shared-cache design explicitly accounts for authorization. A fresh cached response may remain visible for the configured TTL after a PUT. ETag and Last-Modified let a cache validate after the response becomes stale; they do not invalidate a still-fresh response. Avoid `immutable` while a slot can be overwritten at the same URL.
+Image GET and HEAD responses use a 60-second cache lifetime by default. Public reads (`IMAGE_READ_AUTH=none`) get `Cache-Control: public, max-age=60`; private reads use `private, max-age=60` so shared caches cannot expose authenticated images. Set `IMAGE_CACHE_TTL_SECONDS` to change the lifetime; `0` emits `Cache-Control: no-store`. `IMAGE_CACHE_CONTROL` overrides the complete header, so do not set it to `public` for protected images unless a shared-cache design explicitly accounts for authorization. A fresh cached response may remain visible for the configured TTL after a PUT. ETag and Last-Modified let a cache validate after the response becomes stale; they do not invalidate a still-fresh response. Avoid `immutable` while a slot can be overwritten at the same URL.
 
 The current GET implementation buffers the stored WebP before responding. With the default 100 KiB output limit, that is usually simpler than streaming. If deployments raise the output limit substantially or expect many concurrent large downloads, consider an optional `IMAGE_STREAM_GET` setting, disabled by default, backed by OpenDAL's reader stream and Axum's streaming response body. This setting is a future recommendation, not implemented yet. Streaming can bound per-request buffering, but memory still depends on stream buffers and concurrent requests; errors that occur after response headers are sent also terminate the response rather than becoming a normal JSON error.
 
@@ -548,7 +556,7 @@ Optional JSON objects that define named WebP processing profiles and assign them
 
 ### `IMAGE_API_KEY`
 
-Optional bearer token protecting write operations.
+Bearer token required by default for whichever read/write policies use `required`.
 
 Example:
 
@@ -562,15 +570,36 @@ When configured, upload requests must contain:
 Authorization: Bearer <IMAGE_API_KEY>
 ```
 
-Image reads (`GET`, `HEAD`, and resource listing) remain public unless `GETMETHOD_AUTH=true`.
+By default both `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` are `required`, so the service will not start without a non-empty key. Clients send `Authorization: Bearer <IMAGE_API_KEY>`. Set either policy to `none` to make that class of operations public. Both must be explicitly `none` to disable authentication entirely. `GETMETHOD_AUTH` has been removed and causes a startup error if present.
 
-If no API key is configured, uploads are accepted without authentication.
+### `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH`
 
-Production deployments should make this choice deliberately.
+Independent authentication policies. Each accepts `required` or `none`; both default to `required`. A required policy needs `IMAGE_API_KEY` or startup fails.
 
-### `GETMETHOD_AUTH`
+```dotenv
+IMAGE_READ_AUTH=required
+IMAGE_WRITE_AUTH=required
+```
 
-When set to `true`, require `Authorization: Bearer <IMAGE_API_KEY>` for image GET, HEAD, resource-list, image-info, and presign requests. It defaults to `false` for backwards compatibility. Startup fails if it is enabled without `IMAGE_API_KEY`.
+For a public image catalog with protected uploads, use `IMAGE_READ_AUTH=none` and `IMAGE_WRITE_AUTH=required`. For a controlled environment without API authentication, explicitly set both to `none`.
+
+### `IMAGE_RATE_LIMIT_READ_REQUESTS`, `IMAGE_RATE_LIMIT_WRITE_REQUESTS`, and `IMAGE_RATE_LIMIT_WINDOW_SECONDS`
+
+Per-client fixed-window request budgets. Defaults are 600 reads, 60 writes, and a 60-second window. A read/write request count of `0` disables that budget. Excess requests receive `429 Too Many Requests` with a `Retry-After` header. Limits are enforced per socket peer IP in-process; they are not shared across replicas and forwarded headers are not trusted.
+
+### `IMAGE_METRICS_ENABLED`
+
+Set to `true` to expose Prometheus metrics at `GET /metrics`. Defaults to `false`.
+
+### `IMAGE_METRICS_AUTH`
+
+Controls whether `GET /metrics` requires `Authorization: Bearer <IMAGE_API_KEY>`. Defaults to `true`. When metrics are enabled and authentication is required, startup fails unless `IMAGE_API_KEY` is configured. Set this to `false` only when a trusted network, firewall, or proxy already protects the endpoint. This setting is independent of `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH`; disabling it makes metrics public even if image reads and writes remain protected.
+
+### `RUST_LOG`
+
+Controls the `tracing` log filter. Logs are structured JSON written to stdout. Each event has fields such as a timestamp, a `level`, and a `message`; request completion events also include the request ID, method, route label, status, and duration. There are no bracketed prefixes like `[WARNING]` or `[DEBUG]`: severity is represented in the JSON `level` field. Rust tracing levels are `ERROR`, `WARN`, `INFO`, `DEBUG`, and `TRACE` (`WARN` is used instead of `WARNING`). The default filter is `info`; for example, `RUST_LOG=image_service=debug` enables debug events from this service.
+
+The service does not write log files or impose a file-size limit. Configure retention and rotation in the runtime or platform that collects stdout. Docker logging drivers, systemd/journald, and hosted log platforms each manage this according to their deployment. This keeps file permissions, disk quotas, and rotation policy outside the application.
 
 ### `IMAGE_PRESIGN_TTL_SECONDS`
 
@@ -578,7 +607,7 @@ Lifetime in seconds for presigned GET URLs. Defaults to `3600`; valid values are
 
 ### `IMAGE_CACHE_CONTROL`
 
-Optional full Cache-Control override for image GET and HEAD responses. By default, cache lifetime comes from `IMAGE_CACHE_TTL_SECONDS` (60 seconds); responses use `public` when reads are unauthenticated and `private` when `GETMETHOD_AUTH=true`. Do not use `immutable` while slot URLs can be overwritten.
+Optional full Cache-Control override for image GET and HEAD responses. By default, cache lifetime comes from `IMAGE_CACHE_TTL_SECONDS` (60 seconds); responses use `public` when `IMAGE_READ_AUTH=none` and `private` when reads require authentication. Do not use `immutable` while slot URLs can be overwritten.
 
 ### `IMAGE_CACHE_TTL_SECONDS`
 

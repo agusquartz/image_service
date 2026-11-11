@@ -65,7 +65,7 @@ Both methods accept the same complete-image `multipart/form-data` request with a
 image
 ```
 
-If write authentication is enabled, include:
+When write authentication is required (the default), include:
 
 ```http
 Authorization: Bearer <IMAGE_API_KEY>
@@ -115,9 +115,9 @@ ETag: "..."
 Last-Modified: ...
 ```
 
-Reads are public by default for backwards compatibility. Set `GETMETHOD_AUTH=true` to require the configured `IMAGE_API_KEY` bearer token for GET, HEAD, resource listing, image information, and presigned URL creation.
+Reads require the configured `IMAGE_API_KEY` bearer token by default. Set `IMAGE_READ_AUTH=none` to make GET, HEAD, resource listing, image information, and presigned URL creation public. `IMAGE_WRITE_AUTH` independently controls POST, PUT, and DELETE. The service fails to start if a required policy has no API key.
 
-GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses are `public` when `GETMETHOD_AUTH=false` and `private` when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` sets `no-store`; `IMAGE_CACHE_CONTROL` can override the complete policy. GET supports `If-None-Match` and `If-Modified-Since`, returning `304 Not Modified` when the stored representation has not changed. ETag falls back to a SHA-256 content validator when the storage backend does not provide one. A fresh cached response can remain in use for up to its TTL after a PUT; ETag does not force an earlier check. `immutable` is unsuitable while uploads can replace content at the same URL.
+GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses are `public` when `IMAGE_READ_AUTH=none` and `private` when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` sets `no-store`; `IMAGE_CACHE_CONTROL` can override the complete policy. GET supports `If-None-Match` and `If-Modified-Since`, returning `304 Not Modified` when the stored representation has not changed. ETag falls back to a SHA-256 content validator when the storage backend does not provide one. A fresh cached response can remain in use for up to its TTL after a PUT; ETag does not force an earlier check. `immutable` is unsuitable while uploads can replace content at the same URL.
 
 ## Image Information
 
@@ -188,7 +188,7 @@ Returns `200 OK`, `Content-Type: image/webp`, and `Content-Length` when the imag
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 ```
 
-If write authentication is enabled, include `Authorization: Bearer <IMAGE_API_KEY>`. Deleting an existing or missing slot returns `204 No Content`, making the operation idempotent.
+When `IMAGE_WRITE_AUTH=required` (the default), include `Authorization: Bearer <IMAGE_API_KEY>`. Deleting an existing or missing slot returns `204 No Content`, making the operation idempotent.
 
 ## Delete a Resource
 
@@ -196,7 +196,7 @@ If write authentication is enabled, include `Authorization: Bearer <IMAGE_API_KE
 DELETE /api/images/{namespace}/{resource_id}
 ```
 
-Requires write authentication when `IMAGE_API_KEY` is configured. It recursively removes every object under the exact resource prefix and returns `204 No Content`, including when the resource is empty or already deleted. The prefix boundary prevents deleting similarly named resources. OpenDAL handles filesystem directory and object-storage prefix semantics behind the storage layer.
+Follows `IMAGE_WRITE_AUTH` (required by default). It recursively removes every object under the exact resource prefix and returns `204 No Content`, including when the resource is empty or already deleted. The prefix boundary prevents deleting similarly named resources. OpenDAL handles filesystem directory and object-storage prefix semantics behind the storage layer.
 
 ## Presigned Read URL
 

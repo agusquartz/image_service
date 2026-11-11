@@ -36,14 +36,15 @@ This keeps image-specific infrastructure outside the consuming application while
 ## Features
 
 - Multipart image uploads.
-- Public image retrieval over HTTP.
+- Image retrieval over HTTP; private reads are the secure default and public reads are configurable.
 - Image information with storage and WebP dimensions metadata.
 - Presigned read URLs when the storage backend supports them.
 - ETag and Last-Modified validators with conditional GET/HEAD requests.
 - Resource image listing, HEAD metadata checks, and idempotent deletion.
 - POST creates only in an unused slot; PUT creates or replaces the complete image.
-- Optional bearer-token protection for write operations.
-- Optional bearer-token protection for reads, disabled by default for backwards compatibility.
+- Independent bearer-token policies for reads and writes; both are protected by default.
+- Per-client read/write rate limits with `429` responses and `Retry-After`.
+- Structured JSON request logs, server-generated request IDs, and an optional authenticated Prometheus endpoint.
 - Source MIME validation against the detected file format.
 - JPEG, PNG, WebP, GIF, BMP, and TIFF input.
 - WebP output.
@@ -69,14 +70,11 @@ This keeps image-specific infrastructure outside the consuming application while
 ```bash
 cp .env.example .env
 cargo run --release
-curl -F "image=@photo.jpg" http://127.0.0.1:3000/api/images/products/845/1
+curl -F "image=@photo.jpg" -H "Authorization: Bearer replace-with-a-long-random-secret" \
+  http://127.0.0.1:3000/api/images/products/845/1
 ```
 
-If `IMAGE_API_KEY` is configured, add:
-
-```bash
--H "Authorization: Bearer <your-api-key>"
-```
+The service refuses to start without `IMAGE_API_KEY` under the default private read/write policies. Public reads or fully unprotected access must be explicitly configured with `IMAGE_READ_AUTH=none` and/or `IMAGE_WRITE_AUTH=none`.
 
 ## API Overview
 
@@ -142,7 +140,13 @@ IMAGE_PROCESSING_PROFILES
 IMAGE_NAMESPACE_PROFILES
 IMAGE_MAX_SLOTS
 IMAGE_API_KEY
-GETMETHOD_AUTH
+IMAGE_READ_AUTH
+IMAGE_WRITE_AUTH
+IMAGE_RATE_LIMIT_READ_REQUESTS
+IMAGE_RATE_LIMIT_WRITE_REQUESTS
+IMAGE_RATE_LIMIT_WINDOW_SECONDS
+IMAGE_METRICS_ENABLED
+IMAGE_METRICS_AUTH
 IMAGE_PRESIGN_TTL_SECONDS
 IMAGE_CACHE_TTL_SECONDS
 IMAGE_CACHE_CONTROL
@@ -152,6 +156,8 @@ IMAGE_PUBLIC_BASE_URL
 Input/output byte limits, target output dimensions, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder allocation and source-dimension safeguards remain compile-time limits. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
 
 Processing profiles are optional. With no profile assigned, the current global environment settings remain in effect. A profile can override the input byte limit, WebP output byte limit, and/or target dimensions for selected namespaces; omitted profile fields inherit the corresponding global value, which itself falls back to the built-in default. See [Configuration](docs/configuration.md) for the JSON environment variable format.
+
+Application logs are structured JSON written to stdout. The `level` field uses Rust tracing levels (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`); `RUST_LOG` controls filtering and defaults to `info`. The service does not write or rotate log files: configure retention in Docker or the deployment platform's log collector. See [Configuration](docs/configuration.md#rust_log) for details.
 
 See [Configuration](docs/configuration.md).
 
@@ -172,7 +178,9 @@ The long-term goal is to make deployment-specific behavior configurable without 
 - Runtime-configurable image policies.
 - Additional output formats.
 - Additional processing profile options and selection rules.
-- Cache and CDN behavior.
+- Cache and CDN behavior such as immutable versioned image URLs.
+- Distributed rate limiting and per-namespace quotas.
+- OpenTelemetry integration and image-processing/storage metrics.
 - Authentication strategies.
 - Per-namespace policies.
 - Metadata and deletion.

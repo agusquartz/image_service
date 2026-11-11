@@ -125,7 +125,7 @@ docker run --rm --read-only \
 
 This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
 
-The filesystem endpoint smoke test exercises public-read compatibility, authenticated reads, POST create-only behavior, PUT replacement, GET, HEAD, info, listing metadata and limits, legacy slots above the configured limit, slot and resource-level DELETE, custom target dimensions, byte limits, optional namespace profiles, profile input-limit overrides, fallback to global input limits for profiles and unassigned namespaces, and invalid configuration. Resource-level DELETE is checked for idempotence and exact-prefix isolation so similarly named resources remain intact. It needs Docker, `curl`, Python 3, and a local test image:
+The filesystem endpoint smoke test exercises the private/private default, public-read/private-write, private-read/public-write, explicitly unprotected policies, and explicitly public metrics; missing-key and removed-setting startup failures; rate-limit `429`/`Retry-After`; request IDs; authenticated-by-default Prometheus metrics; POST create-only behavior; PUT replacement; GET, HEAD, info, listing, slot/resource DELETE; processing profiles; and invalid configuration. It needs Docker, `curl`, Python 3, and a local test image:
 
 ```bash
 docker build -t image-service:local .
@@ -398,7 +398,12 @@ Before public deployment:
 - Use a release build.
 - Keep `Cargo.lock` committed.
 - Run CI successfully.
-- Set an explicit write-authentication policy.
+- Keep the private-read/private-write default and configure a strong `IMAGE_API_KEY`.
+- Only set `IMAGE_READ_AUTH=none` or `IMAGE_WRITE_AUTH=none` when the exposure is intentional.
+- Configure read/write rate limits for expected traffic and monitor `429` responses.
+- Keep `IMAGE_METRICS_AUTH=true` unless a trusted network or proxy protects `/metrics`; when enabled, metrics authentication requires `IMAGE_API_KEY`.
+- Set `RUST_LOG` to the desired operational log level.
+- Configure stdout log retention/rotation in the runtime or platform. For Docker's `json-file` driver, set `max-size` and `max-file`; the service itself does not write or rotate log files.
 - Set a deliberate bind address.
 - Select the intended storage backend.
 - Verify storage connectivity and permissions.

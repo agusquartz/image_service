@@ -44,8 +44,9 @@ Atomic filesystem writes       yes
 
 WebP reduction                 yes
 Configurable image limits      yes (input/output bytes, output width/height)
-Optional API key               yes
-Optional read authentication   yes
+Read/write authentication      yes (both private by default; API key required at startup)
+Read/write rate limits        yes (per socket IP, configurable fixed windows)
+Observability                 yes (JSON tracing logs, request IDs, optional Prometheus metrics)
 
 Delete endpoint                yes
 Database                       no
@@ -90,6 +91,12 @@ This means the HTTP, processing, and application layers do not need to know whet
 Phase 3 adds optional named WebP processing profiles through `IMAGE_PROCESSING_PROFILES`, assigned to namespaces with `IMAGE_NAMESPACE_PROFILES`. A profile can override the input byte limit, output byte limit, and target dimensions. Each omitted field inherits its matching global setting, then the built-in default. Namespaces without a profile keep the existing global behavior, so profiles remain opt-in and backward compatible.
 
 Verification covers profile overrides and fallback behavior in unit tests, profile-specific input limits and inherited global limits in LocalFS smoke tests, and namespace profile processing in MinIO smoke tests. The tested Docker containers use ephemeral storage and are removed after the run. See [configuration](docs/configuration.md#per-namespace-processing-profiles) and [deployment testing](docs/deployment.md) for configuration and commands.
+
+## Implemented: Production Hardening
+
+Read and write access are independently controlled by `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH`. Both default to `required`; the service refuses to start without `IMAGE_API_KEY` unless each policy is explicitly set to `none`. `GETMETHOD_AUTH` is removed. `/health` remains public. The optional `/metrics` endpoint is controlled by `IMAGE_METRICS_ENABLED` and has independent `IMAGE_METRICS_AUTH=true` protection by default; startup requires the API key when metrics auth is active.
+
+Separate in-process read/write fixed-window rate limits default to 600 and 60 requests per socket IP per 60 seconds. Excess requests receive `429` and `Retry-After`; setting a limit to `0` disables that class. The service emits structured JSON logs through `tracing` to stdout, adds a generated `X-Request-ID` header, and can expose bounded Prometheus HTTP metrics at `/metrics`.
 
 ## Future Features
 
@@ -223,7 +230,7 @@ DELETE /api/images/{namespace}/{resource_id}/{slot}
 DELETE /api/images/{namespace}/{resource_id}
 ```
 
-The operation uses the OpenDAL-backed `ImageStore`, requires write authentication when `IMAGE_API_KEY` is configured, and returns `204 No Content` for both existing and missing slots.
+The operation uses the OpenDAL-backed `ImageStore`, follows `IMAGE_WRITE_AUTH` (required by default), and returns `204 No Content` for both existing and missing slots.
 
 ### Resource Listing and HEAD
 
@@ -296,7 +303,7 @@ Possible implementations include:
 
 ### Cache Configuration
 
-Image GET and HEAD support ETag, Last-Modified when available, and conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`. Cache responses default to 60 seconds, public for unauthenticated reads and private when GET auth is enabled. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
+Image GET and HEAD support ETag, Last-Modified when available, and conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`. Cache responses default to 60 seconds, public when `IMAGE_READ_AUTH=none` and private when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
 
 Example:
 
@@ -312,28 +319,17 @@ Future cache work may include:
 
 ---
 
-### Configurable Authentication
+### Additional Authentication Strategies
 
-The current write authentication model is a single optional bearer token.
-
-Read authentication is implemented through `GETMETHOD_AUTH`. It is disabled by default to preserve existing public image URLs; when enabled, GET, HEAD, and resource listing require the configured `IMAGE_API_KEY`.
+The service currently supports one bearer token with independent `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` requirements. Both default to `required`; broader identity strategies remain future work.
 
 Possible future strategies:
 
 ```text
-none
-static bearer token
 JWT
-API keys
 reverse-proxy authentication
 mTLS
 application callback / policy service
-```
-
-Configuration might select the mechanism:
-
-```dotenv
-IMAGE_AUTH_MODE=bearer
 ```
 
 Authorization could also become namespace-aware.
@@ -378,17 +374,12 @@ Reducing the configured limit does not hide or delete existing higher-numbered s
 
 ### Observability
 
-Planned operational improvements may include:
+Further operational improvements may include:
 
-- `tracing`.
-- Structured JSON logs.
-- Request IDs.
-- Prometheus metrics.
 - Processing-duration metrics.
 - Compression-ratio metrics.
 - Storage latency.
 - Storage backend labels.
-- Failure counters.
 - OpenTelemetry.
 - Distributed tracing.
 
@@ -407,12 +398,10 @@ image_store_failed_total
 
 ---
 
-### Rate Limiting and Quotas
+### Distributed Rate Limiting and Quotas
 
-Future deployments may need configurable limits for:
+The current per-process rate limiter does not share counters across replicas and uses the socket peer address. Future deployments may need distributed limits and additional quotas for:
 
-- Requests per IP.
-- Requests per API key.
 - Uploads per namespace.
 - Storage used per namespace.
 - Processing CPU budget.
