@@ -114,6 +114,7 @@ Responsibilities:
 - Detect the real image format from bytes.
 - Verify that the declared MIME type matches the detected format.
 - Apply decoder safety limits.
+- Resolve the optional namespace processing profile, inheriting unspecified values from global configuration.
 - Decode source images.
 - Encode WebP.
 - Reduce WebP quality.

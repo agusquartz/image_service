@@ -78,6 +78,7 @@ The uploaded image payload is limited by `IMAGE_MAX_INPUT_BYTES` (15 MiB by defa
 There is no `PATCH` upload method because uploads contain the complete image file; this API has no partial image representation to patch.
 
 The service validates the route parameters, reads the multipart image, verifies the source format, processes the image, and stores the resulting WebP in the requested slot.
+Processing uses the optional profile assigned to the namespace. Profiles can override the input byte limit, output byte limit, and target dimensions; fields they omit inherit the existing global environment settings. Unassigned namespaces keep the current global behavior.
 
 A successful response looks like:
 
@@ -124,7 +125,7 @@ GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses
 GET /api/images/{namespace}/{resource_id}/{slot}/info
 ```
 
-Returns storage size and available validators plus the output format and dimensions. The current built-in processing policy is reported as `default`.
+Returns storage size and available validators plus the output format, dimensions, and active namespace processing profile. Unassigned namespaces report `default`.
 
 ```json
 {
@@ -140,6 +141,8 @@ Returns storage size and available validators plus the output format and dimensi
   "last_modified": "Mon, 09 Nov 2026 12:30:00 GMT"
 }
 ```
+
+The `profile` field reports the profile currently assigned to the namespace; it is not persisted per image. Changing a profile affects future uploads and does not reprocess images already stored.
 
 ---
 

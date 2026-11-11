@@ -16,6 +16,8 @@ If API authentication is disabled, remove the `Authorization` header from upload
 
 Image reads are public by default. If `GETMETHOD_AUTH=true`, send `Authorization: Bearer <IMAGE_API_KEY>` with GET, HEAD, and resource-list requests. Direct HTML `<img>` URLs cannot attach this bearer header; keep reads public for that use case or fetch through JavaScript and attach the header.
 
+Uploads use the processing profile assigned to their namespace, if any. Clients do not need to change the upload request; namespaces without a profile keep the existing global processing settings. The image-info response reports the namespace's currently assigned profile.
+
 ---
 
 ## cURL
