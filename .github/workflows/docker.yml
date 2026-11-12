@@ -32,7 +32,7 @@ jobs:
   validate-platforms:
     name: Build ${{ matrix.label }} container
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,16 +40,15 @@ jobs:
           - platform: linux/amd64
             arch: amd64
             label: Linux amd64
+            runner: ubuntu-24.04
           - platform: linux/arm64
             arch: arm64
             label: Linux arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -81,7 +80,7 @@ jobs:
   publish-platform-artifacts:
     name: Publish Linux ${{ matrix.arch }} artifacts
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -91,8 +90,10 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
+            runner: ubuntu-24.04
           - platform: linux/arm64
             arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Check out source
@@ -127,9 +128,6 @@ jobs:
             echo "Cargo.toml version $cargo_version does not match release tag $RELEASE_TAG" >&2
             exit 1
           fi
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
