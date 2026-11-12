@@ -330,9 +330,9 @@ Implemented capabilities are listed above and documented in the linked guides. R
 
 - Immutable, content-versioned image URLs with long-lived cache headers.
 - Additional output formats.
-- More processing operations and richer profile selection/policies.
-- Distributed rate limiting and per-namespace quotas.
-- OpenTelemetry and deeper image-processing/storage metrics.
+- More image operations; profiles already apply input/output limits and target dimensions by namespace. Future per-namespace policy work means auth, formats, slot limits, storage routing, quotas, and retention.
+- Distributed rate limiting and per-namespace quotas; current rate limits are in-memory per process.
+- OpenTelemetry and image-processing/storage metrics; current `/metrics` covers HTTP request counts, HTTP duration, and rate-limited requests only.
 - Background processing and direct-to-object-storage uploads.
 - Persistent metadata, deduplication, content addressing, and storage migration tooling.
 - Structured configuration files and a command-line configuration interface.

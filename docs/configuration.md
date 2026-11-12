@@ -184,6 +184,8 @@ IMAGE_NAMESPACE_PROFILES='{"products":"product","users":"avatar"}'
 
 The first object maps profile names to partial processing policies. The second maps a validated namespace to a profile name. For any field the precedence is: profile value, then the matching global environment setting, then the built-in default. For example, an unset input limit defaults to 15 MiB; setting `IMAGE_MAX_INPUT_BYTES=17825792` makes the global value 17 MiB; a profile with `max_input_bytes: 18874368` raises only its assigned namespaces to 18 MiB. A profile without `max_input_bytes` inherits the global value. The HTTP body limit accounts for the largest input limit assigned to any namespace plus multipart overhead; the selected namespace's source-image limit is checked separately. Namespaces without an assignment keep the global policy and report `"profile": "default"` in image information. Profile names use lowercase letters, digits, `-`, and `_`; `default` is reserved. Profile width and height must be set together and each must be `1..=12000`; input and output byte limits must be positive. Invalid JSON, unknown profile fields, invalid identifiers, or references to undefined profiles reject startup. Changing a profile affects future uploads; stored images are not automatically reprocessed.
 
+Profiles are namespace-specific processing rules only. They do not set authentication, allowed input formats, output format, maximum slots, storage backend/prefix, quota, or retention. Those settings currently remain instance-wide (where implemented); per-namespace variants for them are future work.
+
 ---
 
 ## Concurrency Model
@@ -232,6 +234,8 @@ Use `IMAGE_READ_AUTH=none` for public GET, HEAD, resource listing, image informa
 Read and write requests use independent fixed-window limits per client socket IP. Defaults are 600 reads and 60 writes per 60 seconds. A limit of `0` disables that request class. Excess requests return `429 Too Many Requests` and `Retry-After`. Limits are local to one process; replicas do not share counters. Client-supplied forwarded-IP headers are not trusted.
 
 Every response includes a server-generated `X-Request-ID`. Structured JSON logs use `tracing`; set `RUST_LOG` to adjust the filter (for example, `RUST_LOG=image_service=debug`). Set `IMAGE_METRICS_ENABLED=true` to expose Prometheus metrics at `/metrics`. Authentication is independently controlled by `IMAGE_METRICS_AUTH`, which defaults to `true`.
+
+The current endpoint exports HTTP request totals by method/status class, an HTTP request-duration histogram, and a counter for rate-limited (`429`) requests. It does not currently report image-processing duration, compression ratio, input/output bytes, storage latency/failures, or OpenTelemetry traces/metrics. Those are future observability features, not part of the current endpoint.
 
 ## Cache and Presigned Read URLs
 
