@@ -8,6 +8,12 @@ This document describes the current project structure, module responsibilities, 
 
 ---
 
+## Deployment and Customer Isolation
+
+Image Service is designed as a single-tenant deployment: one running instance serves one customer. The instance's API key, storage credentials, configuration, and runtime limits apply to that deployment. Separate instances provide distinct application failure and maintenance boundaries and make customer data locations and credentials independently manageable.
+
+Namespaces organize resources inside one customer's instance. They do not define separate identities or authorization boundaries. Shared hosts, clusters, networks, and storage systems remain shared dependencies and possible failure points.
+
 ## Project Structure
 
 ```text

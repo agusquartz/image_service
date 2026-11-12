@@ -19,6 +19,10 @@ The service includes several defensive measures:
 - `X-Content-Type-Options: nosniff` on image responses.
 - Optional bearer-token protection for writes.
 
+## Deployment Isolation
+
+The intended deployment model is one service instance per customer. API keys, storage credentials, and service settings apply to the full instance; namespaces only organize that customer's resources and do not provide authorization boundaries. Separate instances and storage credentials keep customer data boundaries explicit and help limit application-level incidents to one deployment. Shared hosts, networks, clusters, or storage remain shared risks.
+
 A production deployment should additionally consider:
 
 - TLS termination.
