@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: Check out source
@@ -87,6 +88,7 @@ jobs:
           sha256sum "$asset" > "$asset.sha256"
 
       - name: Publish GitHub release
+        id: release
         if: steps.version.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
@@ -97,3 +99,10 @@ jobs:
           files: |
             dist/image_service-v${{ steps.version.outputs.version }}-linux-amd64
             dist/image_service-v${{ steps.version.outputs.version }}-linux-amd64.sha256
+
+      - name: Trigger multi-architecture Docker publication
+        if: github.event_name == 'push' && steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: v${{ steps.version.outputs.version }}
+        run: gh workflow run docker.yml --ref main -f release_tag="$RELEASE_TAG"

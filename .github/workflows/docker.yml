@@ -8,6 +8,7 @@ on:
     paths:
       - .dockerignore
       - .github/workflows/docker.yml
+      - .github/workflows/release.yml
       - Cargo.lock
       - Cargo.toml
       - Dockerfile
@@ -16,6 +17,13 @@ on:
   push:
     tags:
       - "v*"
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -72,7 +80,7 @@ jobs:
 
   publish-platform-artifacts:
     name: Publish Linux ${{ matrix.arch }} artifacts
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -89,10 +97,29 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Resolve and verify release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            release_tag="$INPUT_TAG"
+          else
+            release_tag="$REF_NAME"
+          fi
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $release_tag" >&2
+            exit 1
+          fi
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
 
       - name: Verify Cargo and tag versions match
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           tag_version="${RELEASE_TAG#v}"
@@ -131,14 +158,14 @@ jobs:
           target: runtime
           platforms: ${{ matrix.platform }}
           push: true
-          build-args: BUILD_VERSION=${{ github.ref_name }}
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}-linux-${{ matrix.arch }}
+          build-args: BUILD_VERSION=${{ steps.release.outputs.tag }}
+          tags: ghcr.io/${{ github.repository }}:${{ steps.release.outputs.tag }}-linux-${{ matrix.arch }}
           cache-from: type=gha,scope=release-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
 
       - name: Name and checksum binary
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
           ARCH: ${{ matrix.arch }}
         run: |
           install -D "dist/$ARCH/image_service" "dist/image_service-$RELEASE_TAG-linux-$ARCH"
@@ -150,14 +177,14 @@ jobs:
         with:
           name: release-binary-${{ matrix.arch }}
           path: |
-            dist/image_service-${{ github.ref_name }}-linux-${{ matrix.arch }}
-            dist/image_service-${{ github.ref_name }}-linux-${{ matrix.arch }}.sha256
+            dist/image_service-${{ steps.release.outputs.tag }}-linux-${{ matrix.arch }}
+            dist/image_service-${{ steps.release.outputs.tag }}-linux-${{ matrix.arch }}.sha256
           if-no-files-found: error
           retention-days: 1
 
   publish-release:
     name: Publish multi-architecture manifest and GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: publish-platform-artifacts
     runs-on: ubuntu-24.04
     permissions:
@@ -165,6 +192,18 @@ jobs:
       packages: write
 
     steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -178,7 +217,7 @@ jobs:
       - name: Create multi-architecture and latest tags
         env:
           IMAGE_NAME: ghcr.io/${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           docker buildx imagetools create \
             --tag "$IMAGE_NAME:$RELEASE_TAG" \
@@ -196,8 +235,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create GitHub release
+      - name: Create GitHub release from version tag
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.tag }}
           generate_release_notes: true
           files: dist/*
+
+      - name: Add ARM64 assets to the version-bump release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          files: |
+            dist/image_service-${{ steps.release.outputs.tag }}-linux-arm64
+            dist/image_service-${{ steps.release.outputs.tag }}-linux-arm64.sha256
