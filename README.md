@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/github/license/agusquartz/image_service)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 
-**A self-hosted image processing and storage service built with Rust and Axum.**
+**A self-hosted, single-tenant image processing and storage service built with Rust and Axum.**
 
 Image Service accepts uploaded images, validates and decodes them with defensive limits, center-crops to the configured aspect ratio, and encodes WebP under the configured output-size limit. It uses the configured target dimensions unless further downscaling is needed to meet that byte limit.
 
@@ -16,22 +16,100 @@ Applications often need image uploads without wanting image decoding, optimizati
 
 Image Service isolates that responsibility behind a small HTTP API:
 
-```text
-Application
-    |
-    | HTTP
-    v
-Image Service
-    |
-    +----> Validation
-    +----> Processing
-    +----> Storage
-    |
-    v
-Optimized image
+```mermaid
+---
+config:
+  theme: base
+  look: classic
+  layout: dagre
+  htmlLabels: true
+
+  themeVariables:
+    primaryColor: "#332717"
+    primaryTextColor: "#e0c39d"
+    primaryBorderColor: "#ffffff1a"
+    lineColor: "#a0a0a0"
+    edgeLabelBackground: "#322a2d"
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+    fontSize: "10.5px"
+
+  flowchart:
+    rankSpacing: 60
+    nodeSpacing: 45
+    curve: basis
+
+  themeCSS: |
+    .node rect {
+      fill: #332717;
+      stroke: rgba(255,255,255,0.10);
+      stroke-width: 0.75px;
+      rx: 12px;
+      ry: 12px;
+    }
+
+    .node .label,
+    .node .label p,
+    .node text {
+      color: #e0c39d;
+      fill: #e0c39d;
+      font-size: 10.5px;
+      font-weight: 600;
+    }
+
+    .node .label p {
+      padding: 4.5px 9px;
+      margin: 0;
+    }
+
+    .edgeLabel {
+      background-color: transparent;
+      text-align: center;
+    }
+
+    .edgeLabel p {
+      background-color: #322a2d;
+      color: #e0c39d;
+      border: 0.75px solid #e0c39d;
+      border-radius: 9.75px;
+      padding: 7.5px 18px;
+      min-width: 112.5px;
+      box-sizing: border-box;
+      margin: 0;
+      font-size: 9.75px;
+      font-weight: 600;
+      line-height: 1.5;
+      text-align: center;
+    }
+
+    .edgeLabel .label rect {
+      fill: #322a2d;
+      stroke: #e0c39d;
+      rx: 9.75px;
+      ry: 9.75px;
+    }
+
+    .flowchart-link {
+      stroke: rgba(249,249,247,0.50);
+      stroke-width: 0.75px;
+    }
+
+    .marker {
+      fill: rgba(249,249,247,0.50);
+      stroke: rgba(249,249,247,0.50);
+    }
+---
+flowchart TD
+    A[Application] -->|HTTP| B[Image Service]
+    B -->|"Validation<br/>↓<br/>Processing<br/>↓<br/>Storage"| C[Optimized image]
 ```
 
 This keeps image-specific infrastructure outside the consuming application while leaving room for future storage and processing capabilities.
+
+## Deployment Model and Production Use
+
+Image Service is designed to run as a dedicated instance for one customer. Each customer can have separate API credentials, service configuration, and storage access. Keeping instances separate helps contain application-level failures and protects customer data from access through another customer's service instance. Shared hosts, clusters, networks, or storage infrastructure can still be common failure points. `namespace` organizes resources inside one customer's instance; it is not an access-control boundary.
+
+The version currently on `main` is used in production by two companies running an ERP developed by the project maintainer. As of November 2026, no production errors or operational problems have been reported. This production experience refers to the version on `main`.
 
 ## Features
 
@@ -60,6 +138,7 @@ This keeps image-specific infrastructure outside the consuming application while
 - Local filesystem persistence through OpenDAL.
 - S3 and S3-compatible object storage.
 - Runtime-selectable storage backend.
+- Versioned Linux `amd64` and `arm64` container images with architecture-specific tags and a multi-architecture tag published to GHCR from version tags.
 - Optional public base URL generation.
 - Configurable Cache-Control with a 60-second default lifetime.
 - JSON error responses.
@@ -103,18 +182,91 @@ See the [HTTP API documentation](docs/api.md) for request, response, validation,
 
 ## Architecture
 
-```text
-HTTP
-  |
-  v
-Handlers
-  |
-  v
-Service
-  |
-  +------> Image processing
-  |
-  +------> Storage
+```mermaid
+---
+config:
+  theme: base
+  look: classic
+  layout: dagre
+  htmlLabels: true
+
+  themeVariables:
+    primaryColor: "#332717"
+    primaryTextColor: "#e0c39d"
+    primaryBorderColor: "#ffffff1a"
+    lineColor: "#a0a0a0"
+    edgeLabelBackground: "#322a2d"
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif"
+    fontSize: "10.5px"
+
+  flowchart:
+    rankSpacing: 60
+    nodeSpacing: 45
+    curve: basis
+
+  themeCSS: |
+    .node rect {
+      fill: #332717;
+      stroke: rgba(255,255,255,0.10);
+      stroke-width: 0.75px;
+      rx: 12px;
+      ry: 12px;
+    }
+
+    .node .label,
+    .node .label p,
+    .node text {
+      color: #e0c39d;
+      fill: #e0c39d;
+      font-size: 10.5px;
+      font-weight: 600;
+    }
+
+    .node .label p {
+      padding: 4.5px 9px;
+      margin: 0;
+    }
+
+    .edgeLabel {
+      background-color: transparent;
+      text-align: center;
+    }
+
+    .edgeLabel p {
+      background-color: #322a2d;
+      color: #e0c39d;
+      border: 0.75px solid #e0c39d;
+      border-radius: 9.75px;
+      padding: 7.5px 18px;
+      min-width: 112.5px;
+      box-sizing: border-box;
+      margin: 0;
+      font-size: 9.75px;
+      font-weight: 600;
+      line-height: 1.5;
+      text-align: center;
+    }
+
+    .edgeLabel .label rect {
+      fill: #322a2d;
+      stroke: #e0c39d;
+      rx: 9.75px;
+      ry: 9.75px;
+    }
+
+    .flowchart-link {
+      stroke: rgba(249,249,247,0.50);
+      stroke-width: 0.75px;
+    }
+
+    .marker {
+      fill: rgba(249,249,247,0.50);
+      stroke: rgba(249,249,247,0.50);
+    }
+---
+flowchart TD
+    HTTP --> Handlers --> Service
+    Service --> ImageProcessing[Image processing] --> Storage
 ```
 
 The core rule is simple:

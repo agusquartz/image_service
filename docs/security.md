@@ -55,6 +55,10 @@ The secure defaults are `required` for both. Set `IMAGE_READ_AUTH=none` for publ
 
 `/health` remains public for container and orchestrator health checks. `/metrics` is disabled by default. When enabled, it requires the API key by default through `IMAGE_METRICS_AUTH=true`, independently of read/write policies. Setting `IMAGE_METRICS_AUTH=false` makes metrics public and should only be used when network or proxy controls restrict access.
 
+## Customer Isolation
+
+The intended deployment is one service instance per customer. Authentication keys, authorization policies, and storage settings apply to an entire instance; they are not scoped to individual namespaces or resources. Separate instances and storage credentials make customer data boundaries explicit and limit the effect of an application-level failure to that deployment. Treat `namespace` only as an organization mechanism inside one customer's instance. Isolation at the service level does not remove risks from shared hosts, networks, clusters, or storage infrastructure.
+
 The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
 ## Rate Limiting and Observability

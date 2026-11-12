@@ -6,6 +6,12 @@
 
 This document describes the current project structure, module responsibilities, request flows, and architectural principles.
 
+## Deployment and Isolation Model
+
+The service is designed as a single-tenant deployment: one running service instance serves one customer. Its API key, read/write policies, rate limits, processing settings, and storage configuration apply to that whole instance. A dedicated instance gives each customer a separate application failure and maintenance boundary, and allows separate storage credentials and data locations.
+
+Namespaces group resources within that customer's instance. They do not create separate identities or access-control boundaries. Deployments that share a host, cluster, network, or storage system still depend on those shared components.
+
 ---
 
 ## Project Structure
