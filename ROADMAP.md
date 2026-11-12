@@ -205,16 +205,13 @@ avatars  -> WebP, max 100 KiB, 512 × 512
 
 ### More Image Operations
 
-Possible processing capabilities include:
+The upload pipeline already normalizes source orientation and center-crops to the configured output aspect ratio. Further processing capabilities could include:
 
 - Thumbnail generation.
-- Fixed-size resizing.
+- Additional fixed-size derivatives.
 - Maximum-width or maximum-height resizing.
 - Crop modes.
-- Center crop.
 - Smart crop.
-- Orientation normalization.
-- EXIF orientation handling.
 - Metadata removal.
 - Optional metadata retention.
 - Transparent-background handling.
