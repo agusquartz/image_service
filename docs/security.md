@@ -59,13 +59,19 @@ The secure defaults are `required` for both. Set `IMAGE_READ_AUTH=none` for publ
 
 `/health` remains public for container and orchestrator health checks. `/metrics` is disabled by default. When enabled, it requires the API key by default through `IMAGE_METRICS_AUTH=true`, independently of read/write policies. Setting `IMAGE_METRICS_AUTH=false` makes metrics public and should only be used when network or proxy controls restrict access.
 
+## Customer Isolation
+
+The intended deployment is one service instance per customer. Authentication keys, authorization policies, and storage settings apply to an entire instance; they are not scoped to individual namespaces or resources. Separate instances and storage credentials make customer data boundaries explicit and limit the effect of an application-level failure to that deployment. Treat `namespace` only as an organization mechanism inside one customer's instance. Isolation at the service level does not remove risks from shared hosts, networks, clusters, or storage infrastructure.
+
 The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
 ## Rate Limiting and Observability
 
 Read and write requests have separate fixed-window budgets per client source IP. Defaults are 600 reads and 60 writes per 60 seconds. Set the corresponding request count to `0` to disable that budget. The limiter uses the socket peer address and does not trust caller-supplied `X-Forwarded-For`; behind a proxy, configure network-level limits or a trusted-proxy design before relying on client IP fairness. The limiter is in-memory and applies per process, so replicas do not share counters.
 
-Every response includes a generated `X-Request-ID`. Structured JSON logs use Rust's `tracing` ecosystem and can be filtered with `RUST_LOG`; levels are `ERROR`, `WARN`, `INFO`, `DEBUG`, and `TRACE`. Logs and metric labels do not include API keys or image contents. The service writes logs to stdout and does not rotate files; configure retention in Docker, systemd/journald, or the hosting platform. The optional Prometheus endpoint is enabled with `IMAGE_METRICS_ENABLED=true` and exposes bounded method/status counters, request duration, and rate-limit counters. It requires bearer authentication by default; `IMAGE_METRICS_AUTH=false` is an explicit opt-out for deployments protected at the network or proxy layer.
+Every response includes a generated `X-Request-ID`. Structured JSON logs use Rust's `tracing` ecosystem and can be filtered with `RUST_LOG`; levels are `ERROR`, `WARN`, `INFO`, `DEBUG`, and `TRACE`. Request completion logs include the request ID, method, normalized route label, status, and duration. Logs and metric labels do not include API keys or image contents. The service writes logs to stdout and does not rotate files; configure retention in Docker, systemd/journald, or the hosting platform. The optional Prometheus endpoint is enabled with `IMAGE_METRICS_ENABLED=true` and exposes three HTTP-level metric families: `image_service_http_requests_total` (method and status-class labels), `image_service_http_request_duration_seconds` (histogram, sum, and count), and `image_service_rate_limited_requests_total` (429 counter). The request counter has no route, namespace, or resource labels. The endpoint requires bearer authentication by default; `IMAGE_METRICS_AUTH=false` is an explicit opt-out for deployments protected at the network or proxy layer.
+
+These metrics do not measure image-processing/compression or storage operations. The service also does not currently export OpenTelemetry metrics or traces. JSON `tracing` logs are structured application logs; using the `tracing` crate does not by itself mean an OpenTelemetry exporter is configured.
 
 ## Upload Validation Boundary
 

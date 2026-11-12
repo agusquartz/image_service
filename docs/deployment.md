@@ -34,7 +34,7 @@ The service is a self-hosted server application and is not intended to be publis
 
 ## Customer Deployment Isolation
 
-Deploy one Image Service instance per customer, with separate API credentials, service configuration, and storage credentials or locations. This keeps customer data boundaries explicit and helps contain application failures and maintenance within one deployment. A `namespace` only groups resources within an instance; it is not a security boundary. Shared hosts, clusters, networks, or storage remain common dependencies.
+Deploy one Image Service instance for each customer. Give each instance its own API key, configuration, and storage credentials; use a separate filesystem location or bucket/prefix as appropriate. This separates customer data and helps keep application failures, configuration changes, and maintenance within that customer's deployment. A `namespace` is only a resource grouping inside an instance, not a security boundary. If deployments share a host, cluster, network, or storage system, those remain shared failure and security dependencies.
 
 The version currently on `main` is used in production by two companies running an ERP developed by the project maintainer. As of November 2026, no production errors or operational problems have been reported for that version.
 
@@ -130,6 +130,41 @@ docker run --rm --read-only \
 ```
 
 This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
+
+### Multi-architecture images and release binaries
+
+The release build supports two Linux targets:
+
+| Target | Intended systems |
+|---|---|
+| `linux/amd64` | x86-64 Linux servers and cloud instances. |
+| `linux/arm64` | 64-bit ARM Linux, including Oracle Ampere instances, AWS Graviton, Azure Cobalt, and the Linux VM used by Docker Desktop on Apple Silicon. |
+
+These providers use the same Linux ARM64 image format, so the service does not need vendor-specific builds. The build uses generic target settings rather than tuning the binary to the CPU that built it. Oracle documents Ampere Linux as `aarch64` ([OCI Arm-based compute](https://docs.oracle.com/en-us/iaas/Content/Compute/References/arm.htm)); AWS identifies Graviton as `arm64` ([EC2 instance specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/gp.html)); and Azure describes Cobalt as a 64-bit Arm CPU ([Azure Cobalt overview](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/cobalt-overview)). Docker selects the matching platform variant from a multi-platform image ([Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/)).
+
+Apple Silicon is a macOS host, while these images are Linux containers; Docker Desktop runs the `linux/arm64` image in its Linux VM. This release does not include a native macOS executable.
+
+Build either platform locally with Buildx:
+
+```bash
+docker buildx build --platform linux/amd64 --target runtime --tag image-service:local-amd64 --load .
+docker buildx build --platform linux/arm64 --target runtime --tag image-service:local-arm64 --load .
+```
+
+The initial `v0.1.0` baseline contains only a standalone Linux `amd64` binary and checksum; it predates Docker image distribution. For subsequent releases, updating `Cargo.toml` on `main` triggers the Release workflow when the version differs from the previous commit. After creating the GitHub release and its `amd64` assets, that workflow explicitly dispatches the Docker workflow. The Docker workflow builds Linux `amd64` and `arm64` binaries and images, adds the `arm64` release assets, and publishes architecture-specific and multi-architecture GHCR tags. This explicit dispatch is needed because tags created by workflows using `GITHUB_TOKEN` do not trigger ordinary tag-push workflows. Manual version-tag pushes also run the Docker publication workflow directly.
+
+The manifest tag lets Docker select the correct image automatically; pull a specific architecture only when needed:
+
+```bash
+RELEASE_TAG=vX.Y.Z
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG-linux-amd64
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG-linux-arm64
+```
+
+Version releases also update `latest`; ordinary pushes and merges do not publish releases. The standalone executables are dynamically linked GNU/Linux binaries built against Debian 12 and need a compatible glibc on the host. The container images carry their matching runtime libraries and are the more portable option across Linux distributions. Before Docker distribution is merged to `main`, the `v0.1.0` release does not contain GHCR images; versioned container tags appear on subsequent releases.
+
+After the first image is published, set the GHCR package visibility to **Public** if customers should be able to pull it without registry credentials. Until then, GHCR may require authentication even though the repository itself is public.
 
 The filesystem endpoint smoke test exercises the private/private default, public-read/private-write, private-read/public-write, explicitly unprotected policies, and explicitly public metrics; missing-key and removed-setting startup failures; rate-limit `429`/`Retry-After`; request IDs; authenticated-by-default Prometheus metrics; POST create-only behavior; PUT replacement; GET, HEAD, info, listing, slot/resource DELETE; processing profiles; and invalid configuration. It needs Docker, `curl`, Python 3, and a local test image:
 
@@ -442,7 +477,6 @@ Before public deployment:
 
 Planned deployment improvements include:
 
-- Container images.
 - Docker Compose examples.
 - Systemd guidance.
 - Configurable caching and CDN behavior.

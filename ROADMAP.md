@@ -52,9 +52,14 @@ Delete endpoint                yes
 Database                       no
 Processing profiles            yes (optional namespace-specific WebP settings)
 Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
+Linux Docker images             yes (amd64, arm64, architecture-specific and multi-architecture GHCR tags)
+Linux release binaries          yes (amd64 and arm64 with SHA-256 checksums on releases)
+Version-triggered releases      yes (version bump on main; Docker publication dispatched after release creation)
 ```
 
 S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
+
+The `build/docker-image-distribution` branch has passed local ARM64 and emulated AMD64 container smoke tests against LocalFS and MinIO. GitHub's two-platform pull-request build remains the final CI check before this phase is marked complete. `Cargo.toml` stays at `0.1.0` on this branch because that version records the production baseline; the next promoted release should update the package version deliberately.
 
 Storage is implemented through OpenDAL.
 
@@ -88,7 +93,7 @@ This means the HTTP, processing, and application layers do not need to know whet
 
 ## Implemented: Processing Profiles
 
-Phase 3 adds optional named WebP processing profiles through `IMAGE_PROCESSING_PROFILES`, assigned to namespaces with `IMAGE_NAMESPACE_PROFILES`. A profile can override the input byte limit, output byte limit, and target dimensions. Each omitted field inherits its matching global setting, then the built-in default. Namespaces without a profile keep the existing global behavior, so profiles remain opt-in and backward compatible.
+Phase 3 adds optional named WebP processing profiles through `IMAGE_PROCESSING_PROFILES`, assigned to namespaces with `IMAGE_NAMESPACE_PROFILES`. A profile can override only the input byte limit, output byte limit, and target dimensions. Each omitted field inherits its matching global setting, then the built-in default. Namespaces without a profile keep the existing global behavior, so profiles remain opt-in and backward compatible. These are namespace-specific **image processing** rules; they do not configure authentication, allowed source formats, slot limits, storage backend/prefix, quotas, or retention.
 
 Verification covers profile overrides and fallback behavior in unit tests, profile-specific input limits and inherited global limits in LocalFS smoke tests, and namespace profile processing in MinIO smoke tests. The tested Docker containers use ephemeral storage and are removed after the run. See [configuration](docs/configuration.md#per-namespace-processing-profiles) and [deployment testing](docs/deployment.md) for configuration and commands.
 
@@ -100,7 +105,7 @@ Separate in-process read/write fixed-window rate limits default to 600 and 60 re
 
 ## Future Features
 
-The long-term direction is to make the service increasingly configurable, including image policy, security, caching, URL generation, processing behavior, storage operations, and observability.
+This section lists only work that is not implemented. Existing namespace processing profiles, cache validators, HTTP metrics, authentication, resource operations, and storage backends are documented under Current Capabilities and the implemented sections above.
 
 The items below describe planned architectural directions rather than functionality that should be assumed to exist today.
 
@@ -200,16 +205,13 @@ avatars  -> WebP, max 100 KiB, 512 × 512
 
 ### More Image Operations
 
-Possible processing capabilities include:
+The upload pipeline already normalizes source orientation and center-crops to the configured output aspect ratio. Further processing capabilities could include:
 
 - Thumbnail generation.
-- Fixed-size resizing.
+- Additional fixed-size derivatives.
 - Maximum-width or maximum-height resizing.
 - Crop modes.
-- Center crop.
 - Smart crop.
-- Orientation normalization.
-- EXIF orientation handling.
 - Metadata removal.
 - Optional metadata retention.
 - Transparent-background handling.
@@ -321,7 +323,7 @@ Future cache work may include:
 
 ### Additional Authentication Strategies
 
-The service currently supports one bearer token with independent `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` requirements. Both default to `required`; broader identity strategies remain future work.
+The service currently supports one bearer token with independent instance-wide `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` requirements. Both default to `required`. The existing processing profiles do not change authentication or authorization by namespace. Future work could add additional identity strategies and namespace-aware authorization.
 
 Possible future strategies:
 
@@ -336,9 +338,9 @@ Authorization could also become namespace-aware.
 
 ---
 
-### Per-Namespace Policies
+### Per-Namespace Policies Beyond Processing Profiles
 
-Different namespaces may eventually use different rules:
+Namespace-to-profile assignment is already implemented for WebP processing: input/output byte limits and target width/height may differ by namespace, with unspecified fields inheriting global values and then built-in defaults. This section concerns other policy types that are not currently configurable per namespace:
 
 ```text
 products
@@ -347,16 +349,13 @@ articles
 documents
 ```
 
-Possible namespace-specific configuration:
+Possible future namespace-specific configuration:
 
-- Allowed source formats.
-- Maximum source and output sizes beyond the limits available in processing profiles.
-- Number of slots.
-- Processing profile selection (basic namespace assignment is implemented; richer namespace policies remain future work).
-- Public/private read access.
-- Storage backend.
-- Storage prefix.
-- Retention rules.
+- Allowed source formats and output format.
+- Slot limits (the current `IMAGE_MAX_SLOTS` value applies globally).
+- Read/write authorization policy.
+- Storage backend or object prefix.
+- Storage quotas and retention rules.
 
 ---
 
@@ -374,27 +373,23 @@ Reducing the configured limit does not hide or delete existing higher-numbered s
 
 ### Observability
 
-Further operational improvements may include:
+The current optional `/metrics` endpoint (`IMAGE_METRICS_ENABLED=true`) exports three bounded-cardinality Prometheus metric families:
+
+- `image_service_http_requests_total`, a counter labeled by HTTP method and status class (not route, namespace, or resource).
+- `image_service_http_request_duration_seconds`, an HTTP request-duration histogram with sum and count.
+- `image_service_rate_limited_requests_total`, a counter of requests rejected with `429`.
+
+The endpoint's authentication is independent of image read/write policies: `IMAGE_METRICS_AUTH` defaults to `true`, and an API key is required at startup when metrics are enabled with authentication. JSON `tracing` logs separately include request ID, method, normalized route label, status, and duration. This is HTTP-level instrumentation only: the service does not currently export OpenTelemetry traces/metrics or measure image processing/compression and storage operations.
+
+Future observability work may add:
 
 - Processing-duration metrics.
-- Compression-ratio metrics.
-- Storage latency.
-- Storage backend labels.
-- OpenTelemetry.
-- Distributed tracing.
+- Input/output byte and compression-ratio metrics.
+- Resize/encoding attempts and processing failures.
+- Storage operation duration, failures, and backend labels.
+- OpenTelemetry exporters and distributed tracing.
 
-Potential metrics:
-
-```text
-image_upload_total
-image_upload_failed_total
-image_processing_duration_seconds
-image_source_bytes
-image_output_bytes
-image_resize_rounds
-image_store_duration_seconds
-image_store_failed_total
-```
+Future metrics should avoid namespace/resource labels by default, to prevent high-cardinality series and avoid exposing customer identifiers.
 
 ---
 

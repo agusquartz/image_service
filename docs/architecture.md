@@ -6,13 +6,13 @@
 
 This document describes the current project structure, module responsibilities, request flows, and architectural principles.
 
+## Deployment and Isolation Model
+
+The service is designed as a single-tenant deployment: one running service instance serves one customer. Its API key, read/write policies, rate limits, processing settings, and storage configuration apply to that whole instance. A dedicated instance gives each customer a separate application failure and maintenance boundary, and allows separate storage credentials and data locations.
+
+Namespaces group resources within that customer's instance. They do not create separate identities or access-control boundaries. Deployments that share a host, cluster, network, or storage system still depend on those shared components.
+
 ---
-
-## Deployment and Customer Isolation
-
-Image Service is designed as a single-tenant deployment: one running instance serves one customer. The instance's API key, storage credentials, configuration, and runtime limits apply to that deployment. Separate instances provide distinct application failure and maintenance boundaries and make customer data locations and credentials independently manageable.
-
-Namespaces organize resources inside one customer's instance. They do not define separate identities or authorization boundaries. Shared hosts, clusters, networks, and storage systems remain shared dependencies and possible failure points.
 
 ## Project Structure
 
