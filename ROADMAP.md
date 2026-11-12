@@ -52,9 +52,14 @@ Delete endpoint                yes
 Database                       no
 Processing profiles            yes (optional namespace-specific WebP settings)
 Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
+Linux Docker images             yes (amd64, arm64, architecture-specific and multi-architecture GHCR tags)
+Linux release binaries          yes (amd64 and arm64 with SHA-256 checksums on releases)
+Version-triggered releases      yes (version bump on main; Docker publication dispatched after release creation)
 ```
 
 S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
+
+The `build/docker-image-distribution` branch has passed local ARM64 and emulated AMD64 container smoke tests against LocalFS and MinIO. GitHub's two-platform pull-request build remains the final CI check before this phase is marked complete. `Cargo.toml` stays at `0.1.0` on this branch because that version records the production baseline; the next promoted release should update the package version deliberately.
 
 Storage is implemented through OpenDAL.
 

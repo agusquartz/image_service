@@ -139,6 +139,7 @@ The version currently on `main` is used in production by two companies running a
 - S3 and S3-compatible object storage.
 - Runtime-selectable storage backend.
 - Versioned Linux `amd64` and `arm64` container images with architecture-specific tags and a multi-architecture tag published to GHCR from version tags.
+- Standalone Linux `amd64` and `arm64` release binaries with SHA-256 checksums.
 - Optional public base URL generation.
 - Configurable Cache-Control with a 60-second default lifetime.
 - JSON error responses.
@@ -325,19 +326,16 @@ See [Configuration](docs/configuration.md).
 
 ## Roadmap
 
-The long-term goal is to make deployment-specific behavior configurable without changing application code, including:
+Implemented capabilities are listed above and documented in the linked guides. Remaining roadmap work includes:
 
-- Runtime-configurable image policies.
+- Immutable, content-versioned image URLs with long-lived cache headers.
 - Additional output formats.
-- Additional processing profile options and selection rules.
-- Cache and CDN behavior such as immutable versioned image URLs.
+- More processing operations and richer profile selection/policies.
 - Distributed rate limiting and per-namespace quotas.
-- OpenTelemetry integration and image-processing/storage metrics.
-- Authentication strategies.
-- Per-namespace policies.
-- Metadata and deletion.
-- Observability and rate limiting.
+- OpenTelemetry and deeper image-processing/storage metrics.
 - Background processing and direct-to-object-storage uploads.
+- Persistent metadata, deduplication, content addressing, and storage migration tooling.
+- Structured configuration files and a command-line configuration interface.
 
 See [ROADMAP.md](ROADMAP.md) for the full roadmap.
 
