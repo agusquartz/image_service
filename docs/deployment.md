@@ -151,15 +151,18 @@ docker buildx build --platform linux/amd64 --target runtime --tag image-service:
 docker buildx build --platform linux/arm64 --target runtime --tag image-service:local-arm64 --load .
 ```
 
-On a version tag such as `v0.1.0`, GitHub Actions checks that the tag matches `Cargo.toml`, builds a standalone Linux binary and a Docker image for each target, publishes architecture-specific images to GHCR, and creates a multi-architecture manifest plus the GitHub release. Release assets include SHA-256 checksums. The manifest tag lets Docker select the correct image automatically; pull a specific architecture only when needed:
+The initial `v0.1.0` baseline contains only a standalone Linux `amd64` binary and checksum; it predates Docker image distribution. For subsequent releases, updating `Cargo.toml` on `main` triggers the Release workflow when the version differs from the previous commit. After creating the GitHub release and its `amd64` assets, that workflow explicitly dispatches the Docker workflow. The Docker workflow builds Linux `amd64` and `arm64` binaries and images, adds the `arm64` release assets, and publishes architecture-specific and multi-architecture GHCR tags. This explicit dispatch is needed because tags created by workflows using `GITHUB_TOKEN` do not trigger ordinary tag-push workflows. Manual version-tag pushes also run the Docker publication workflow directly.
+
+The manifest tag lets Docker select the correct image automatically; pull a specific architecture only when needed:
 
 ```bash
-docker pull ghcr.io/agusquartz/image_service:v0.1.0
-docker pull ghcr.io/agusquartz/image_service:v0.1.0-linux-amd64
-docker pull ghcr.io/agusquartz/image_service:v0.1.0-linux-arm64
+RELEASE_TAG=vX.Y.Z
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG-linux-amd64
+docker pull ghcr.io/agusquartz/image_service:$RELEASE_TAG-linux-arm64
 ```
 
-Version tags also update `latest`; ordinary pushes and merges do not publish releases. The standalone executables are dynamically linked GNU/Linux binaries built against Debian 12 and need a compatible glibc on the host. The container images carry their matching runtime libraries and are the more portable option across Linux distributions.
+Version releases also update `latest`; ordinary pushes and merges do not publish releases. The standalone executables are dynamically linked GNU/Linux binaries built against Debian 12 and need a compatible glibc on the host. The container images carry their matching runtime libraries and are the more portable option across Linux distributions. Before Docker distribution is merged to `main`, the `v0.1.0` release does not contain GHCR images; versioned container tags appear on subsequent releases.
 
 After the first image is published, set the GHCR package visibility to **Public** if customers should be able to pull it without registry credentials. Until then, GHCR may require authentication even though the repository itself is public.
 
