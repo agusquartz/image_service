@@ -32,6 +32,12 @@ S3 and S3-compatible deployments additionally require:
 
 The service is a self-hosted server application and is not intended to be published as a reusable crates.io library.
 
+## Customer Deployment Isolation
+
+Deploy one Image Service instance per customer, with separate API credentials, service configuration, and storage credentials or locations. This keeps customer data boundaries explicit and helps contain application failures and maintenance within one deployment. A `namespace` only groups resources within an instance; it is not a security boundary. Shared hosts, clusters, networks, or storage remain common dependencies.
+
+The version currently on `main` is used in production by two companies running an ERP developed by the project maintainer. As of November 2026, no production errors or operational problems have been reported for that version.
+
 ---
 
 ## Environment File
@@ -143,6 +149,20 @@ bash scripts/verify_phase1_phase2.sh ./TEST_IMAGE_ORIGINAL.png
 ```
 
 The combined script builds the Distroless service image, runs the filesystem smoke test, pulls the MinIO-compatible test image if needed, and runs the S3-compatible smoke test. Both test backends use volatile storage and clean up their containers. Set `MINIO_IMAGE` to use a different MinIO-compatible image and `IMAGE_SERVICE_IMAGE` to choose the service image tag. The individual scripts can also be run separately.
+
+## Versioned Releases
+
+The current `main` baseline declares version `0.1.0` in `Cargo.toml`. The initial `v0.1.0` release is created by manually running the **Release** GitHub Actions workflow on `main`; it attaches a Linux `amd64` executable and its SHA-256 checksum.
+
+For later releases, merge a package-version update in `Cargo.toml` (and the corresponding `Cargo.lock` update, when required) into `main`. GitHub Actions compares the package version with the previous `main` commit and publishes a GitHub Release only when that version changed. Ordinary merges that keep the same version do not publish releases. Release notes are generated from merged pull requests and can be edited on GitHub after publication.
+
+Download the executable and checksum from the matching GitHub Release. Verify the file with:
+
+```bash
+sha256sum -c image_service-v0.1.0-linux-amd64.sha256
+```
+
+The standalone executable is a Linux `amd64` GNU/Linux build and requires a compatible glibc on the host.
 
 ---
 

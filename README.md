@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/github/license/agusquartz/image_service)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 
-**A self-hosted image processing and storage service built with Rust and Axum.**
+**A self-hosted, single-tenant image processing and storage service built with Rust and Axum.**
 
 Image Service accepts uploaded images, validates and decodes them with defensive limits, center-crops to the configured aspect ratio, and encodes WebP under the configured output-size limit. It uses the configured target dimensions unless further downscaling is needed to meet that byte limit.
 
@@ -32,6 +32,12 @@ Optimized image
 ```
 
 This keeps image-specific infrastructure outside the consuming application while leaving room for future storage and processing capabilities.
+
+## Deployment Model and Production Use
+
+Image Service is designed to run as a dedicated instance for one customer. Separate instances allow each customer to have its own API key, configuration, and storage credentials, and help contain application failures and maintenance within that deployment. A `namespace` groups resources inside an instance; it is not an access-control boundary. Shared hosts, clusters, networks, and storage can still be common failure or security dependencies.
+
+The version currently on `main` is used in production by two companies running an ERP developed by the project maintainer. As of November 2026, no production errors or operational problems have been reported for that version.
 
 ## Features
 

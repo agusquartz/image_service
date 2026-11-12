@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version in Cargo.toml to release (for the initial baseline)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release-linux-amd64:
+    name: Release Linux amd64 binary
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Check release version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          current_version="$(sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' Cargo.toml | head -n 1)"
+          if [[ -z "$current_version" ]]; then
+            echo "Could not read the package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$REQUESTED_VERSION" != "$current_version" ]]; then
+              echo "Requested version $REQUESTED_VERSION does not match Cargo.toml version $current_version" >&2
+              exit 1
+            fi
+            publish=true
+          else
+            previous_version="$(git show HEAD^:Cargo.toml | sed -n '/^\[package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' | head -n 1)"
+            if [[ "$previous_version" == "$current_version" ]]; then
+              echo "Cargo.toml version is unchanged; skipping release."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            publish=true
+          fi
+
+          tag="v$current_version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Release tag $tag already exists" >&2
+            exit 1
+          fi
+
+          echo "version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build release binary
+        if: steps.version.outputs.publish == 'true'
+        run: cargo build --release --locked
+
+      - name: Name binary and create checksum
+        if: steps.version.outputs.publish == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="image_service-v$RELEASE_VERSION-linux-amd64"
+          install -D target/release/image_service "dist/$asset"
+          cd dist
+          sha256sum "$asset" > "$asset.sha256"
+
+      - name: Publish GitHub release
+        if: steps.version.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            dist/image_service-v${{ steps.version.outputs.version }}-linux-amd64
+            dist/image_service-v${{ steps.version.outputs.version }}-linux-amd64.sha256
