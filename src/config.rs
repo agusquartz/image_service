@@ -16,6 +16,9 @@ pub const DEFAULT_IMAGE_CACHE_TTL_SECONDS: u64 = 60;
 
 /// Maximum HTTP request overhead for multipart headers and boundaries.
 pub const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
+pub const UPLOAD_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_UPLOADS_IN_FLIGHT: usize = 4;
+pub const DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS: u64 = 120;
 
 /// Minimum valid image slot.
 pub const MIN_SLOT: u8 = 1;
@@ -145,6 +148,14 @@ pub struct AppConfig {
     /// to execute concurrently.
     pub max_concurrency: usize,
 
+    /// Requests admitted to read or process an uploaded image at once.
+    pub max_uploads_in_flight: usize,
+
+    /// Budget reserved for compressed upload bodies while in flight.
+    pub upload_memory_budget_bytes: usize,
+
+    pub upload_read_timeout_seconds: u64,
+
     /// Maximum uploaded image payload size, in bytes.
     pub max_source_bytes: usize,
 
@@ -209,6 +220,9 @@ impl AppConfig {
     /// - `IMAGE_STORAGE_SCHEME`
     /// - `IMAGE_STORAGE_*` backend-specific options
     /// - `IMAGE_MAX_CONCURRENCY`
+    /// - `IMAGE_MAX_UPLOADS_IN_FLIGHT`
+    /// - `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES`
+    /// - `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS`
     /// - `IMAGE_MAX_INPUT_BYTES`
     /// - `IMAGE_MAX_OUTPUT_BYTES`
     /// - `IMAGE_OUTPUT_WIDTH`
@@ -303,6 +317,43 @@ impl AppConfig {
         let namespace_profiles =
             parse_json_env::<HashMap<String, String>>("IMAGE_NAMESPACE_PROFILES")?;
         validate_processing_profiles(&processing_profiles, &namespace_profiles)?;
+        let largest_input =
+            max_configured_input_bytes(max_source_bytes, &processing_profiles, &namespace_profiles);
+        let max_uploads_in_flight = parse_bounded_usize(
+            "IMAGE_MAX_UPLOADS_IN_FLIGHT",
+            DEFAULT_MAX_UPLOADS_IN_FLIGHT,
+            1,
+            1024,
+        )?;
+        let default_upload_budget = largest_input
+            .div_ceil(UPLOAD_BUDGET_UNIT_BYTES)
+            .checked_mul(DEFAULT_MAX_UPLOADS_IN_FLIGHT)
+            .and_then(|units| units.checked_mul(UPLOAD_BUDGET_UNIT_BYTES))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload budget overflow"))?;
+        let upload_memory_budget_bytes = parse_bounded_usize(
+            "IMAGE_UPLOAD_MEMORY_BUDGET_BYTES",
+            default_upload_budget,
+            1,
+            usize::MAX,
+        )?;
+        let upload_units = largest_input.div_ceil(UPLOAD_BUDGET_UNIT_BYTES);
+        let budget_units = upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES;
+        if upload_memory_budget_bytes < largest_input
+            || budget_units < upload_units
+            || upload_units > u32::MAX as usize
+            || budget_units > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IMAGE_UPLOAD_MEMORY_BUDGET_BYTES must cover the largest configured input and fit the semaphore",
+            ));
+        }
+        let upload_read_timeout_seconds = parse_bounded_u64(
+            "IMAGE_UPLOAD_READ_TIMEOUT_SECONDS",
+            DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS,
+            1,
+            86_400,
+        )?;
         let max_slots = parse_bounded_u32(
             "IMAGE_MAX_SLOTS",
             u32::from(DEFAULT_MAX_SLOTS),
@@ -428,6 +479,9 @@ impl AppConfig {
             bind_address,
             storage,
             max_concurrency,
+            max_uploads_in_flight,
+            upload_memory_budget_bytes,
+            upload_read_timeout_seconds,
             max_source_bytes,
             max_output_bytes,
             output_width,

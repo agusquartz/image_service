@@ -91,7 +91,14 @@ async fn upload_image(
         }
     }
 
-    let incoming = read_multipart_image(multipart, policy.max_input_bytes).await?;
+    // Reserve compressed-body capacity before consuming the multipart stream.
+    let admission = state.admit_upload(policy.max_input_bytes)?;
+    let incoming = tokio::time::timeout(
+        std::time::Duration::from_secs(state.upload_read_timeout_seconds),
+        read_multipart_image(multipart, policy.max_input_bytes),
+    )
+    .await
+    .map_err(|_| ApiError::RequestTimeout("Upload body read timed out".to_string()))??;
 
-    service::upload(&state, &key, incoming, replace_existing).await
+    service::upload(&state, &key, incoming, replace_existing, admission).await
 }

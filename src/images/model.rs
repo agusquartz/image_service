@@ -46,6 +46,6 @@ impl ImageKey {
 /// verify that it matches the actual image format detected from the
 /// file bytes.
 pub(crate) struct IncomingImage {
-    pub bytes: Vec<u8>,
-    pub mime: String,
+    pub bytes: axum::body::Bytes,
+    pub mime: Option<String>,
 }

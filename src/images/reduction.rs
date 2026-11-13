@@ -1,11 +1,12 @@
 use crate::{
     config::{MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION},
     error::ApiError,
+    state::UploadAdmission,
 };
 
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType};
 
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, sync::Arc, time::Instant};
 
 use tokio::sync::Semaphore;
 
@@ -25,25 +26,30 @@ use super::model::IncomingImage;
 pub(crate) async fn reduce_to_webp(
     semaphore: Arc<Semaphore>,
     incoming: IncomingImage,
+    admission: UploadAdmission,
     max_output_bytes: usize,
     output_width: u32,
     output_height: u32,
 ) -> Result<Vec<u8>, ApiError> {
+    let queue_started = Instant::now();
     let permit = semaphore.acquire_owned().await.map_err(|error| {
         ApiError::Internal(format!("Image processing semaphore closed: {error}"))
     })?;
+    let queue_wait_us = queue_started.elapsed().as_micros() as u64;
 
     tokio::task::spawn_blocking(move || {
         // Keep the permit alive for the complete duration of the
         // blocking image-processing operation.
         let _permit = permit;
+        let _admission = admission;
 
         process_image_blocking(
             &incoming.bytes,
-            &incoming.mime,
+            incoming.mime.as_deref(),
             max_output_bytes,
             output_width,
             output_height,
+            queue_wait_us,
         )
     })
     .await
@@ -56,11 +62,14 @@ pub(crate) async fn reduce_to_webp(
 /// encoder perform CPU-bound work.
 fn process_image_blocking(
     bytes: &[u8],
-    declared_mime: &str,
+    declared_mime: Option<&str>,
     max_output_bytes: usize,
     output_width: u32,
     output_height: u32,
+    queue_wait_us: u64,
 ) -> Result<Vec<u8>, ApiError> {
+    let processing_started = Instant::now();
+    let decode_started = Instant::now();
     let format = image::guess_format(bytes)
         .map_err(|_| ApiError::UnsupportedMediaType("Unknown image format".to_string()))?;
 
@@ -72,7 +81,8 @@ fn process_image_blocking(
 
     if !declared_mime_is_acceptable(declared_mime, format) {
         return Err(ApiError::UnsupportedMediaType(format!(
-            "Declared MIME type ({declared_mime}) does not match the detected image format ({format:?})"
+            "Declared MIME type ({}) does not match the detected image format ({format:?})",
+            declared_mime.unwrap_or_default()
         )));
     }
 
@@ -109,12 +119,28 @@ fn process_image_blocking(
     // metadata from becoming rotated after conversion to WebP.
     image.apply_orientation(orientation);
 
-    compress_webp(image, max_output_bytes, output_width, output_height)
+    let decode_us = decode_started.elapsed().as_micros() as u64;
+    let compression_started = Instant::now();
+    let result = compress_webp(image, max_output_bytes, output_width, output_height);
+    let compression_us = compression_started.elapsed().as_micros() as u64;
+
+    if tracing::enabled!(target: "image_processing_profile", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "image_processing_profile",
+            queue_wait_us,
+            decode_us,
+            compression_us,
+            processing_us = processing_started.elapsed().as_micros() as u64,
+            "image processing profile"
+        );
+    }
+
+    result
 }
 
 /// Returns whether the detected source format is accepted by the
 /// service.
-fn supported_format(format: ImageFormat) -> bool {
+pub(super) fn supported_format(format: ImageFormat) -> bool {
     matches!(
         format,
         ImageFormat::Jpeg
@@ -131,7 +157,13 @@ fn supported_format(format: ImageFormat) -> bool {
 ///
 /// This prevents clients from disguising arbitrary formats by merely
 /// changing the Content-Type header.
-fn declared_mime_is_acceptable(declared_mime: &str, format: ImageFormat) -> bool {
+pub(super) fn declared_mime_is_acceptable(
+    declared_mime: Option<&str>,
+    format: ImageFormat,
+) -> bool {
+    let Some(declared_mime) = declared_mime else {
+        return true;
+    };
     let mime = declared_mime
         .split(';')
         .next()
@@ -266,7 +298,20 @@ fn crop_and_resize(image: DynamicImage, output_width: u32, output_height: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_webp, crop_and_resize};
+    use super::{compress_webp, crop_and_resize, declared_mime_is_acceptable};
+
+    #[test]
+    fn absent_content_type_uses_detected_image_format() {
+        assert!(declared_mime_is_acceptable(None, image::ImageFormat::Png));
+        assert!(declared_mime_is_acceptable(
+            Some("image/png"),
+            image::ImageFormat::Png
+        ));
+        assert!(!declared_mime_is_acceptable(
+            Some("image/jpeg"),
+            image::ImageFormat::Png
+        ));
+    }
 
     #[test]
     fn center_crops_sides_to_match_the_target_aspect_ratio() {
