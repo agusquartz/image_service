@@ -1,4 +1,8 @@
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::ApiError,
+    state::{AppState, UploadAdmission},
+};
+use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -30,21 +34,30 @@ pub(crate) async fn upload(
     key: &ImageKey,
     incoming: IncomingImage,
     replace_existing: bool,
+    admission: UploadAdmission,
 ) -> Result<(UploadResponse, bool), ApiError> {
     let policy = state.processing_policy_for(&key.namespace);
     let webp = reduce_to_webp(
         state.image_jobs.clone(),
         incoming,
+        admission,
         policy.max_output_bytes,
         policy.output_width,
         policy.output_height,
     )
     .await?;
+    let webp = Bytes::from(webp);
 
     let was_created = if replace_existing {
-        state.store.write(key, &webp, state.max_slots).await?
+        state
+            .store
+            .write(key, webp.clone(), state.max_slots)
+            .await?
     } else {
-        state.store.create(key, &webp, state.max_slots).await?;
+        state
+            .store
+            .create(key, webp.clone(), state.max_slots)
+            .await?;
         true
     };
 
