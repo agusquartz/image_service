@@ -73,11 +73,14 @@ Authorization: Bearer <IMAGE_API_KEY>
 
 The uploaded image payload is limited by `IMAGE_MAX_INPUT_BYTES` (15 MiB by default). The complete multipart request may include up to 1 MiB of framing overhead beyond that limit. The converted WebP is constrained by `IMAGE_MAX_OUTPUT_BYTES` (100 KiB by default) and targets the `IMAGE_OUTPUT_WIDTH` × `IMAGE_OUTPUT_HEIGHT` dimensions (1024×1024 by default). It center-crops to the target aspect ratio without distortion. Lossy WebP quality is searched from 100 down to 0. If quality 0 at the configured dimensions still exceeds the byte limit, the service reduces dimensions in further steps, preserving the target aspect ratio and always resizing from the same cropped source pixels.
 
+The source byte limit is counted from received multipart chunks, including when the request has no `Content-Length`; the selected namespace/profile limit is enforced as the chunks arrive. `Content-Length` and the part's `Content-Type` are optional hints. The service detects the format from the incoming bytes as they arrive; if a MIME type is supplied, it must match the detected format. The full image is then decoded and validated before processing. Missing or incorrect hints do not bypass the actual byte limit or format checks.
+
 `POST` creates an image only when that slot is empty and returns `201 Created`. If the slot already contains an image, it returns `409 Conflict` and leaves the stored image unchanged. `PUT` creates a missing image with `201 Created` or replaces an existing image with `200 OK`; use it when replacing a slot. A successful upload stays within the configured output byte limit. The service can return `422 Unprocessable Entity` only if the configured byte limit is too small even for a 1×1 WebP image.
 
 There is no `PATCH` upload method because uploads contain the complete image file; this API has no partial image representation to patch.
 
 The service validates the route parameters, reads the multipart image, verifies the source format, processes the image, and stores the resulting WebP in the requested slot.
+Upload admission reserves capacity before reading multipart data. When the configured number of uploads or compressed-body budget is full, `POST` and `PUT` return `503 Service Unavailable` with `Retry-After: 1`; the client can retry the complete request. A multipart read that exceeds `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` returns `408 Request Timeout`.
 Processing uses the optional profile assigned to the namespace. Profiles can override the input byte limit, output byte limit, and target dimensions; fields they omit inherit the existing global environment settings. Unassigned namespaces keep the current global behavior.
 
 A successful response looks like:

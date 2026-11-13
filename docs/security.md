@@ -18,6 +18,7 @@ The service includes several defensive measures:
 - Restricted namespace characters.
 - Restricted resource-ID characters.
 - Bounded image-processing concurrency.
+- Separate upload admission and compressed-body budget before multipart reads; configurable whole-body read timeout.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
 - Per-client read/write rate limits with a `429` response and `Retry-After`.
