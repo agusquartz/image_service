@@ -71,6 +71,10 @@ async fn upload_image(
     let key = ImageKey::new(namespace, resource_id, slot)?;
     let policy = state.processing_policy_for(&key.namespace);
 
+    // The token records the resource/slot generation before any upload body
+    // work begins. A concurrent delete can then invalidate this upload.
+    let operation = state.store.begin_operation(&key).await;
+
     if slot > state.max_slots {
         if !replace_existing {
             return Err(ApiError::BadRequest(format!(
@@ -91,6 +95,10 @@ async fn upload_image(
         }
     }
 
+    if !replace_existing {
+        state.store.ensure_absent(&key).await?;
+    }
+
     // Reserve compressed-body capacity before consuming the multipart stream.
     let admission = state.admit_upload(policy.max_input_bytes)?;
     let incoming = tokio::time::timeout(
@@ -100,5 +108,13 @@ async fn upload_image(
     .await
     .map_err(|_| ApiError::RequestTimeout("Upload body read timed out".to_string()))??;
 
-    service::upload(&state, &key, incoming, replace_existing, admission).await
+    service::upload(
+        &state,
+        &key,
+        incoming,
+        replace_existing,
+        admission,
+        operation,
+    )
+    .await
 }

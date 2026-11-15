@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex, Weak},
     time::{Duration, SystemTime},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::model::ImageKey;
 
@@ -27,6 +27,23 @@ pub(crate) struct StoredMetadata {
     pub last_modified: Option<SystemTime>,
 }
 
+#[derive(Debug, Default)]
+struct ResourceOperationState {
+    generation: u64,
+    slot_generations: HashMap<u8, u64>,
+}
+
+/// Captures the resource and slot generations when an upload starts reading.
+/// Deletes advance a generation, preventing an older in-flight upload from
+/// publishing after the delete has completed.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageOperationToken {
+    state: Arc<Mutex<ResourceOperationState>>,
+    resource_generation: u64,
+    slot_generation: u64,
+    slot: u8,
+}
+
 /// The actual storage implementation is provided by OpenDAL.
 ///
 /// Currently enabled backends:
@@ -36,9 +53,9 @@ pub(crate) struct StoredMetadata {
 #[derive(Debug, Clone)]
 pub(crate) struct ImageStore {
     operator: Operator,
-    /// OpenDAL filesystem conditional writes check existence before rename.
-    /// Per-key locks protect that sequence without serializing unrelated slots.
-    write_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+    /// Weak references let idle resource locks disappear while uploads hold a
+    /// strong reference to the lock from their admission through publication.
+    operation_locks: Arc<StdMutex<HashMap<String, Weak<Mutex<ResourceOperationState>>>>>,
 }
 
 impl ImageStore {
@@ -46,39 +63,106 @@ impl ImageStore {
     pub fn new(operator: Operator) -> Self {
         Self {
             operator,
-            write_locks: Arc::new(StdMutex::new(HashMap::new())),
+            operation_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
-    fn write_lock_for(&self, object_key: &str) -> Arc<Mutex<()>> {
+    fn operation_lock_for_resource(
+        &self,
+        namespace: &str,
+        resource_id: &str,
+    ) -> Arc<Mutex<ResourceOperationState>> {
+        let resource_key = format!("{namespace}/{resource_id}");
         let mut locks = self
-            .write_locks
+            .operation_locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(object_key).and_then(Weak::upgrade) {
+        if let Some(lock) = locks.get(&resource_key).and_then(Weak::upgrade) {
             return lock;
         }
 
-        let lock = Arc::new(Mutex::new(()));
-        locks.insert(object_key.to_string(), Arc::downgrade(&lock));
+        let lock = Arc::new(Mutex::new(ResourceOperationState::default()));
+        locks.insert(resource_key, Arc::downgrade(&lock));
         lock
     }
 
+    /// Captures the operation generation before an upload consumes its body.
+    pub async fn begin_operation(&self, key: &ImageKey) -> ImageOperationToken {
+        let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+        let guard = state.clone().lock_owned().await;
+        ImageOperationToken {
+            state,
+            resource_generation: guard.generation,
+            slot_generation: *guard.slot_generations.get(&key.slot).unwrap_or(&0),
+            slot: key.slot,
+        }
+    }
+
+    async fn lock_current_operation(
+        &self,
+        key: &ImageKey,
+        token: &ImageOperationToken,
+    ) -> Result<OwnedMutexGuard<ResourceOperationState>, ApiError> {
+        if token.slot != key.slot
+            || !Arc::ptr_eq(
+                &token.state,
+                &self.operation_lock_for_resource(&key.namespace, &key.resource_id),
+            )
+        {
+            return Err(ApiError::Internal(
+                "Image operation token does not match the requested slot".to_string(),
+            ));
+        }
+
+        let guard = token.state.clone().lock_owned().await;
+        if guard.generation != token.resource_generation
+            || *guard.slot_generations.get(&key.slot).unwrap_or(&0) != token.slot_generation
+        {
+            return Err(ApiError::Conflict(
+                "The image operation was superseded by a delete".to_string(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    /// Fast create-only preflight. The final conditional write remains the
+    /// authority because another request can create the slot after this check.
+    pub async fn ensure_absent(&self, key: &ImageKey) -> Result<(), ApiError> {
+        match self.operator.stat(&image_object_key(key)).await {
+            Ok(_) => Err(ApiError::Conflict(
+                "An image already exists in this slot".to_string(),
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
     /// Creates a processed WebP image only if the slot does not exist.
+    #[cfg(test)]
     pub async fn create(
         &self,
         key: &ImageKey,
         bytes: Bytes,
         max_slots: u8,
     ) -> Result<(), ApiError> {
+        let token = self.begin_operation(key).await;
+        self.create_with_token(key, bytes, max_slots, &token).await
+    }
+
+    pub async fn create_with_token(
+        &self,
+        key: &ImageKey,
+        bytes: Bytes,
+        max_slots: u8,
+        token: &ImageOperationToken,
+    ) -> Result<(), ApiError> {
         if key.slot > max_slots {
             return Err(slot_limit_error(key.slot, max_slots));
         }
 
+        let _operation_guard = self.lock_current_operation(key, token).await?;
         let object_key = image_object_key(key);
-        let write_lock = self.write_lock_for(&object_key);
-        let _write_guard = write_lock.lock().await;
 
         self.operator
             .write_with(&object_key, bytes)
@@ -98,15 +182,26 @@ impl ImageStore {
     /// Stores a processed WebP image, creating or replacing the slot.
     ///
     /// Returns `true` when the slot was created, and `false` when it was replaced.
+    #[cfg(test)]
     pub async fn write(
         &self,
         key: &ImageKey,
         bytes: Bytes,
         max_slots: u8,
     ) -> Result<bool, ApiError> {
+        let token = self.begin_operation(key).await;
+        self.write_with_token(key, bytes, max_slots, &token).await
+    }
+
+    pub async fn write_with_token(
+        &self,
+        key: &ImageKey,
+        bytes: Bytes,
+        max_slots: u8,
+        token: &ImageOperationToken,
+    ) -> Result<bool, ApiError> {
+        let _operation_guard = self.lock_current_operation(key, token).await?;
         let object_key = image_object_key(key);
-        let write_lock = self.write_lock_for(&object_key);
-        let _write_guard = write_lock.lock().await;
 
         if key.slot > max_slots {
             match self.operator.stat(&object_key).await {
@@ -153,9 +248,15 @@ impl ImageStore {
 
     /// Deletes an image. Missing objects are treated as successful deletion.
     pub async fn delete(&self, key: &ImageKey) -> Result<(), ApiError> {
+        let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+        let mut operation_guard = state.lock_owned().await;
+        let generation = operation_guard
+            .slot_generations
+            .entry(key.slot)
+            .or_default();
+        *generation = generation.wrapping_add(1);
+
         let object_key = image_object_key(key);
-        let write_lock = self.write_lock_for(&object_key);
-        let _write_guard = write_lock.lock().await;
 
         match self.operator.delete(&object_key).await {
             Ok(()) => Ok(()),
@@ -174,6 +275,10 @@ impl ImageStore {
         namespace: &str,
         resource_id: &str,
     ) -> Result<(), ApiError> {
+        let state = self.operation_lock_for_resource(namespace, resource_id);
+        let mut operation_guard = state.lock_owned().await;
+        operation_guard.generation = operation_guard.generation.wrapping_add(1);
+
         let prefix = format!("{namespace}/{resource_id}/");
         self.operator
             .delete_with(&prefix)
@@ -382,6 +487,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_preflight_rejects_existing_slot_without_changing_it() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        store
+            .create(&key, Bytes::from_static(b"original image"), 5)
+            .await
+            .expect("Initial create should succeed");
+
+        let error = store
+            .ensure_absent(&key)
+            .await
+            .expect_err("Preflight should reject an occupied slot");
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert_eq!(
+            store.read(&key).await.expect("Original should remain"),
+            b"original image"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_creates_allow_only_one_image_to_claim_a_slot() {
         let (_temp_dir, store) = test_store();
         let key = test_key(1);
@@ -423,6 +548,85 @@ mod tests {
         let actual = store.read(&key).await.expect("Image read should succeed");
 
         assert_eq!(actual, b"replacement image");
+    }
+
+    #[tokio::test]
+    async fn slot_delete_invalidates_upload_started_before_the_delete() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        store
+            .write(&key, Bytes::from_static(b"old image"), 5)
+            .await
+            .expect("Initial image should exist");
+        let operation = store.begin_operation(&key).await;
+
+        store.delete(&key).await.expect("Delete should succeed");
+        let error = store
+            .write_with_token(
+                &key,
+                Bytes::from_static(b"stale replacement"),
+                5,
+                &operation,
+            )
+            .await
+            .expect_err("Upload begun before delete must not resurrect the slot");
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(matches!(store.read(&key).await, Err(ApiError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn resource_delete_invalidates_uploads_started_for_any_slot() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(2);
+        let operation = store.begin_operation(&key).await;
+
+        store
+            .delete_resource("products", "845")
+            .await
+            .expect("Resource delete should succeed");
+        let error = store
+            .write_with_token(&key, Bytes::from_static(b"stale image"), 5, &operation)
+            .await
+            .expect_err("Upload begun before resource delete must be invalidated");
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(
+            store
+                .list_resource("products", "845")
+                .await
+                .expect("List should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_one_slot_does_not_invalidate_sibling_slot_upload() {
+        let (_temp_dir, store) = test_store();
+        let sibling_key = test_key(2);
+        let operation = store.begin_operation(&sibling_key).await;
+
+        store
+            .delete(&test_key(1))
+            .await
+            .expect("Deleting a sibling slot should succeed");
+        store
+            .write_with_token(
+                &sibling_key,
+                Bytes::from_static(b"sibling image"),
+                5,
+                &operation,
+            )
+            .await
+            .expect("An unrelated slot operation should remain valid");
+
+        assert_eq!(
+            store
+                .read(&sibling_key)
+                .await
+                .expect("Sibling should exist"),
+            b"sibling image"
+        );
     }
 
     #[tokio::test]
