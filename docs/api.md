@@ -10,6 +10,8 @@ The service exposes the following endpoints:
 
 ```text
 GET  /health
+GET  /health/live
+GET  /health/ready
 
 GET  /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}/{slot}/info
@@ -230,15 +232,13 @@ The expiration is configured with `IMAGE_PRESIGN_TTL_SECONDS` (default `3600`, m
 
 ```text
 GET /health
+GET /health/live
+GET /health/ready
 ```
 
-Expected successful status:
+`/health` remains a backwards-compatible alias for `/health/live`. Both return `204 No Content` (the process is running) without checking storage, so an orchestrator can restart the process only when it is unresponsive.
 
-```text
-204 No Content
-```
-
-The health endpoint is intentionally lightweight and only indicates that the HTTP service is running.
+`/health/ready` returns `204 No Content` (the instance is ready) only while the server is accepting requests and a bounded OpenDAL storage check succeeds. It returns `503 Service Unavailable` (the instance is not ready) while shutting down, when storage is unavailable, or when the storage check exceeds its two-second timeout. The check lists at most one entry at the storage root; S3 credentials must allow the corresponding bucket-list operation. Health routes bypass application rate limits and authentication.
 
 ---
 

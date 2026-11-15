@@ -64,7 +64,7 @@ The layout follows a simple rule:
 
 ## Layer Responsibilities
 
-The current architecture is divided into five main layers.
+The current architecture is divided into five main layers with a separate process-lifecycle boundary.
 
 ### HTTP Layer
 
@@ -83,6 +83,7 @@ images/multipart.rs
 Responsibilities:
 
 - Define routes.
+- Preserve `/health` as a liveness-compatible route and provide separate liveness and storage-readiness probes.
 - Extract path parameters.
 - Read request headers.
 - Parse multipart requests.
@@ -94,6 +95,12 @@ Responsibilities:
 - Set response headers.
 
 The HTTP layer should not implement image compression or storage backend operations directly.
+
+### Process Lifecycle
+
+Files: `main.rs`, `server.rs`, and lifecycle state in `state.rs`.
+
+`main.rs` builds the Tokio runtime with a bounded shutdown wait. `server.rs` handles SIGTERM/SIGINT, marks the shared lifecycle state as not ready, and asks Axum to stop accepting connections and drain active requests until the configured deadline. Readiness checks the configured OpenDAL backend; liveness only reports whether the process is running.
 
 ### Application / Service Layer
 
@@ -337,6 +344,7 @@ These operations use the same validated `ImageKey` and OpenDAL-backed storage bo
 - `GET /api/images/{namespace}/{resource_id}` lists existing `NN.webp` slots under the resource prefix in ascending order, includes available storage metadata, and returns `max_creatable_slot`. The list includes existing slots above `IMAGE_MAX_SLOTS` so lowering the limit never hides stored images. OpenDAL normalizes LocalFS and object-storage listing behavior before it reaches the application layer.
 
 `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH` independently control bearer authentication; both default to `required`, and startup requires `IMAGE_API_KEY` for either required policy. `GETMETHOD_AUTH` has been removed. `/health` remains public. `/metrics` is optional (`IMAGE_METRICS_ENABLED=false` by default) and has its own `IMAGE_METRICS_AUTH=true` default; startup requires an API key if metrics are enabled and metrics authentication remains on.
+`/health/live` is independent of storage, while `/health/ready` performs a bounded storage probe. The legacy `/health` route aliases liveness.
 
 ---
 

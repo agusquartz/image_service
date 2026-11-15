@@ -143,7 +143,7 @@ The version currently on `main` is used in production by two companies running a
 - Optional public base URL generation.
 - Configurable Cache-Control with a 60-second default lifetime.
 - JSON error responses.
-- Lightweight health endpoint.
+- Backwards-compatible liveness endpoint plus separate liveness and storage-readiness probes.
 
 ## Quick Start
 
@@ -160,6 +160,8 @@ The service refuses to start without `IMAGE_API_KEY` under the default private r
 
 ```text
 GET  /health
+GET  /health/live
+GET  /health/ready
 
 GET  /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}/{slot}/info
@@ -288,6 +290,7 @@ IMAGE_MAX_CONCURRENCY
 IMAGE_MAX_UPLOADS_IN_FLIGHT
 IMAGE_UPLOAD_MEMORY_BUDGET_BYTES
 IMAGE_UPLOAD_READ_TIMEOUT_SECONDS
+IMAGE_SHUTDOWN_TIMEOUT_SECONDS
 IMAGE_MAX_INPUT_BYTES
 IMAGE_MAX_OUTPUT_BYTES
 IMAGE_OUTPUT_WIDTH

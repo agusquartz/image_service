@@ -19,6 +19,7 @@ pub const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 pub const UPLOAD_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_UPLOADS_IN_FLIGHT: usize = 4;
 pub const DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS: u64 = 120;
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
 /// Minimum valid image slot.
 pub const MIN_SLOT: u8 = 1;
@@ -156,6 +157,9 @@ pub struct AppConfig {
 
     pub upload_read_timeout_seconds: u64,
 
+    /// Maximum time to drain active HTTP requests after SIGINT or SIGTERM.
+    pub shutdown_timeout_seconds: u64,
+
     /// Maximum uploaded image payload size, in bytes.
     pub max_source_bytes: usize,
 
@@ -223,6 +227,7 @@ impl AppConfig {
     /// - `IMAGE_MAX_UPLOADS_IN_FLIGHT`
     /// - `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES`
     /// - `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS`
+    /// - `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`
     /// - `IMAGE_MAX_INPUT_BYTES`
     /// - `IMAGE_MAX_OUTPUT_BYTES`
     /// - `IMAGE_OUTPUT_WIDTH`
@@ -354,6 +359,12 @@ impl AppConfig {
             1,
             86_400,
         )?;
+        let shutdown_timeout_seconds = parse_bounded_u64(
+            "IMAGE_SHUTDOWN_TIMEOUT_SECONDS",
+            DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+            1,
+            3600,
+        )?;
         let max_slots = parse_bounded_u32(
             "IMAGE_MAX_SLOTS",
             u32::from(DEFAULT_MAX_SLOTS),
@@ -482,6 +493,7 @@ impl AppConfig {
             max_uploads_in_flight,
             upload_memory_budget_bytes,
             upload_read_timeout_seconds,
+            shutdown_timeout_seconds,
             max_source_bytes,
             max_output_bytes,
             output_width,
@@ -700,6 +712,10 @@ fn parse_bounded_u64(name: &str, default: u64, min: u64, max: u64) -> io::Result
             )
         })?
         .unwrap_or(default);
+    validate_bounded_u64(name, value, min, max)
+}
+
+fn validate_bounded_u64(name: &str, value: u64, min: u64, max: u64) -> io::Result<u64> {
     if !(min..=max).contains(&value) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -770,6 +786,17 @@ mod tests {
         assert_eq!(DEFAULT_READ_RATE_LIMIT_REQUESTS, 600);
         assert_eq!(DEFAULT_WRITE_RATE_LIMIT_REQUESTS, 60);
         assert_eq!(DEFAULT_RATE_LIMIT_WINDOW_SECONDS, 60);
+    }
+
+    #[test]
+    fn shutdown_timeout_defaults_to_25_seconds_and_is_bounded() {
+        assert_eq!(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, 25);
+        assert_eq!(
+            validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 25, 1, 3600).unwrap(),
+            25
+        );
+        assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 0, 1, 3600).is_err());
+        assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 3601, 1, 3600).is_err());
     }
 
     #[test]
