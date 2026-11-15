@@ -52,14 +52,14 @@ Delete endpoint                yes
 Database                       no
 Processing profiles            yes (optional namespace-specific WebP settings)
 Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
-Linux Docker images             yes (amd64, arm64, architecture-specific and multi-architecture GHCR tags)
-Linux release binaries          yes (amd64 and arm64 with SHA-256 checksums on releases)
+Linux Docker distribution       implemented and PR builds verified for amd64/arm64; versioned GHCR publication awaits the next release
+Linux release binaries          automated amd64/arm64 builds and checksums configured; published v0.1.0 baseline contains amd64 only
 Version-triggered releases      yes (version bump on main; Docker publication dispatched after release creation)
 ```
 
 S3-compatible storage can be configured for providers such as MinIO and Cloudflare R2 using provider-specific endpoint and credential settings.
 
-The `build/docker-image-distribution` branch has passed local ARM64 and emulated AMD64 container smoke tests against LocalFS and MinIO. GitHub's two-platform pull-request build remains the final CI check before this phase is marked complete. `Cargo.toml` stays at `0.1.0` on this branch because that version records the production baseline; the next promoted release should update the package version deliberately.
+The Docker phase has passed local ARM64 and emulated AMD64 container smoke tests against LocalFS and MinIO. PR #7 was merged into `develop` as `7be9d7d`; GitHub Actions successfully built and verified standalone binaries and containers for Linux `amd64` and `arm64`, and the Rust CI workflow passed. Publication jobs were correctly skipped for the pull request. The remaining verification is to bump the package version deliberately for the next release and confirm that the release workflow publishes the binaries, checksums, and multi-architecture GHCR image. `Cargo.toml` remains at `0.1.0` because that version records the production baseline.
 
 Storage is implemented through OpenDAL.
 
@@ -399,7 +399,7 @@ Future metrics should avoid namespace/resource labels by default, to prevent hig
 
 ### Distributed Rate Limiting and Quotas
 
-The current per-process rate limiter does not share counters across replicas and uses the socket peer address. Future deployments may need distributed limits and additional quotas for:
+The current per-process rate limiter does not share counters across replicas and uses the socket peer address. It does not resolve end-user IPs behind proxies, and clients sharing a CGNAT/proxy/CDN address share one budget. Future work may add an explicit trusted-proxy allowlist and safe client-IP extraction (never trusting arbitrary forwarded headers), distributed limits, and additional quotas for:
 
 - Uploads per namespace.
 - Storage used per namespace.

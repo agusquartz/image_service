@@ -235,7 +235,9 @@ Use `IMAGE_READ_AUTH=none` for public GET, HEAD, resource listing, image informa
 
 ## Rate limits and observability
 
-Read and write requests use independent fixed-window limits per client socket IP. Defaults are 600 reads and 60 writes per 60 seconds. A limit of `0` disables that request class. Excess requests return `429 Too Many Requests` and `Retry-After`. Limits are local to one process; replicas do not share counters. Client-supplied forwarded-IP headers are not trusted.
+Read and write requests use independent fixed-window limits per socket peer IP. Defaults are 600 reads and 60 writes per 60 seconds. A limit of `0` disables that request class. Excess requests return `429 Too Many Requests` and `Retry-After`. Limits are local to one process; replicas do not share counters. The bearer key does not define the rate-limit identity: requests from the same source IP share each budget whether they include a key or not. Health routes bypass rate limiting.
+
+This is a source-network limit, not a per-person or per-ERP-user quota. Users behind carrier-grade NAT (CGNAT), an office gateway, a reverse proxy, or a CDN can appear as one IP and collectively consume the same budget. This can cause legitimate clients to receive `429` during traffic peaks. When deploying behind an intermediary, the service still sees the intermediary's socket IP; it does not trust `X-Forwarded-For` or `Forwarded`. Do not set a low per-IP limit for shared public traffic without accounting for that aggregation. Raise the applicable limit for the expected aggregate traffic, or enforce fairness at a trusted edge. Setting a limit to `0` removes that application-level protection for that request class.
 
 Every response includes a server-generated `X-Request-ID`. Structured JSON logs use `tracing`; set `RUST_LOG` to adjust the filter (for example, `RUST_LOG=image_service=debug`). Set `IMAGE_METRICS_ENABLED=true` to expose Prometheus metrics at `/metrics`. Authentication is independently controlled by `IMAGE_METRICS_AUTH`, which defaults to `true`.
 
@@ -601,7 +603,7 @@ For a public image catalog with protected uploads, use `IMAGE_READ_AUTH=none` an
 
 ### `IMAGE_RATE_LIMIT_READ_REQUESTS`, `IMAGE_RATE_LIMIT_WRITE_REQUESTS`, and `IMAGE_RATE_LIMIT_WINDOW_SECONDS`
 
-Per-client fixed-window request budgets. Defaults are 600 reads, 60 writes, and a 60-second window. A read/write request count of `0` disables that budget. Excess requests receive `429 Too Many Requests` with a `Retry-After` header. Limits are enforced per socket peer IP in-process; they are not shared across replicas and forwarded headers are not trusted.
+Per-source-IP fixed-window request budgets. Defaults are 600 reads, 60 writes, and a 60-second window. A read/write request count of `0` disables that budget. Excess requests receive `429 Too Many Requests` with a `Retry-After` header. Limits are enforced per socket peer IP in-process; they are not shared across replicas and forwarded headers are not trusted. Shared IPs (including CGNAT users and proxy/CDN origin traffic) share the same budget. The API key does not currently provide per-client fairness. See [rate limits and observability](#rate-limits-and-observability) for deployment guidance.
 
 ### `IMAGE_METRICS_ENABLED`
 

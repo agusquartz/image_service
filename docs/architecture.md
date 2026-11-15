@@ -88,7 +88,7 @@ Responsibilities:
 - Read request headers.
 - Parse multipart requests.
 - Apply independent read/write bearer-authentication policies.
-- Enforce per-client read/write rate limits before handlers run.
+- Enforce per-source-IP read/write rate limits before handlers run; shared NAT/proxy addresses share the budget.
 - Add request IDs, structured request logs, and low-cardinality metrics.
 - Expose Prometheus metrics at `/metrics` when enabled, with independent authentication enabled by default.
 - Convert application results into HTTP responses.

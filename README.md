@@ -121,7 +121,7 @@ The version currently on `main` is used in production by two companies running a
 - Resource image listing, HEAD metadata checks, and idempotent deletion.
 - POST creates only in an unused slot; PUT creates or replaces the complete image.
 - Independent bearer-token policies for reads and writes; both are protected by default.
-- Per-client read/write rate limits with `429` responses and `Retry-After`.
+- Per-source-IP read/write rate limits with `429` responses and `Retry-After`; clients behind one NAT/proxy share the budget.
 - Structured JSON request logs, server-generated request IDs, and an optional authenticated Prometheus endpoint.
 - Source MIME validation against the detected file format.
 - JPEG, PNG, WebP, GIF, BMP, and TIFF input.
@@ -138,8 +138,8 @@ The version currently on `main` is used in production by two companies running a
 - Local filesystem persistence through OpenDAL.
 - S3 and S3-compatible object storage.
 - Runtime-selectable storage backend.
-- Versioned Linux `amd64` and `arm64` container images with architecture-specific tags and a multi-architecture tag published to GHCR from version tags.
-- Standalone Linux `amd64` and `arm64` release binaries with SHA-256 checksums.
+- Automated publication of versioned Linux `amd64` and `arm64` container images to GHCR, with architecture-specific and multi-architecture tags; the current `v0.1.0` baseline predates Docker distribution.
+- Automated standalone Linux `amd64` and `arm64` release binaries with SHA-256 checksums; the current `v0.1.0` baseline contains the `amd64` binary only.
 - Optional public base URL generation.
 - Configurable Cache-Control with a 60-second default lifetime.
 - JSON error responses.

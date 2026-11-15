@@ -478,7 +478,7 @@ Before public deployment:
 - Run CI successfully.
 - Keep the private-read/private-write default and configure a strong `IMAGE_API_KEY`.
 - Only set `IMAGE_READ_AUTH=none` or `IMAGE_WRITE_AUTH=none` when the exposure is intentional.
-- Configure read/write rate limits for expected traffic and monitor `429` responses.
+- Configure read/write rate limits for expected aggregate traffic and monitor `429` responses. CGNAT users and requests arriving through the same proxy/CDN IP share one budget; the service does not currently trust forwarded-IP headers.
 - Keep `IMAGE_METRICS_AUTH=true` unless a trusted network or proxy protects `/metrics`; when enabled, metrics authentication requires `IMAGE_API_KEY`.
 - Set `RUST_LOG` to the desired operational log level.
 - Configure stdout log retention/rotation in the runtime or platform. For Docker's `json-file` driver, set `max-size` and `max-file`; the service itself does not write or rotate log files.
