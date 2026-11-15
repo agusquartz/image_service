@@ -1,8 +1,9 @@
 use crate::{
     config::{
-        AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile,
+        AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile, UPLOAD_BUDGET_UNIT_BYTES,
         max_configured_input_bytes, resolve_processing_policy,
     },
+    error::ApiError,
     images::ImageStore,
     observability::HttpMetrics,
     rate_limit::RateLimiter,
@@ -12,7 +13,13 @@ use opendal::Operator;
 
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Keeps admission capacity reserved while the compressed source remains in memory.
+pub(crate) struct UploadAdmission {
+    _slot: OwnedSemaphorePermit,
+    _body_budget: OwnedSemaphorePermit,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,6 +27,10 @@ pub struct AppState {
     pub store: ImageStore,
 
     pub image_jobs: Arc<Semaphore>,
+
+    upload_slots: Arc<Semaphore>,
+    upload_body_budget: Arc<Semaphore>,
+    pub upload_read_timeout_seconds: u64,
 
     pub max_source_bytes: usize,
 
@@ -70,6 +81,12 @@ impl AppState {
             store: ImageStore::new(operator),
 
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
+
+            upload_slots: Arc::new(Semaphore::new(config.max_uploads_in_flight)),
+            upload_body_budget: Arc::new(Semaphore::new(
+                config.upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES,
+            )),
+            upload_read_timeout_seconds: config.upload_read_timeout_seconds,
 
             max_source_bytes: config.max_source_bytes,
 
@@ -123,5 +140,66 @@ impl AppState {
             &self.processing_profiles,
             &self.namespace_profiles,
         )
+    }
+
+    pub(crate) fn admit_upload(&self, max_input_bytes: usize) -> Result<UploadAdmission, ApiError> {
+        reserve_upload(
+            self.upload_slots.clone(),
+            self.upload_body_budget.clone(),
+            max_input_bytes,
+        )
+    }
+}
+
+fn reserve_upload(
+    upload_slots: Arc<Semaphore>,
+    upload_body_budget: Arc<Semaphore>,
+    max_input_bytes: usize,
+) -> Result<UploadAdmission, ApiError> {
+    let slot = upload_slots
+        .try_acquire_owned()
+        .map_err(|_| ApiError::ServiceUnavailable("Upload capacity exhausted".to_string()))?;
+    let units = u32::try_from(max_input_bytes.div_ceil(UPLOAD_BUDGET_UNIT_BYTES))
+        .map_err(|_| ApiError::Internal("Upload input limit exceeds budget units".into()))?;
+    let body_budget = upload_body_budget
+        .try_acquire_many_owned(units)
+        .map_err(|_| ApiError::ServiceUnavailable("Upload memory budget exhausted".into()))?;
+    Ok(UploadAdmission {
+        _slot: slot,
+        _body_budget: body_budget,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_releases_count_after_capacity_rejection() {
+        let slots = Arc::new(Semaphore::new(2));
+        let budget = Arc::new(Semaphore::new(1));
+        let first = reserve_upload(slots.clone(), budget.clone(), 1).unwrap();
+        assert!(matches!(
+            reserve_upload(slots.clone(), budget.clone(), 1),
+            Err(ApiError::ServiceUnavailable(_))
+        ));
+        assert_eq!(slots.available_permits(), 1);
+        drop(first);
+        assert!(reserve_upload(slots, budget, 1).is_ok());
+    }
+
+    #[test]
+    fn admission_reserves_effective_limit_until_dropped() {
+        let slots = Arc::new(Semaphore::new(3));
+        let budget = Arc::new(Semaphore::new(3));
+        let first =
+            reserve_upload(slots.clone(), budget.clone(), UPLOAD_BUDGET_UNIT_BYTES + 1).unwrap();
+        assert_eq!(budget.available_permits(), 1);
+        assert!(matches!(
+            reserve_upload(slots.clone(), budget.clone(), UPLOAD_BUDGET_UNIT_BYTES + 1),
+            Err(ApiError::ServiceUnavailable(_))
+        ));
+        drop(first);
+        assert!(reserve_upload(slots, budget, UPLOAD_BUDGET_UNIT_BYTES + 1).is_ok());
     }
 }

@@ -483,6 +483,37 @@ PY
         expect_status 201 "$tmp_dir/default-profile-upload" \
             --request POST --form "image=@$tmp_dir/tiny.png" -H "Authorization: Bearer $api_key" "$fallback_route"
         expect_status 200 "$tmp_dir/default-profile-info" -H "Authorization: Bearer $api_key" "$fallback_route/info"
+        python3 - "$base_url" "$api_key" "$tmp_dir/tiny.png" <<'PY'
+import http.client
+import sys
+from urllib.parse import urlsplit
+
+base, api_key, image_path = sys.argv[1:]
+url = urlsplit(base)
+boundary = "image-service-no-hints-boundary"
+with open(image_path, "rb") as image_file:
+    image = image_file.read()
+body = (
+    f"--{boundary}\r\n"
+    'Content-Disposition: form-data; name="image"; filename="tiny.bin"\r\n'
+    "\r\n"
+).encode() + image + f"\r\n--{boundary}--\r\n".encode()
+connection = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+connection.putrequest("POST", "/api/images/misc/no-hints/2")
+connection.putheader("Authorization", f"Bearer {api_key}")
+connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+connection.putheader("Transfer-Encoding", "chunked")
+connection.endheaders()
+for offset in range(0, len(body), 37):
+    chunk = body[offset:offset + 37]
+    connection.send(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+connection.send(b"0\r\n\r\n")
+response = connection.getresponse()
+payload = response.read()
+assert response.status == 201, (response.status, payload)
+connection.close()
+PY
+        echo "PASS: upload without Content-Length or part Content-Type is detected from streamed bytes"
         python3 - "$tmp_dir/default-profile-info" <<'PY'
 import json
 import sys

@@ -34,6 +34,10 @@ pub enum ApiError {
 
     PayloadTooLarge(String),
 
+    RequestTimeout(String),
+
+    ServiceUnavailable(String),
+
     UnprocessableEntity(String),
 
     /// Filesystem/storage failure.
@@ -78,6 +82,21 @@ impl IntoResponse for ApiError {
             Self::NotImplemented(message) => (StatusCode::NOT_IMPLEMENTED, message),
 
             Self::PayloadTooLarge(message) => (StatusCode::PAYLOAD_TOO_LARGE, message),
+
+            Self::RequestTimeout(message) => (StatusCode::REQUEST_TIMEOUT, message),
+
+            Self::ServiceUnavailable(message) => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse { error: message }),
+                )
+                    .into_response();
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+                return response;
+            }
 
             Self::UnprocessableEntity(message) => (StatusCode::UNPROCESSABLE_ENTITY, message),
 

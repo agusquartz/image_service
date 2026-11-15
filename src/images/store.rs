@@ -1,5 +1,6 @@
 use crate::{config::MAX_SLOT_NUMBER, error::ApiError};
 
+use axum::body::Bytes;
 use opendal::{EntryMode, ErrorKind, Operator, raw::PresignedRequest};
 use std::{
     collections::HashMap,
@@ -68,7 +69,7 @@ impl ImageStore {
     pub async fn create(
         &self,
         key: &ImageKey,
-        bytes: &[u8],
+        bytes: Bytes,
         max_slots: u8,
     ) -> Result<(), ApiError> {
         if key.slot > max_slots {
@@ -80,7 +81,7 @@ impl ImageStore {
         let _write_guard = write_lock.lock().await;
 
         self.operator
-            .write_with(&object_key, bytes.to_vec())
+            .write_with(&object_key, bytes)
             .if_not_exists(true)
             .await
             .map_err(|error| {
@@ -100,7 +101,7 @@ impl ImageStore {
     pub async fn write(
         &self,
         key: &ImageKey,
-        bytes: &[u8],
+        bytes: Bytes,
         max_slots: u8,
     ) -> Result<bool, ApiError> {
         let object_key = image_object_key(key);
@@ -119,14 +120,14 @@ impl ImageStore {
 
         match self
             .operator
-            .write_with(&object_key, bytes.to_vec())
+            .write_with(&object_key, bytes.clone())
             .if_not_exists(true)
             .await
         {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {
                 self.operator
-                    .write(&object_key, bytes.to_vec())
+                    .write(&object_key, bytes)
                     .await
                     .map_err(|error| ApiError::Storage(error.to_string()))?;
                 Ok(false)
@@ -352,7 +353,7 @@ mod tests {
         let expected = b"processed webp bytes";
 
         store
-            .write(&key, expected, 5)
+            .write(&key, Bytes::from_static(expected), 5)
             .await
             .expect("Image write should succeed");
 
@@ -366,12 +367,12 @@ mod tests {
         let (_temp_dir, store) = test_store();
         let key = test_key(1);
         store
-            .create(&key, b"original image", 5)
+            .create(&key, Bytes::from_static(b"original image"), 5)
             .await
             .expect("First create should succeed");
 
         let error = store
-            .create(&key, b"second image", 5)
+            .create(&key, Bytes::from_static(b"second image"), 5)
             .await
             .expect_err("Second create must not overwrite the image");
         assert!(matches!(error, ApiError::Conflict(_)));
@@ -385,8 +386,8 @@ mod tests {
         let (_temp_dir, store) = test_store();
         let key = test_key(1);
         let (first, second) = tokio::join!(
-            store.create(&key, b"first image", 5),
-            store.create(&key, b"second image", 5),
+            store.create(&key, Bytes::from_static(b"first image"), 5),
+            store.create(&key, Bytes::from_static(b"second image"), 5),
         );
 
         let results = [first, second];
@@ -410,12 +411,12 @@ mod tests {
         let key = test_key(1);
 
         store
-            .write(&key, b"first image", 5)
+            .write(&key, Bytes::from_static(b"first image"), 5)
             .await
             .expect("Initial image write should succeed");
 
         store
-            .write(&key, b"replacement image", 5)
+            .write(&key, Bytes::from_static(b"replacement image"), 5)
             .await
             .expect("Replacement image write should succeed");
 
@@ -456,7 +457,7 @@ mod tests {
         let expected = b"processed webp bytes";
 
         store
-            .write(&key, expected, 5)
+            .write(&key, Bytes::from_static(expected), 5)
             .await
             .expect("Image write should succeed");
 
@@ -479,7 +480,7 @@ mod tests {
         let (_temp_dir, store) = test_store();
         let key = test_key(1);
         store
-            .write(&key, b"webp bytes", 5)
+            .write(&key, Bytes::from_static(b"webp bytes"), 5)
             .await
             .expect("Image write should succeed");
 
@@ -494,7 +495,7 @@ mod tests {
         let (_temp_dir, store) = test_store();
         for slot in [5, 2, 1] {
             store
-                .write(&test_key(slot), b"webp bytes", 5)
+                .write(&test_key(slot), Bytes::from_static(b"webp bytes"), 5)
                 .await
                 .expect("Image write should succeed");
         }
@@ -533,7 +534,7 @@ mod tests {
             let key = ImageKey::new("products".to_string(), resource_id.to_string(), slot)
                 .expect("test image key should be valid");
             store
-                .write(&key, b"webp bytes", 5)
+                .write(&key, Bytes::from_static(b"webp bytes"), 5)
                 .await
                 .expect("Image write should succeed");
         }
