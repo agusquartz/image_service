@@ -82,6 +82,7 @@ Check the service:
 
 ```bash
 curl -i http://127.0.0.1:3000/health
+curl -i http://127.0.0.1:3000/health/ready
 ```
 
 Expected status:
@@ -407,6 +408,8 @@ Use:
 
 ```text
 GET /health
+GET /health/live
+GET /health/ready
 ```
 
 A healthy HTTP process returns:
@@ -415,7 +418,25 @@ A healthy HTTP process returns:
 204 No Content
 ```
 
-The current health endpoint verifies that the HTTP application is running. It should not be treated as a comprehensive external-storage health check.
+`/health` remains an alias for `/health/live`; both return `204 No Content` (the process is running) and do not check storage. Configure the orchestrator liveness probe against either route.
+
+`/health/ready` returns `204 No Content` (the instance is ready) when the service is accepting requests and OpenDAL can list at most one item at the storage root. It returns `503 Service Unavailable` (the instance is not ready) during shutdown, if storage is unavailable, or if the probe takes more than two seconds. The probe requires bucket-list permission for S3-compatible storage. Configure load balancers and orchestrators to use this route for readiness.
+
+Health routes bypass API authentication and application rate limits.
+
+## Graceful Shutdown
+
+The process handles SIGTERM and SIGINT. It marks readiness false, stops accepting new connections, and drains active HTTP requests for up to `IMAGE_SHUTDOWN_TIMEOUT_SECONDS` (25 seconds by default). If the deadline expires, the server abandons active connections and exits; image work already running in Tokio's `spawn_blocking` pool cannot be cancelled safely and may be interrupted when the process exits.
+
+The container runtime's stop grace period must exceed the service drain timeout so the service can finish its shutdown path. With the default timeout, configure at least 35 seconds, for example:
+
+```yaml
+services:
+  image-service:
+    stop_grace_period: 35s
+```
+
+For `docker run`, use `--stop-timeout 35` or a larger value. A force stop or host failure can still interrupt active work; uploads are published only after processing finishes, but an interrupted request may need to be retried.
 
 ---
 

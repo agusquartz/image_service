@@ -58,7 +58,7 @@ The secure defaults are `required` for both. Set `IMAGE_READ_AUTH=none` for publ
 
 `GETMETHOD_AUTH` has been removed. If it remains in the environment, startup fails with guidance to use `IMAGE_READ_AUTH` and `IMAGE_WRITE_AUTH`. This is a deliberate configuration migration: deployments that previously relied on public reads or unprotected writes must choose those policies explicitly.
 
-`/health` remains public for container and orchestrator health checks. `/metrics` is disabled by default. When enabled, it requires the API key by default through `IMAGE_METRICS_AUTH=true`, independently of read/write policies. Setting `IMAGE_METRICS_AUTH=false` makes metrics public and should only be used when network or proxy controls restrict access.
+`/health`, `/health/live`, and `/health/ready` remain public so container and orchestrator probes can use them. `/health/ready` discloses only whether the configured storage check succeeds. `/metrics` is disabled by default. When enabled, it requires the API key by default through `IMAGE_METRICS_AUTH=true`, independently of read/write policies. Setting `IMAGE_METRICS_AUTH=false` makes metrics public and should only be used when network or proxy controls restrict access.
 
 ## Customer Isolation
 

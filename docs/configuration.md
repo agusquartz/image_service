@@ -209,6 +209,7 @@ IMAGE_MAX_CONCURRENCY=2
 IMAGE_MAX_UPLOADS_IN_FLIGHT=4
 # IMAGE_UPLOAD_MEMORY_BUDGET_BYTES=62914560
 IMAGE_UPLOAD_READ_TIMEOUT_SECONDS=120
+IMAGE_SHUTDOWN_TIMEOUT_SECONDS=25
 IMAGE_MAX_INPUT_BYTES=15728640
 IMAGE_MAX_OUTPUT_BYTES=102400
 IMAGE_OUTPUT_WIDTH=1024
@@ -544,6 +545,8 @@ Invalid, empty, or zero values fall back to the default.
 `IMAGE_MAX_UPLOADS_IN_FLIGHT` limits the number of uploads that can read or retain a source body concurrently. Default: `4` (valid range `1..=1024`). `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES` limits the compressed source bodies reserved across those uploads. Its default is four times the largest effective input limit across the global policy and assigned namespace profiles, with each input rounded up to 1 MiB; with the default 15 MiB input limit, it is 60 MiB. It must cover the largest configured input. Reservations are rounded up to 1 MiB per upload and the available budget is rounded down, so a very small explicitly configured budget may reject startup. Both limits are checked before the server reads the multipart body. The selected namespace/profile's maximum is then enforced incrementally against the actual chunks, regardless of `Content-Length`. When admission capacity is exhausted, the upload receives `503 Service Unavailable` (service temporarily unavailable) with `Retry-After: 1` and may be retried.
 
 `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` limits the entire multipart read. Default: `120`; valid range `1..=86400`. A timeout returns `408 Request Timeout` (request timed out). Upload admission remains reserved while the source is being processed, even if the client disconnects after CPU work starts; the existing `IMAGE_MAX_CONCURRENCY` continues to limit the encoder separately. The body budget covers compressed source bytes, not decoder buffers, WebP output, HTTP/proxy buffers or allocator overhead. Set container memory limits with those additional costs in mind.
+
+`IMAGE_SHUTDOWN_TIMEOUT_SECONDS` sets the maximum HTTP drain period after SIGINT or SIGTERM. Default: `25`; valid range `1..=3600`. The service stops accepting new connections and waits for active requests until they finish or the deadline expires. Set the container/orchestrator stop grace period longer than this timeout; for example, use `stop_grace_period: 35s` with the default. Tokio blocking image tasks cannot be forcibly cancelled once running; after the HTTP deadline, the process exits and the operating system terminates any remaining work.
 
 ### `IMAGE_MAX_INPUT_BYTES`
 
