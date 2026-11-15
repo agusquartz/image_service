@@ -174,6 +174,7 @@ Responsibilities:
 - Write image bytes through OpenDAL.
 - Delete image objects through OpenDAL.
 - Read object metadata with `stat` and list slots under a resource prefix.
+- Coordinate uploads and deletes per resource in-process. Uploads capture resource/slot generations before consuming the body; a later slot or resource delete invalidates older uploads before they can publish.
 - Generate presigned read requests only when the backend advertises that capability.
 - Translate storage backend errors into application errors.
 
@@ -184,6 +185,8 @@ products/845/01.webp
 ```
 
 No compression logic belongs in this layer.
+
+The operation coordinator is an in-memory consistency mechanism for one service process. It serializes publication/deletion for the same resource and keeps unrelated resources independent. It does not persist pending work or coordinate multiple replicas; durable recovery belongs to the future job catalog and staging design.
 
 ### Configuration and Shared State
 
