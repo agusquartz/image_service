@@ -309,6 +309,8 @@ Possible implementations include:
 
 Image GET and HEAD support ETag, Last-Modified when available, and conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`. Cache responses default to 60 seconds, public when `IMAGE_READ_AUTH=none` and private when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
 
+GET confirms storage-provided validators before reading the full image body, so a matching conditional request can return `304 Not Modified` after a conditional one-byte range read on S3-compatible storage or a locked metadata check on LocalFS. Full responses use a consistent metadata/body snapshot: LocalFS reads coordinate with in-process writes, and S3-compatible backends use conditional `If-Match` reads when supported. If storage has no ETag, the SHA-256 fallback still requires reading the body before it can be compared.
+
 Example:
 
 ```dotenv

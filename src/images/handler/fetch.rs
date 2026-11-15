@@ -36,20 +36,45 @@ pub(crate) async fn fetch_image(
 
     let key = ImageKey::new(namespace, resource_id, slot)?;
 
+    // A matching storage validator can answer conditional requests before
+    // reading the image body, after the store confirms the same version.
+    // Without a reliable validator, fetch computes a content ETag instead.
+    if headers.contains_key(header::IF_NONE_MATCH)
+        || headers.contains_key(header::IF_MODIFIED_SINCE)
+    {
+        let metadata = service::stat(&state, &key).await?;
+        let etag = metadata.etag.clone().map(service::normalize_etag);
+        if is_not_modified(&headers, etag.as_deref(), metadata.last_modified)
+            && service::is_current_snapshot(&state, &key, &metadata).await?
+        {
+            return image_response(&state, None, etag.as_deref(), metadata.last_modified);
+        }
+    }
+
     let image = service::fetch(&state, &key).await?;
     let not_modified = is_not_modified(&headers, Some(&image.etag), image.last_modified);
 
-    let mut response = Response::new(if not_modified {
-        Body::empty()
-    } else {
-        Body::from(image.bytes)
-    });
+    image_response(
+        &state,
+        (!not_modified).then_some(image.bytes),
+        Some(&image.etag),
+        image.last_modified,
+    )
+}
 
-    *response.status_mut() = if not_modified {
-        StatusCode::NOT_MODIFIED
-    } else {
+fn image_response(
+    state: &AppState,
+    body: Option<Vec<u8>>,
+    etag: Option<&str>,
+    last_modified: Option<SystemTime>,
+) -> Result<Response, ApiError> {
+    let status = if body.is_some() {
         StatusCode::OK
+    } else {
+        StatusCode::NOT_MODIFIED
     };
+    let mut response = Response::new(body.map_or_else(Body::empty, Body::from));
+    *response.status_mut() = status;
 
     response
         .headers_mut()
@@ -61,12 +86,7 @@ pub(crate) async fn fetch_image(
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
-    set_cache_headers(
-        &state,
-        response.headers_mut(),
-        Some(&image.etag),
-        image.last_modified,
-    )?;
+    set_cache_headers(state, response.headers_mut(), etag, last_modified)?;
 
     Ok(response)
 }

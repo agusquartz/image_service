@@ -114,6 +114,68 @@ status="$(curl --silent --dump-header "$tmp_dir/head.headers" --output /dev/null
 [[ "$status" == 200 ]] || fail "MinIO-backed HEAD returned HTTP $status"
 grep -qi '^Content-Length: [1-9][0-9]*' "$tmp_dir/head.headers" || fail "MinIO-backed HEAD omitted Content-Length"
 
+# Race service GET snapshots against writes made directly through S3, which
+# bypasses the process-local resource lock and exercises OpenDAL If-Match.
+snapshot_route="$service_url/api/images/minio-smoke/snapshot-read/1"
+snapshot_object="$minio_url/$bucket/minio-smoke/snapshot-read/01.webp"
+printf 'snapshot-version-a' >"$tmp_dir/snapshot-a.bin"
+printf 'snapshot-version-b-is-longer' >"$tmp_dir/snapshot-b.bin"
+put_snapshot_version() {
+    curl --fail --silent --show-error \
+        --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user "$access_key:$secret_key" \
+        --upload-file "$1" "$snapshot_object" >/dev/null
+}
+put_snapshot_version "$tmp_dir/snapshot-a.bin"
+(
+    for attempt in $(seq 1 40); do
+        if (( attempt % 2 == 0 )); then
+            put_snapshot_version "$tmp_dir/snapshot-b.bin"
+        else
+            put_snapshot_version "$tmp_dir/snapshot-a.bin"
+        fi
+    done
+) &
+writer_pid=$!
+for attempt in $(seq 1 40); do
+    status="$(curl --silent --dump-header "$tmp_dir/snapshot-$attempt.headers" \
+        --output "$tmp_dir/snapshot-$attempt.body" --write-out '%{http_code}' "$snapshot_route")"
+    [[ "$status" == 200 ]] || fail "concurrent MinIO snapshot GET returned HTTP $status"
+done
+wait "$writer_pid"
+python3 - "$tmp_dir" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+allowed = {
+    (root / "snapshot-a.bin").read_bytes(),
+    (root / "snapshot-b.bin").read_bytes(),
+}
+for body_path in root.glob("snapshot-[0-9]*.body"):
+    body = body_path.read_bytes()
+    assert body in allowed, (body_path, body)
+    header_path = body_path.with_suffix(".headers")
+    headers = header_path.read_text(encoding="latin-1").splitlines()
+    etag = next(line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("etag:"))
+    assert etag.strip('"') == hashlib.md5(body).hexdigest(), (body_path, etag)
+PY
+
+# Once a replacement has completed, a validator from the old object must not
+# cause a false 304 for the new representation.
+status="$(curl --silent --dump-header "$tmp_dir/snapshot-old.headers" \
+    --output "$tmp_dir/snapshot-old.body" --write-out '%{http_code}' "$snapshot_route")"
+[[ "$status" == 200 ]] || fail "MinIO snapshot baseline GET returned HTTP $status"
+old_etag="$(awk 'tolower($1) == "etag:" {sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); print; exit}' "$tmp_dir/snapshot-old.headers")"
+put_snapshot_version "$tmp_dir/snapshot-a.bin"
+status="$(curl --silent --dump-header "$tmp_dir/snapshot-after-put.headers" \
+    --output "$tmp_dir/snapshot-after-put.body" --write-out '%{http_code}' \
+    --header "If-None-Match: $old_etag" "$snapshot_route")"
+[[ "$status" == 200 ]] || fail "MinIO GET with a stale ETag returned HTTP $status instead of 200"
+cmp -s "$tmp_dir/snapshot-a.bin" "$tmp_dir/snapshot-after-put.body" \
+    || fail "MinIO GET with a stale ETag returned bytes from the old version"
+
 status="$(curl --silent --output "$tmp_dir/info.json" --write-out '%{http_code}' "$image_route/info")"
 [[ "$status" == 200 ]] || fail "MinIO-backed info returned HTTP $status"
 python3 - "$tmp_dir/info.json" <<'PY'
@@ -311,5 +373,5 @@ sleep 0.2
 status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$cancel_route")"
 [[ "$status" == 404 ]] || fail "cancelled MinIO upload stored an incomplete object (HTTP $status)"
 
-echo "PASS: MinIO S3-compatible upload preflight, replacement, GET/HEAD, conditional GET, metadata, listing, profiles, presigned GET, DELETE races, cancellation, and resource DELETE"
+echo "PASS: MinIO uploads, replacement, snapshot-consistent GETs during external writes, stale conditional validators, HEAD, metadata, listing, profiles, presigned GET, DELETE races, cancellation, and resource DELETE"
 echo "Both containers used ephemeral storage; all test data was removed during cleanup."

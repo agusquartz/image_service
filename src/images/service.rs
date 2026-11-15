@@ -86,8 +86,7 @@ pub(crate) async fn upload(
 ///
 /// Validation has already occurred when constructing [`ImageKey`].
 pub(crate) async fn fetch(state: &AppState, key: &ImageKey) -> Result<ImageDelivery, ApiError> {
-    let metadata = state.store.stat(key).await?;
-    let bytes = state.store.read(key).await?;
+    let (metadata, bytes) = state.store.read_snapshot(key).await?;
     let etag = metadata
         .etag
         .map(normalize_etag)
@@ -116,10 +115,17 @@ pub(crate) async fn stat(state: &AppState, key: &ImageKey) -> Result<StoredMetad
     state.store.stat(key).await
 }
 
+pub(crate) async fn is_current_snapshot(
+    state: &AppState,
+    key: &ImageKey,
+    metadata: &StoredMetadata,
+) -> Result<bool, ApiError> {
+    state.store.is_current_snapshot(key, metadata).await
+}
+
 pub(crate) async fn info(state: &AppState, key: &ImageKey) -> Result<ImageInfoResponse, ApiError> {
     let policy = state.processing_policy_for(&key.namespace);
-    let metadata = state.store.stat(key).await?;
-    let bytes = state.store.read(key).await?;
+    let (metadata, bytes) = state.store.read_snapshot(key).await?;
     let dimensions = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::WebP)
         .into_dimensions()
         .map_err(|error| {
