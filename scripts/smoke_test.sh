@@ -225,6 +225,8 @@ PY
     fi
 
     expect_status 204 "$tmp_dir/health" "$base_url/health"
+    expect_status 204 "$tmp_dir/health-live" "$base_url/health/live"
+    expect_status 204 "$tmp_dir/health-ready" "$base_url/health/ready"
     if [[ "$metrics_auth_required" == "true" ]]; then
         expect_status 401 "$tmp_dir/unauthorized-metrics" "$base_url/metrics"
         expect_status 200 "$tmp_dir/metrics" -H "Authorization: Bearer $api_key" "$base_url/metrics"
@@ -725,5 +727,23 @@ grep -q '^image_service_http_requests_total' "$tmp_dir/public-metrics-no-token" 
     || fail "public metrics endpoint omitted HTTP request counters"
 stop_service
 echo "PASS: IMAGE_METRICS_AUTH=false permits metrics scraping without an API key"
+
+start_service default
+shutdown_route="$base_url/api/images/products/shutdown-drain/1"
+curl --silent --show-error --output "$tmp_dir/shutdown-upload.json" --write-out '%{http_code}' \
+    --limit-rate 128k --form "image=@$image_file" \
+    -H "Authorization: Bearer $api_key" "$shutdown_route" \
+    >"$tmp_dir/shutdown-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "shutdown-test upload finished before SIGTERM"
+docker stop --time 35 "$container_id" >/dev/null || fail "Docker did not stop the service within its 35-second grace period"
+container_id=""
+if ! wait "$upload_pid"; then
+    fail "in-flight request failed while Docker stopped the service gracefully"
+fi
+status="$(cat "$tmp_dir/shutdown-upload.status")"
+[[ "$status" == 201 ]] || fail "in-flight request returned HTTP $status during graceful Docker stop"
+echo "PASS: Docker SIGTERM drained an active upload within the configured stop grace period"
 
 echo "All Image Service smoke tests passed. Containers used volatile tmpfs storage only."

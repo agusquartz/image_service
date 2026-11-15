@@ -86,6 +86,8 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 curl --fail --silent "$service_url/health" >/dev/null || fail "Image Service did not become healthy"
+curl --fail --silent "$service_url/health/live" >/dev/null || fail "Image Service liveness probe failed"
+curl --fail --silent "$service_url/health/ready" >/dev/null || fail "MinIO storage readiness probe failed"
 
 image_route="$service_url/api/images/minio-smoke/1/1"
 printf 'not an image' >"$tmp_dir/not-image.bin"
