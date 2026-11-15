@@ -52,6 +52,8 @@ Delete endpoint                yes
 Database                       no
 Processing profiles            yes (optional namespace-specific WebP settings)
 Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
+Cargo workspace                yes (Core, processor contract, image processor, and versioned worker protocol crates; default image build remains compatible)
+Selective feature builds       yes (image API by default; Core-only and Core-plus-protocol compile variants; worker dispatch is not implemented)
 Linux Docker distribution       implemented and PR builds verified for amd64/arm64; versioned GHCR publication awaits the next release
 Linux release binaries          automated amd64/arm64 builds and checksums configured; published v0.1.0 baseline contains amd64 only
 Version-triggered releases      yes (version bump on main; Docker publication dispatched after release creation)
@@ -412,6 +414,12 @@ The current per-process rate limiter does not share counters across replicas and
 
 The current API processes images synchronously before returning success.
 
+The workspace now has a `Processor` contract and versioned worker/job/`StorageRef`
+protocol DTOs. The `ipc` feature can compile those protocol types without the
+local image processor. It does not yet persist jobs, open a worker connection,
+dispatch work, or recover after a restart; those require the future durable job
+catalog and worker-dispatch implementation.
+
 A future optional mode could support queued processing:
 
 ```text
@@ -674,54 +682,33 @@ while making deployment-specific behavior configurable.
 
 ---
 
-## Possible Future Project Structure
+## Possible Future Workspace Expansion
 
-As the service grows, a reasonable direction could be:
+The first workspace boundary is in place. New processor families and the
+runtime worker transport can be added as separate members when implemented:
 
 ```text
-src/
-├── main.rs
-├── config/
-│   ├── mod.rs
-│   ├── server.rs
-│   ├── storage.rs
-│   └── processing.rs
-│
-├── http/
-│   ├── router.rs
-│   ├── auth.rs
-│   └── error.rs
-│
-└── images/
-    ├── model.rs
-    ├── service.rs
-    ├── validation.rs
-    │
-    ├── handler/
-    │   ├── upload.rs
-    │   ├── fetch.rs
-    │   └── delete.rs
-    │
-    ├── processing/
-    │   ├── mod.rs
-    │   ├── decode.rs
-    │   ├── webp.rs
-    │   └── resize.rs
-    │
-    └── store.rs
+crates/
+├── image-core/                 # implemented
+├── processor-contract/         # implemented
+├── image-processor-image/      # implemented
+├── image-worker-protocol/      # DTOs implemented; transport pending
+├── image-processor-video/      # future, when required
+├── image-processor-document/   # future, when required
+└── image-worker-runtime/       # future IPC registration and dispatch
 ```
 
-If storage construction becomes sufficiently complex, a dedicated infrastructure module could be introduced:
+If storage construction becomes sufficiently complex, a dedicated infrastructure crate or module could be introduced:
 
 ```text
-src/
+crates/image-core/src/
 ├── storage.rs
 ```
 
 or:
 
 ```text
-src/
+crates/image-core/src/
 ├── storage/
 │   └── mod.rs
 ```

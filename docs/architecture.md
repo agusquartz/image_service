@@ -17,46 +17,49 @@ Namespaces group resources within that customer's instance. They do not create s
 ## Project Structure
 
 ```text
-src/
-├── main.rs
-├── auth.rs
-├── config.rs
-├── error.rs
-├── health.rs
-├── observability.rs
-├── rate_limit.rs
-├── router.rs
-├── state.rs
-│
-└── images/
-    ├── mod.rs
-    ├── model.rs
-    ├── multipart.rs
-    ├── reduction.rs
-    ├── service.rs
-    ├── store.rs
-    ├── validation.rs
-    │
-    ├── dtos/
-    │   ├── mod.rs
-    │   ├── image_info_response.rs
-    │   ├── image_list_response.rs
-    │   ├── presign_response.rs
-    │   └── upload_response.rs
-    │
-    └── handler/
-        ├── mod.rs
-        ├── delete.rs
-        ├── fetch.rs
-        ├── info.rs
-        ├── list.rs
-        ├── presign.rs
-        └── upload.rs
+src/main.rs                       # Minimal executable entry point
+crates/
+├── image-core/src/               # HTTP, auth, config, storage, lifecycle, use cases
+│   ├── auth.rs
+│   ├── config.rs
+│   ├── router.rs
+│   ├── state.rs
+│   └── images/                   # Image API and storage adapters; enabled by `images`
+├── processor-contract/src/       # Processor capability and in-process request/result types
+├── image-processor-image/src/    # Decode, crop, resize, WebP encoding
+└── image-worker-protocol/src/    # Versioned worker/job/storage-reference DTOs
 ```
 
 The layout follows a simple rule:
 
 > HTTP-specific code should remain at the edge of the application. Image processing and storage should not depend on Axum.
+
+## Cargo Workspace and Features
+
+The root `image_service` binary delegates startup to `image-core`. The default
+`images` feature enables the existing image routes and the `image-processor-image`
+crate, preserving the service behavior and configuration by default. The image
+processor implements the shared `Processor` contract; the Core retains HTTP
+admission, the bounded Tokio blocking-pool handoff, storage, and response
+handling.
+
+The root package forwards `images` and `ipc` features to the Core. Supported
+builds are checked in CI:
+
+```text
+default (`images`)                 compatible image service
+--no-default-features              core, health/readiness, optional metrics
+--no-default-features --features ipc
+                                   core plus worker protocol types, no local image processor
+--no-default-features --features all
+                                   image service and worker protocol types
+```
+
+The `image-worker-protocol` crate currently defines versioned registration,
+job, result, and `StorageRef` data types. It does not yet implement a Unix socket,
+worker registration, scheduling, leases, retries, or remote processing. The
+no-image build is an architectural base, not a deployable replacement for the
+default image service until the later IPC dispatch branch is implemented.
 
 ---
 
@@ -98,9 +101,9 @@ The HTTP layer should not implement image compression or storage backend operati
 
 ### Process Lifecycle
 
-Files: `main.rs`, `server.rs`, and lifecycle state in `state.rs`.
+Files: root `src/main.rs`, `image-core/src/lib.rs`, `server.rs`, and lifecycle state in `state.rs`.
 
-`main.rs` builds the Tokio runtime with a bounded shutdown wait. `server.rs` handles SIGTERM/SIGINT, marks the shared lifecycle state as not ready, and asks Axum to stop accepting connections and drain active requests until the configured deadline. Readiness checks the configured OpenDAL backend; liveness only reports whether the process is running.
+`main.rs` loads `.env` and delegates startup to `image-core::run`, which builds the Tokio runtime with a bounded shutdown wait. `server.rs` handles SIGTERM/SIGINT, marks the shared lifecycle state as not ready, and asks Axum to stop accepting connections and drain active requests until the configured deadline. Readiness checks the configured OpenDAL backend; liveness only reports whether the process is running.
 
 ### Application / Service Layer
 
@@ -126,7 +129,7 @@ The service layer represents application behavior rather than transport or infra
 File:
 
 ```text
-images/reduction.rs
+image-processor-image/src/lib.rs
 ```
 
 Responsibilities:
@@ -143,7 +146,7 @@ Responsibilities:
 - Move CPU-heavy work away from the async executor.
 - Respect the image-processing concurrency limit.
 
-This layer has no knowledge of HTTP routes, namespaces, storage backends, or Axum.
+This crate has no knowledge of HTTP routes, namespaces, storage backends, or Axum. Its synchronous `Processor` contract is called by the Core through `spawn_blocking`; the Core owns admission and concurrency permits.
 
 Conceptually:
 

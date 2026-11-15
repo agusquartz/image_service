@@ -156,6 +156,19 @@ curl -F "image=@photo.jpg" -H "Authorization: Bearer replace-with-a-long-random-
 
 The service refuses to start without `IMAGE_API_KEY` under the default private read/write policies. Public reads or fully unprotected access must be explicitly configured with `IMAGE_READ_AUTH=none` and/or `IMAGE_WRITE_AUTH=none`.
 
+### Cargo feature builds
+
+The default `images` feature preserves the complete HTTP API and is the supported service build. Cargo features can also produce smaller architecture builds:
+
+```bash
+cargo build --release --locked
+cargo build --release --locked --no-default-features
+cargo build --release --locked --no-default-features --features ipc
+cargo build --release --locked --no-default-features --features all
+```
+
+The no-image builds expose health/readiness and optional metrics only; image routes and local image processing are excluded. The `ipc` feature currently includes versioned worker-protocol data types, but does not yet connect to or dispatch jobs to workers. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
+
 ## API Overview
 
 ```text
