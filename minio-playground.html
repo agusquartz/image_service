@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Service · MinIO Playground</title>
+  <link rel="icon" href="data:,">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #8b5e34; outline-offset: 2px; }
+    .preview-image { max-height: 420px; object-fit: contain; }
+    .log-entry + .log-entry { border-top: 1px solid #e7e5e4; }
+  </style>
+</head>
+<body class="bg-stone-50 text-stone-900 antialiased">
+  <header class="border-b border-stone-200 bg-white">
+    <div class="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-5 py-4">
+      <div>
+        <p class="text-xs font-semibold uppercase tracking-[0.14em] text-stone-500">Image Service / pruebas locales</p>
+        <h1 class="mt-1 text-xl font-semibold tracking-tight">MinIO Playground</h1>
+      </div>
+      <div class="flex flex-wrap items-center gap-3 text-sm">
+        <span id="service-status" class="inline-flex items-center gap-2 text-stone-600"><span class="h-2 w-2 rounded-full bg-stone-400"></span>Conectando…</span>
+        <span id="runtime-info" class="rounded border border-stone-200 px-2.5 py-1 font-mono text-xs text-stone-600">—</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="mx-auto max-w-7xl space-y-6 px-5 py-6">
+    <section class="grid gap-6 lg:grid-cols-[minmax(0,1.3fr)_minmax(320px,0.7fr)]">
+      <div class="space-y-5">
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 class="text-base font-semibold">Imagen original</h2>
+              <p class="mt-1 text-sm text-stone-600">El original se conserva en IndexedDB de este navegador para futuras comparaciones. No se sube hasta que elijas POST o PUT.</p>
+            </div>
+            <div class="flex gap-2">
+              <label class="cursor-pointer rounded border border-stone-300 px-3 py-2 text-sm font-medium hover:bg-stone-50">
+                Elegir imagen<input id="image-file" class="sr-only" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff">
+              </label>
+              <button id="clear-original" class="rounded border border-stone-300 px-3 py-2 text-sm hover:bg-stone-50">Borrar original local</button>
+            </div>
+          </div>
+          <div id="drop-zone" class="flex min-h-56 items-center justify-center rounded border border-dashed border-stone-300 bg-stone-50 p-4 text-center">
+            <div id="original-empty" class="max-w-sm">
+              <p class="font-medium">Suelta una imagen aquí o selecciónala</p>
+              <p class="mt-1 text-sm text-stone-500">PNG, JPEG, WebP y otros formatos compatibles con el decoder.</p>
+            </div>
+            <img id="original-preview" class="preview-image hidden w-full" alt="Vista previa del archivo original">
+          </div>
+          <dl id="original-stats" class="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-4">
+            <div><dt class="text-stone-500">Archivo</dt><dd id="original-name" class="truncate font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Formato</dt><dd id="original-type" class="font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Dimensiones</dt><dd id="original-dimensions" class="font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Peso</dt><dd id="original-size" class="font-medium">—</dd></div>
+          </dl>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 class="text-base font-semibold">Imagen almacenada en MinIO</h2>
+              <p class="mt-1 text-sm text-stone-600">La comparación usa los bytes obtenidos con GET, HEAD o la URL presignada.</p>
+            </div>
+            <span id="output-status" class="text-sm text-stone-500">Sin resultado</span>
+          </div>
+          <div class="flex min-h-56 items-center justify-center rounded border border-stone-200 bg-stone-50 p-4">
+            <p id="output-empty" class="text-sm text-stone-500">Sube una imagen o ejecuta GET para verla aquí.</p>
+            <img id="output-preview" class="preview-image hidden w-full" alt="Vista previa de la imagen WebP almacenada">
+          </div>
+          <dl class="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-4">
+            <div><dt class="text-stone-500">Formato</dt><dd id="output-type" class="font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Dimensiones</dt><dd id="output-dimensions" class="font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Peso</dt><dd id="output-size" class="font-medium">—</dd></div>
+            <div><dt class="text-stone-500">Reducción</dt><dd id="output-reduction" class="font-medium">—</dd></div>
+          </dl>
+        </section>
+      </div>
+
+      <aside class="space-y-5">
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Servicio y recurso</h2>
+          <div class="mt-4 space-y-3">
+            <label class="block text-sm"><span class="mb-1 block font-medium">API key</span><input id="api-key" type="password" autocomplete="off" class="w-full rounded border border-stone-300 px-3 py-2 font-mono text-sm" placeholder="IMAGE_API_KEY"></label>
+            <div class="grid grid-cols-3 gap-3">
+              <label class="block text-sm"><span class="mb-1 block font-medium">Namespace</span><input id="namespace" value="products" class="w-full rounded border border-stone-300 px-3 py-2"></label>
+              <label class="block text-sm"><span class="mb-1 block font-medium">Resource ID</span><input id="resource-id" value="playground-1" class="w-full rounded border border-stone-300 px-3 py-2"></label>
+              <label class="block text-sm"><span class="mb-1 block font-medium">Slot</span><input id="slot" value="1" type="number" min="1" max="255" class="w-full rounded border border-stone-300 px-3 py-2"></label>
+            </div>
+            <p class="text-xs text-stone-500">Los datos de MinIO viven en `tmpfs` y se borran al detener el script.</p>
+          </div>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Subida</h2>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button id="post-button" class="rounded bg-stone-900 px-3 py-2.5 text-sm font-semibold text-white hover:bg-stone-700">POST · crear</button>
+            <button id="put-button" class="rounded border border-stone-300 px-3 py-2.5 text-sm font-semibold hover:bg-stone-50">PUT · reemplazar</button>
+          </div>
+          <p class="mt-2 text-xs text-stone-500">POST devuelve 409 si el slot ya existe. PUT crea o reemplaza.</p>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Lectura y metadatos</h2>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button data-action="health" class="action-button">GET /health</button>
+            <button data-action="get" class="action-button">GET imagen</button>
+            <button data-action="head" class="action-button">HEAD</button>
+            <button data-action="info" class="action-button">GET info</button>
+            <button data-action="conditional" class="action-button">GET condicional</button>
+            <button data-action="presign" class="action-button col-span-2">Presign GET y descargar desde MinIO</button>
+          </div>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Recurso</h2>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button data-action="list" class="action-button">Listar slots</button>
+            <button data-action="delete-slot" class="action-button">DELETE slot</button>
+            <button data-action="delete-resource" class="action-button col-span-2 border-red-200 text-red-700 hover:bg-red-50">DELETE recurso completo</button>
+          </div>
+          <div id="resource-list" class="mt-3 hidden border-t border-stone-200 pt-3"></div>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Seguridad y métricas</h2>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button data-action="auth-check" class="action-button">Probar auth requerida</button>
+            <button data-action="metrics" class="action-button">GET /metrics</button>
+            <button data-action="logs" class="action-button col-span-2">Ver logs JSON del servicio</button>
+          </div>
+          <p class="mt-2 text-xs text-stone-500">La instancia de prueba inicia con read/write privados y métricas protegidas.</p>
+        </section>
+
+        <section class="rounded border border-stone-200 bg-white p-5">
+          <h2 class="text-base font-semibold">Límites y pruebas S3</h2>
+          <label class="mt-3 block text-sm"><span class="mb-1 block font-medium">Solicitudes por ráfaga</span><input id="burst-count" type="number" min="1" max="100" value="12" class="w-28 rounded border border-stone-300 px-3 py-2"></label>
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button data-action="rate-read" class="action-button">Probar límite de lectura</button>
+            <button data-action="rate-write" class="action-button">Probar límite de escritura</button>
+            <button data-action="seed-slot" class="action-button col-span-2">Sembrar WebP en el slot elegido (bypass S3)</button>
+          </div>
+          <p class="mt-2 text-xs text-stone-500">Las ráfagas respetan los límites configurados al iniciar el script. La siembra directa permite probar slots antiguos sobre el máximo sin modificar la lógica del servicio.</p>
+        </section>
+      </aside>
+    </section>
+
+    <section class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.8fr)]">
+      <section class="rounded border border-stone-200 bg-white">
+        <div class="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-5 py-3">
+          <div><h2 class="font-semibold">Resultado de la última respuesta</h2><p id="response-summary" class="mt-0.5 text-sm text-stone-500">Aún no se hicieron solicitudes.</p></div>
+          <button id="copy-response" class="rounded border border-stone-300 px-3 py-1.5 text-sm hover:bg-stone-50">Copiar respuesta</button>
+        </div>
+        <dl class="grid grid-cols-2 gap-x-4 gap-y-2 px-5 py-3 text-sm sm:grid-cols-5">
+          <div><dt class="text-stone-500">Cache-Control</dt><dd id="header-cache" class="break-all font-mono text-xs">—</dd></div>
+          <div><dt class="text-stone-500">ETag</dt><dd id="header-etag" class="break-all font-mono text-xs">—</dd></div>
+          <div><dt class="text-stone-500">Last-Modified</dt><dd id="header-modified" class="break-all font-mono text-xs">—</dd></div>
+          <div><dt class="text-stone-500">Content-Length</dt><dd id="header-length" class="font-mono text-xs">—</dd></div>
+          <div><dt class="text-stone-500">Retry-After</dt><dd id="header-retry" class="font-mono text-xs">—</dd></div>
+        </dl>
+        <pre id="response-body" class="max-h-72 overflow-auto border-t border-stone-200 bg-stone-50 p-5 text-xs leading-5 text-stone-800">{}</pre>
+      </section>
+      <section class="rounded border border-stone-200 bg-white">
+        <div class="flex items-center justify-between border-b border-stone-200 px-5 py-3">
+          <div><h2 class="font-semibold">Registro de solicitudes</h2><p class="mt-0.5 text-sm text-stone-500">Método, ruta, estado y duración.</p></div>
+          <button id="clear-log" class="rounded border border-stone-300 px-3 py-1.5 text-sm hover:bg-stone-50">Limpiar</button>
+        </div>
+        <div id="request-log" class="max-h-80 overflow-auto px-5"></div>
+      </section>
+    </section>
+
+    <footer class="border-t border-stone-200 py-4 text-xs text-stone-500">
+      Herramienta de desarrollo local para el backend S3-compatible MinIO. No uses credenciales ni datos reales. Cierra con Ctrl+C para eliminar contenedores, red y almacenamiento temporal.
+    </footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { original: null, originalUrl: null, resultUrl: null, outputBlob: null, etag: null, lastResponse: "{}", config: null };
+    const ORIGINAL_DB = "image-service-minio-playground";
+    document.querySelectorAll(".action-button").forEach((button) => button.classList.add("rounded", "border", "border-stone-300", "px-3", "py-2", "text-sm", "font-medium", "hover:bg-stone-50"));
+
+    function bytes(value) {
+      if (!Number.isFinite(value)) return "—";
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+      return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
+    }
+    function pathParts() {
+      const namespace = $("namespace").value.trim();
+      const resource = $("resource-id").value.trim();
+      const slot = Number($("slot").value);
+      if (!namespace || !resource || !Number.isInteger(slot) || slot < 1 || slot > 255) throw new Error("Namespace y resource ID son requeridos; slot debe estar entre 1 y 255.");
+      return { namespace: encodeURIComponent(namespace), resource: encodeURIComponent(resource), slot };
+    }
+    function routes() {
+      const p = pathParts();
+      const resource = `/api/images/${p.namespace}/${p.resource}`;
+      return { resource, image: `${resource}/${p.slot}`, info: `${resource}/${p.slot}/info`, presign: `${resource}/${p.slot}/presign` };
+    }
+    function authHeaders() {
+      const key = $("api-key").value;
+      return key ? { Authorization: `Bearer ${key}` } : {};
+    }
+    function setStatus(text, ok) {
+      $("service-status").innerHTML = `<span class="h-2 w-2 rounded-full ${ok ? "bg-emerald-600" : "bg-red-600"}"></span>${text}`;
+    }
+    function showOriginal(file) {
+      state.original = file;
+      if (state.originalUrl) URL.revokeObjectURL(state.originalUrl);
+      state.originalUrl = URL.createObjectURL(file);
+      $("original-preview").src = state.originalUrl;
+      $("original-preview").classList.remove("hidden");
+      $("original-empty").classList.add("hidden");
+      $("original-name").textContent = file.name;
+      $("original-type").textContent = file.type || "desconocido";
+      $("original-size").textContent = bytes(file.size);
+      const preview = $("original-preview");
+      preview.onload = () => { $("original-dimensions").textContent = `${preview.naturalWidth} × ${preview.naturalHeight} px`; };
+      preview.onerror = () => { $("original-dimensions").textContent = "No se pudo decodificar en el navegador"; };
+      saveOriginal(file).catch((error) => addLog("LOCAL", "IndexedDB", 0, 0, `No se pudo guardar el original: ${error.message}`));
+    }
+    function openOriginalDb() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(ORIGINAL_DB, 1);
+        request.onupgradeneeded = () => request.result.createObjectStore("original", { keyPath: "id" });
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+    async function saveOriginal(file) {
+      const db = await openOriginalDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("original", "readwrite");
+        tx.objectStore("original").put({ id: "selected", blob: file, name: file.name, type: file.type, lastModified: file.lastModified });
+        tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+      });
+      db.close();
+    }
+    async function restoreOriginal() {
+      const db = await openOriginalDb();
+      const record = await new Promise((resolve, reject) => {
+        const tx = db.transaction("original", "readonly");
+        const request = tx.objectStore("original").get("selected");
+        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+      });
+      db.close();
+      if (record) showOriginal(new File([record.blob], record.name, { type: record.type, lastModified: record.lastModified }));
+    }
+    async function clearOriginal() {
+      const db = await openOriginalDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("original", "readwrite");
+        tx.objectStore("original").delete("selected");
+        tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+      });
+      db.close();
+      state.original = null;
+      if (state.originalUrl) URL.revokeObjectURL(state.originalUrl);
+      state.originalUrl = null;
+      $("original-preview").removeAttribute("src"); $("original-preview").classList.add("hidden"); $("original-empty").classList.remove("hidden");
+      for (const id of ["original-name", "original-type", "original-dimensions", "original-size"]) $(id).textContent = "—";
+    }
+    function showOutput(blob, label = "GET almacenado") {
+      if (state.resultUrl) URL.revokeObjectURL(state.resultUrl);
+      state.outputBlob = blob;
+      state.resultUrl = URL.createObjectURL(blob);
+      const image = $("output-preview");
+      image.onload = () => {
+        const outputSize = blob.size;
+        $("output-type").textContent = blob.type || "image/webp";
+        $("output-dimensions").textContent = `${image.naturalWidth} × ${image.naturalHeight} px`;
+        $("output-size").textContent = bytes(outputSize);
+        $("output-reduction").textContent = state.original ? `${Math.max(0, 100 - outputSize / state.original.size * 100).toFixed(1)}% menos` : "—";
+      };
+      image.src = state.resultUrl;
+      image.classList.remove("hidden");
+      $("output-empty").classList.add("hidden");
+      $("output-status").textContent = label;
+    }
+    function showResponse(response, bodyText) {
+      $("response-summary").textContent = `${response.status} ${response.statusText} · ${response.headers.get("x-request-id") || "sin request ID"}`;
+      $("header-cache").textContent = response.headers.get("cache-control") || "—";
+      $("header-etag").textContent = response.headers.get("etag") || "—";
+      $("header-modified").textContent = response.headers.get("last-modified") || "—";
+      $("header-length").textContent = response.headers.get("content-length") || "—";
+      $("header-retry").textContent = response.headers.get("retry-after") || "—";
+      state.lastResponse = bodyText;
+      $("response-body").textContent = bodyText;
+      if (response.headers.get("etag")) state.etag = response.headers.get("etag");
+    }
+    function addLog(method, path, status, elapsed, note = "") {
+      const item = document.createElement("div");
+      item.className = "log-entry py-2.5 text-xs";
+      const tone = status >= 200 && status < 400 ? "text-emerald-700" : "text-red-700";
+      const row = document.createElement("div"); row.className = "flex items-baseline justify-between gap-3";
+      const requestLabel = document.createElement("span"); requestLabel.className = "truncate font-mono text-stone-800";
+      const methodLabel = document.createElement("b"); methodLabel.textContent = method;
+      requestLabel.append(methodLabel, document.createTextNode(` ${path}`));
+      const statusLabel = document.createElement("span"); statusLabel.className = `shrink-0 font-semibold ${tone}`; statusLabel.textContent = `${status} · ${elapsed} ms`;
+      row.append(requestLabel, statusLabel); item.append(row);
+      if (note) { const details = document.createElement("p"); details.className = "mt-1 whitespace-pre-wrap text-stone-500"; details.textContent = note; item.append(details); }
+      $("request-log").prepend(item);
+    }
+    async function request(method, path, options = {}) {
+      const started = performance.now();
+      const headers = new Headers(options.headers || {});
+      if (options.auth !== false) for (const [key, value] of Object.entries(authHeaders())) headers.set(key, value);
+      const response = await fetch(path, { method, headers, body: options.body, cache: "no-store" });
+      const elapsed = Math.round(performance.now() - started);
+      let bodyText = "";
+      let blob = null;
+      if (method !== "HEAD" && response.status !== 304) {
+        if (options.expectBlob || (response.headers.get("content-type") || "").startsWith("image/")) {
+          blob = await response.blob();
+          bodyText = `${blob.type}, ${bytes(blob.size)}`;
+        } else {
+          bodyText = await response.text();
+          try { bodyText = JSON.stringify(JSON.parse(bodyText), null, 2); } catch (_) {}
+        }
+      }
+      showResponse(response, bodyText || (response.status === 304 ? "304 Not Modified · respuesta sin cuerpo" : "(sin cuerpo)"));
+      addLog(method, options.displayPath || path, response.status, elapsed, options.note || "");
+      return { response, bodyText, blob };
+    }
+    async function upload(method) {
+      if (!state.original) throw new Error("Primero selecciona la imagen original.");
+      const { image } = routes();
+      const form = new FormData(); form.append("image", state.original, state.original.name);
+      const result = await request(method, image, { body: form });
+      if (result.response.ok) await fetchStored();
+    }
+    async function fetchStored() {
+      const { image } = routes();
+      const result = await request("GET", image);
+      if (result.response.ok && result.blob) showOutput(result.blob);
+      return result;
+    }
+    async function getInfo() {
+      const { info } = routes();
+      const result = await request("GET", info);
+      if (result.response.ok) {
+        try {
+          const info = JSON.parse(result.bodyText);
+          $("output-type").textContent = info.format || "—";
+          $("output-dimensions").textContent = `${info.width} × ${info.height} px`;
+          $("output-size").textContent = bytes(info.size_bytes);
+          $("output-status").textContent = `Metadatos · perfil ${info.profile || "default"}`;
+        } catch (_) {}
+      }
+    }
+    async function listResource() {
+      const { resource } = routes();
+      const result = await request("GET", resource);
+      if (!result.response.ok) return;
+      const listing = JSON.parse(result.bodyText);
+      const root = $("resource-list"); root.classList.remove("hidden");
+      root.innerHTML = `<div class="mb-2 text-xs text-stone-600">${listing.images.length} slots · máximo creable ${listing.max_creatable_slot}</div>`;
+      if (!listing.images.length) { root.insertAdjacentHTML("beforeend", '<p class="text-sm text-stone-500">No hay imágenes.</p>'); return; }
+      for (const image of listing.images) {
+        const row = document.createElement("div"); row.className = "flex items-center justify-between gap-3 border-t border-stone-100 py-2 text-sm";
+        row.innerHTML = `<span>Slot ${image.slot} · ${bytes(image.size_bytes)}</span><button class="rounded border border-stone-300 px-2 py-1 text-xs hover:bg-stone-50">Ver</button>`;
+        row.querySelector("button").addEventListener("click", async () => { $("slot").value = image.slot; await fetchStored(); });
+        root.append(row);
+      }
+    }
+    async function conditionalGet() {
+      const { image } = routes();
+      if (!state.etag) {
+        const prior = await request("HEAD", image);
+        if (!prior.response.ok || !state.etag) throw new Error("No se obtuvo ETag; primero crea o consulta una imagen en MinIO.");
+      }
+      await request("GET", image, { headers: { "If-None-Match": state.etag }, note: `If-None-Match: ${state.etag}` });
+    }
+    async function presignedGet() {
+      const { presign } = routes();
+      const result = await request("POST", presign);
+      if (!result.response.ok) return;
+      const payload = JSON.parse(result.bodyText);
+      const localUrl = `/__presigned?url=${encodeURIComponent(payload.url)}`;
+      const fetched = await request("GET", localUrl, { auth: false, expectBlob: true, displayPath: "/__presigned", note: `Lectura directa firmada · expira en ${payload.expires_in}s` });
+      if (fetched.response.ok && fetched.blob) showOutput(new Blob([fetched.blob], { type: "image/webp" }), "Descarga directa con URL presignada");
+    }
+    async function deleteSlot() {
+      const { image } = routes();
+      await request("DELETE", image);
+      await listResource();
+    }
+    async function deleteResource() {
+      const { resource } = routes();
+      if (!confirm(`¿Borrar todas las imágenes de ${decodeURIComponent(resource.split("/").at(-1))}?`)) return;
+      await request("DELETE", resource);
+      await listResource();
+    }
+    async function authCheck() {
+      const { image } = routes();
+      await request("HEAD", image, { auth: false, note: "Esperado: 401 con read auth requerida." });
+      await request("HEAD", image, { note: "La misma solicitud con API key; esperado: 200 si existe el slot." });
+    }
+    async function metrics() {
+      await request("GET", "/metrics", { note: "Endpoint Prometheus; protegido por IMAGE_METRICS_AUTH." });
+    }
+    async function rateBurst(kind) {
+      const count = Math.min(100, Math.max(1, Number($("burst-count").value) || 1));
+      const path = routes().image;
+      const method = kind === "read" ? "HEAD" : "POST";
+      const requests = Array.from({ length: count }, () => request(method, path, {
+        body: method === "POST" ? new FormData() : undefined,
+        note: method === "POST" ? "Rate-limit probe: empty multipart request; no image is written." : "Rate-limit probe: HEAD does not modify the slot."
+      }));
+      await Promise.all(requests);
+    }
+    async function seedSlot() {
+      if (!state.outputBlob) throw new Error("Primero descarga una imagen con GET o presign, o sube una imagen.");
+      const p = pathParts();
+      if (!confirm(`Sembrar el WebP actual directamente en MinIO en slot ${p.slot}? Esto sobrescribe ese objeto de prueba si ya existe.`)) return;
+      const query = new URLSearchParams({ namespace: decodeURIComponent(p.namespace), resource_id: decodeURIComponent(p.resource), slot: String(p.slot) });
+      const result = await request("POST", `/__seed-slot?${query}`, {
+        auth: false,
+        body: state.outputBlob,
+        headers: { "Content-Type": "image/webp" },
+        note: "Carga directa al MinIO local para preparar un slot legado de prueba."
+      });
+      if (result.response.ok) await listResource();
+    }
+    async function showLogs() {
+      await request("GET", "/__logs", { auth: false, note: "Logs JSON del contenedor de Image Service." });
+    }
+    async function init() {
+      try {
+        await restoreOriginal();
+        const response = await fetch("/__config", { cache: "no-store" });
+        state.config = await response.json();
+        $("api-key").value = state.config.api_key || "";
+        $("runtime-info").textContent = `${state.config.platform} · ${state.config.storage}`;
+        setStatus("Image Service y MinIO activos", true);
+        const settings = [
+          `Image Service: ${state.config.image}`, `MinIO: ${state.config.minio}`,
+          `API auth: read=${state.config.read_auth}, write=${state.config.write_auth}`,
+          `Metrics: ${state.config.metrics_enabled ? "enabled" : "disabled"} (auth=${state.config.metrics_auth})`,
+          `Límites: input ${bytes(state.config.max_input_bytes)}, output ${bytes(state.config.max_output_bytes)}, dimensiones ${state.config.width}×${state.config.height}, slots ${state.config.max_slots}`,
+          `Rate limits por ${state.config.rate_window}s: lectura ${state.config.rate_read}, escritura ${state.config.rate_write}`,
+          `Profiles: ${state.config.profiles}`,
+          `Namespace profiles: ${state.config.namespace_profiles}`
+        ].join("\n");
+        addLog("INFO", "/__config", 200, 0, settings);
+      } catch (error) { setStatus("No se pudo conectar con el launcher", false); addLog("ERROR", "/__config", 0, 0, error.message); }
+    }
+
+    $("image-file").addEventListener("change", (event) => { if (event.target.files[0]) showOriginal(event.target.files[0]); });
+    $("clear-original").addEventListener("click", () => clearOriginal().catch((error) => alert(error.message)));
+    const drop = $("drop-zone");
+    drop.addEventListener("dragover", (event) => { event.preventDefault(); drop.classList.add("border-stone-500"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("border-stone-500"));
+    drop.addEventListener("drop", (event) => { event.preventDefault(); drop.classList.remove("border-stone-500"); const file = event.dataTransfer.files[0]; if (file) showOriginal(file); });
+    $("post-button").addEventListener("click", () => upload("POST").catch((error) => alert(error.message)));
+    $("put-button").addEventListener("click", () => upload("PUT").catch((error) => alert(error.message)));
+    document.querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", async () => {
+      try {
+        const action = button.dataset.action;
+        if (action === "health") await request("GET", "/health");
+        if (action === "get") await fetchStored();
+        if (action === "head") await request("HEAD", routes().image);
+        if (action === "info") await getInfo();
+        if (action === "conditional") await conditionalGet();
+        if (action === "presign") await presignedGet();
+        if (action === "list") await listResource();
+        if (action === "delete-slot") await deleteSlot();
+        if (action === "delete-resource") await deleteResource();
+        if (action === "auth-check") await authCheck();
+        if (action === "metrics") await metrics();
+        if (action === "logs") await showLogs();
+        if (action === "rate-read") await rateBurst("read");
+        if (action === "rate-write") await rateBurst("write");
+        if (action === "seed-slot") await seedSlot();
+      } catch (error) { addLog("ERROR", button.dataset.action, 0, 0, error.message); alert(error.message); }
+    }));
+    $("clear-log").addEventListener("click", () => { $("request-log").innerHTML = ""; });
+    $("copy-response").addEventListener("click", async () => { await navigator.clipboard.writeText(state.lastResponse); $("copy-response").textContent = "Copiado"; setTimeout(() => $("copy-response").textContent = "Copiar respuesta", 1200); });
+    window.addEventListener("beforeunload", () => { if (state.originalUrl) URL.revokeObjectURL(state.originalUrl); if (state.resultUrl) URL.revokeObjectURL(state.resultUrl); });
+    init();
+  </script>
+</body>
+</html>
