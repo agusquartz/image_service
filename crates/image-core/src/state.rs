@@ -1,15 +1,17 @@
+#[cfg(feature = "images")]
+use crate::{config::UPLOAD_BUDGET_UNIT_BYTES, error::ApiError, images::ImageStore};
 use crate::{
     config::{
-        AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile, UPLOAD_BUDGET_UNIT_BYTES,
+        AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile,
         max_configured_input_bytes, resolve_processing_policy,
     },
-    error::ApiError,
-    images::ImageStore,
     observability::HttpMetrics,
     rate_limit::RateLimiter,
 };
 
 use opendal::Operator;
+#[cfg(feature = "images")]
+use processor_contract::Processor;
 
 use std::{
     collections::HashMap,
@@ -19,9 +21,11 @@ use std::{
     },
 };
 
+#[cfg(feature = "images")]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Keeps admission capacity reserved while the compressed source remains in memory.
+#[cfg(feature = "images")]
 pub(crate) struct UploadAdmission {
     _slot: OwnedSemaphorePermit,
     _body_budget: OwnedSemaphorePermit,
@@ -46,13 +50,24 @@ impl ServiceLifecycle {
 pub struct AppState {
     pub lifecycle: ServiceLifecycle,
 
+    /// Shared storage operator used by readiness and optional image routes.
+    pub storage_operator: Operator,
+
     /// Backend-independent image repository.
+    #[cfg(feature = "images")]
     pub store: ImageStore,
 
+    #[cfg(feature = "images")]
     pub image_jobs: Arc<Semaphore>,
 
+    #[cfg(feature = "images")]
+    pub image_processor: Arc<dyn Processor>,
+
+    #[cfg(feature = "images")]
     upload_slots: Arc<Semaphore>,
+    #[cfg(feature = "images")]
     upload_body_budget: Arc<Semaphore>,
+    #[cfg(feature = "images")]
     pub upload_read_timeout_seconds: u64,
 
     pub max_source_bytes: usize,
@@ -103,14 +118,24 @@ impl AppState {
         Ok(Self {
             lifecycle: ServiceLifecycle::default(),
 
+            storage_operator: operator.clone(),
+
+            #[cfg(feature = "images")]
             store: ImageStore::new(operator),
 
+            #[cfg(feature = "images")]
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
 
+            #[cfg(feature = "images")]
+            image_processor: Arc::new(image_processor_image::ImageProcessor),
+
+            #[cfg(feature = "images")]
             upload_slots: Arc::new(Semaphore::new(config.max_uploads_in_flight)),
+            #[cfg(feature = "images")]
             upload_body_budget: Arc::new(Semaphore::new(
                 config.upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES,
             )),
+            #[cfg(feature = "images")]
             upload_read_timeout_seconds: config.upload_read_timeout_seconds,
 
             max_source_bytes: config.max_source_bytes,
@@ -167,6 +192,7 @@ impl AppState {
         )
     }
 
+    #[cfg(feature = "images")]
     pub(crate) fn admit_upload(&self, max_input_bytes: usize) -> Result<UploadAdmission, ApiError> {
         reserve_upload(
             self.upload_slots.clone(),
@@ -176,6 +202,7 @@ impl AppState {
     }
 }
 
+#[cfg(feature = "images")]
 fn reserve_upload(
     upload_slots: Arc<Semaphore>,
     upload_body_budget: Arc<Semaphore>,

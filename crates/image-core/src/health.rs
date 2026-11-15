@@ -22,7 +22,7 @@ pub async fn ready(State(state): State<AppState>) -> StatusCode {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    match tokio::time::timeout(Duration::from_secs(2), state.store.check()).await {
+    match tokio::time::timeout(Duration::from_secs(2), state.storage_operator.check()).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT,
         Ok(Err(error)) => {
             tracing::debug!(error = ?error, "storage readiness check failed");

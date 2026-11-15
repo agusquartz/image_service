@@ -34,14 +34,11 @@ pub const MAX_SLOT_NUMBER: u8 = u8::MAX;
 ///
 /// This helps protect the service from extremely large or maliciously
 /// crafted images.
-pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
+pub const MAX_IMAGE_DIMENSION: u32 = processor_contract::MAX_IMAGE_DIMENSION;
 
 /// Maximum source image dimensions accepted for converted output.
 pub const DEFAULT_OUTPUT_WIDTH: u32 = 1024;
 pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1024;
-
-/// Maximum memory allocation allowed by the image decoder.
-pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 /// Maximum presigned URL lifetime supported by the S3 API.
 pub const MAX_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
