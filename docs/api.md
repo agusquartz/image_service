@@ -124,6 +124,8 @@ Reads require the configured `IMAGE_API_KEY` bearer token by default. Set `IMAGE
 
 GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses are `public` when `IMAGE_READ_AUTH=none` and `private` when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` sets `no-store`; `IMAGE_CACHE_CONTROL` can override the complete policy. GET supports `If-None-Match` and `If-Modified-Since`, returning `304 Not Modified` when the stored representation has not changed. ETag falls back to a SHA-256 content validator when the storage backend does not provide one. A fresh cached response can remain in use for up to its TTL after a PUT; ETag does not force an earlier check. `immutable` is unsuitable while uploads can replace content at the same URL.
 
+When a conditional GET matches storage metadata, the service confirms that version before returning `304 Not Modified` (the cached representation is still valid). S3-compatible storage with ETags uses a conditional one-byte range read; LocalFS checks again while holding the resource operation lock. This avoids reading the full image while preventing stale metadata from producing a false 304. If storage does not provide an ETag, the SHA-256 fallback can only be compared after reading the body. For a `200 OK` response, the service reads metadata and bytes as one snapshot: its per-resource lock coordinates local writes/deletes, and storage backends that support conditional reads use `If-Match` to reject bytes from a different ETag. Repeated changes during a read return `503 Service Unavailable` (retry the request) rather than pairing one version's body with another version's validators.
+
 ## Image Information
 
 ```text

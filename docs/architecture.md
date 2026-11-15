@@ -175,6 +175,8 @@ Responsibilities:
 - Delete image objects through OpenDAL.
 - Read object metadata with `stat` and list slots under a resource prefix.
 - Coordinate uploads and deletes per resource in-process. Uploads capture resource/slot generations before consuming the body; a later slot or resource delete invalidates older uploads before they can publish.
+- Read GET bodies as metadata/body snapshots. The resource lock excludes this process's writes/deletes; backends with conditional-read support also use the metadata ETag as `If-Match`.
+- Confirm conditional GET validators before returning a bodyless response: S3-compatible stores issue a one-byte conditional range read, while LocalFS rechecks metadata under the resource lock.
 - Generate presigned read requests only when the backend advertises that capability.
 - Translate storage backend errors into application errors.
 

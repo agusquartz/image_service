@@ -177,7 +177,7 @@ The image file is a local fixture and is excluded from Git and the Docker build 
 
 ### MinIO S3-compatible smoke test
 
-The MinIO test starts a MinIO-compatible server and Image Service on a private Docker network. Both use ephemeral containers and a `tmpfs` object directory; the script removes the containers and network on exit. It checks create-only and replace uploads, S3 GET/HEAD and conditional GET, metadata-bearing listings including a legacy slot above the configured limit, a namespace-specific processing profile, direct download through a presigned URL, slot deletion, and recursive resource-level deletion. The resource deletion test verifies idempotence and confirms that objects under a similarly named resource are preserved.
+The MinIO test starts a MinIO-compatible server and Image Service on a private Docker network. Both use ephemeral containers and a `tmpfs` object directory; the script removes the containers and network on exit. It checks create-only and replace uploads, concurrent external S3 writes against GET snapshots (body and ETag must identify the same version), stale conditional validators, S3 GET/HEAD, metadata-bearing listings including a legacy slot above the configured limit, a namespace-specific processing profile, direct download through a presigned URL, slot deletion, and recursive resource-level deletion. The resource deletion test verifies idempotence and confirms that objects under a similarly named resource are preserved.
 
 ```bash
 bash scripts/verify_phase1_phase2.sh ./TEST_IMAGE_ORIGINAL.png
