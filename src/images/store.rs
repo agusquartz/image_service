@@ -231,19 +231,116 @@ impl ImageStore {
         }
     }
 
-    /// Reads a previously stored WebP image.
-    pub async fn read(&self, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
+    /// Reads a consistent metadata/body snapshot for one image.
+    ///
+    /// The resource lock excludes writes and deletes made by this process.
+    /// Backends that support conditional reads also verify the ETag so writes
+    /// from another process cannot pair stale metadata with newer bytes.
+    pub async fn read_snapshot(
+        &self,
+        key: &ImageKey,
+    ) -> Result<(StoredMetadata, Vec<u8>), ApiError> {
         let object_key = image_object_key(key);
+        let supports_if_match = self.operator.info().full_capability().read_with_if_match;
 
-        match self.operator.read(&object_key).await {
+        if !supports_if_match {
+            // LocalFS has no conditional-read primitive, so serialize the
+            // stat/read pair against mutations made by this process.
+            let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+            let _operation_guard = state.lock_owned().await;
+            let metadata = self.stat(key).await?;
+            let bytes = self.read_object(&object_key).await?;
+            return Ok((metadata, bytes));
+        }
+
+        // S3-compatible backends can validate the ETag atomically with GET.
+        // That keeps same-resource readers concurrent while still preventing
+        // a write from another process from mixing response metadata and bytes.
+        for _ in 0..3 {
+            let metadata = self.stat(key).await?;
+            if let Some(etag) = metadata.etag.as_deref() {
+                match self.operator.read_with(&object_key).if_match(etag).await {
+                    Ok(buffer) => return Ok((metadata, buffer.to_vec())),
+                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        return Err(ApiError::NotFound("Image not found".to_string()));
+                    }
+                    Err(error) => return Err(ApiError::Storage(error.to_string())),
+                }
+            }
+
+            // A backend may advertise If-Match but omit ETags for a particular
+            // object. Use the process-local lock for that fallback case.
+            let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+            let _operation_guard = state.lock_owned().await;
+            let current_metadata = self.stat(key).await?;
+            if current_metadata.etag.is_some() {
+                continue;
+            }
+            let bytes = self.read_object(&object_key).await?;
+            return Ok((current_metadata, bytes));
+        }
+
+        Err(ApiError::ServiceUnavailable(
+            "Image changed repeatedly while being read; retry the request".to_string(),
+        ))
+    }
+
+    /// Confirms that metadata used for a conditional response still identifies
+    /// the current object. S3-compatible stores verify the ETag with a one-byte
+    /// conditional range read; LocalFS checks under the resource operation lock.
+    pub async fn is_current_snapshot(
+        &self,
+        key: &ImageKey,
+        metadata: &StoredMetadata,
+    ) -> Result<bool, ApiError> {
+        let object_key = image_object_key(key);
+        let supports_if_match = self.operator.info().full_capability().read_with_if_match;
+
+        if supports_if_match {
+            let Some(etag) = metadata.etag.as_deref() else {
+                // Without a validator, force the caller to fetch the full
+                // snapshot and evaluate its content-derived ETag instead.
+                return Ok(false);
+            };
+            return match self
+                .operator
+                .read_with(&object_key)
+                .if_match(etag)
+                .range(0..1)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    Err(ApiError::NotFound("Image not found".to_string()))
+                }
+                Err(error) => Err(ApiError::Storage(error.to_string())),
+            };
+        }
+
+        let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+        let _operation_guard = state.lock_owned().await;
+        let current = self.stat(key).await?;
+        Ok(current.etag == metadata.etag
+            && current.content_length == metadata.content_length
+            && current.last_modified == metadata.last_modified)
+    }
+
+    async fn read_object(&self, object_key: &str) -> Result<Vec<u8>, ApiError> {
+        match self.operator.read(object_key).await {
             Ok(buffer) => Ok(buffer.to_vec()),
-
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 Err(ApiError::NotFound("Image not found".to_string()))
             }
-
             Err(error) => Err(ApiError::Storage(error.to_string())),
         }
+    }
+
+    /// Reads a previously stored WebP image.
+    #[cfg(test)]
+    pub async fn read(&self, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
+        self.read_object(&image_object_key(key)).await
     }
 
     /// Deletes an image. Missing objects are treated as successful deletion.
@@ -465,6 +562,68 @@ mod tests {
         let actual = store.read(&key).await.expect("Image read should succeed");
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_returns_metadata_for_the_same_body() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        let expected = Bytes::from_static(b"a stored image version");
+        store
+            .write(&key, expected.clone(), 5)
+            .await
+            .expect("Image write should succeed");
+
+        let (metadata, actual) = store
+            .read_snapshot(&key)
+            .await
+            .expect("Snapshot read should succeed");
+
+        assert_eq!(actual, expected);
+        assert_eq!(metadata.content_length, actual.len() as u64);
+        assert!(metadata.last_modified.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_metadata_cannot_authorize_a_not_modified_response() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        store
+            .write(&key, Bytes::from_static(b"old version"), 5)
+            .await
+            .expect("Initial image write should succeed");
+        let stale_metadata = store.stat(&key).await.expect("Image should exist");
+
+        store
+            .write(&key, Bytes::from_static(b"new version is longer"), 5)
+            .await
+            .expect("Image replacement should succeed");
+
+        assert!(
+            !store
+                .is_current_snapshot(&key, &stale_metadata)
+                .await
+                .expect("Snapshot validation should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_replacement_never_mixes_snapshot_metadata_and_body() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        store
+            .write(&key, Bytes::from(vec![0; 8]), 5)
+            .await
+            .expect("Initial image write should succeed");
+
+        for version in 1..=32 {
+            let replacement = Bytes::from(vec![version; version as usize + 8]);
+            let (write_result, snapshot) =
+                tokio::join!(store.write(&key, replacement, 5), store.read_snapshot(&key),);
+            write_result.expect("Concurrent replacement should succeed");
+            let (metadata, body) = snapshot.expect("Concurrent snapshot read should succeed");
+            assert_eq!(metadata.content_length, body.len() as u64);
+        }
     }
 
     #[tokio::test]
