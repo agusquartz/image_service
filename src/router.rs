@@ -1,6 +1,6 @@
 use crate::{
     config::MULTIPART_OVERHEAD_BYTES,
-    health::health,
+    health::{health, live, ready},
     images::handler::{
         create_image, delete_image, delete_resource, fetch_image, head_image, image_info,
         list_images, presign_image_read, replace_image,
@@ -17,6 +17,8 @@ use axum::{Router, extract::DefaultBodyLimit, middleware, routing::get};
 ///
 /// ```text
 /// GET  /health
+/// GET  /health/live
+/// GET  /health/ready
 ///
 /// GET  /api/images/{namespace}/{resource_id}/{slot}
 /// GET  /api/images/{namespace}/{resource_id}/{slot}/info
@@ -35,6 +37,8 @@ pub fn build_router(state: AppState) -> Router {
     let metrics_enabled = state.metrics_enabled;
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready))
         .route(
             "/api/images/{namespace}/{resource_id}",
             get(list_images).delete(delete_resource),

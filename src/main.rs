@@ -6,12 +6,13 @@ mod images;
 mod observability;
 mod rate_limit;
 mod router;
+mod server;
 mod state;
 
 use config::AppConfig;
 use state::AppState;
 
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, time::Duration};
 
 use tokio::net::TcpListener;
 
@@ -27,8 +28,7 @@ use tokio::net::TcpListener;
 /// - Starting the HTTP server.
 ///
 /// Business logic should not be added to this file.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -40,21 +40,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = AppConfig::from_env()?;
-
     let state = AppState::from_config(&config)?;
-
+    let lifecycle = state.lifecycle.clone();
     let app = router::build_router(state);
+    let bind_address = config.bind_address.clone();
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_seconds);
 
-    let listener = TcpListener::bind(&config.bind_address).await?;
-
-    tracing::info!(address = %config.bind_address, "image service listening");
-    tracing::info!(backend = %config.storage.scheme, "image storage configured");
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async move {
+        let listener = TcpListener::bind(&bind_address).await?;
+        lifecycle.set_ready(true);
+        tracing::info!(address = %bind_address, "image service listening");
+        tracing::info!(backend = %config.storage.scheme, "image storage configured");
+        server::serve(listener, app, lifecycle, shutdown_timeout).await
+    });
+    runtime.shutdown_timeout(Duration::ZERO);
+    if let Err(error) = &result {
+        tracing::error!(error = %error, "image service stopped with an error");
+    }
+    result?;
 
     Ok(())
 }

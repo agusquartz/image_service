@@ -141,7 +141,7 @@ pub async fn observe_request(
     let started = Instant::now();
     let rate_class = classify_request(&method, &path);
 
-    let response = if path == "/health" {
+    let response = if path == "/health" || path.starts_with("/health/") {
         next.run(request).await
     } else {
         let identity = client_identity(&request, state.api_key.as_deref());
@@ -184,7 +184,7 @@ fn classify_request(method: &Method, path: &str) -> RateClass {
 
 fn route_label(method: &Method, path: &str) -> &'static str {
     match path {
-        "/health" => return "health",
+        "/health" | "/health/live" | "/health/ready" => return "health",
         "/metrics" => return "metrics",
         _ => {}
     }

@@ -11,7 +11,13 @@ use crate::{
 
 use opendal::Operator;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -21,8 +27,25 @@ pub(crate) struct UploadAdmission {
     _body_budget: OwnedSemaphorePermit,
 }
 
+#[derive(Clone, Default)]
+pub struct ServiceLifecycle {
+    ready: Arc<AtomicBool>,
+}
+
+impl ServiceLifecycle {
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
+    pub lifecycle: ServiceLifecycle,
+
     /// Backend-independent image repository.
     pub store: ImageStore,
 
@@ -78,6 +101,8 @@ impl AppState {
         let operator = Operator::via_iter(&config.storage.scheme, config.storage.options.clone())?;
 
         Ok(Self {
+            lifecycle: ServiceLifecycle::default(),
+
             store: ImageStore::new(operator),
 
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
@@ -173,6 +198,18 @@ fn reserve_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_readiness_can_be_changed_across_clones() {
+        let lifecycle = ServiceLifecycle::default();
+        let server_lifecycle = lifecycle.clone();
+
+        assert!(!lifecycle.is_ready());
+        server_lifecycle.set_ready(true);
+        assert!(lifecycle.is_ready());
+        lifecycle.set_ready(false);
+        assert!(!server_lifecycle.is_ready());
+    }
 
     #[test]
     fn admission_releases_count_after_capacity_rejection() {
