@@ -88,11 +88,12 @@ done
 curl --fail --silent "$service_url/health" >/dev/null || fail "Image Service did not become healthy"
 
 image_route="$service_url/api/images/minio-smoke/1/1"
+printf 'not an image' >"$tmp_dir/not-image.bin"
 status="$(curl --silent --output "$tmp_dir/upload.json" --write-out '%{http_code}' \
     --form "image=@$image_file" "$image_route")"
 [[ "$status" == 201 ]] || fail "MinIO-backed POST returned HTTP $status: $(cat "$tmp_dir/upload.json")"
 status="$(curl --silent --output "$tmp_dir/conflict.json" --write-out '%{http_code}' \
-    --form "image=@$image_file" "$image_route")"
+    --form "image=@$tmp_dir/not-image.bin" "$image_route")"
 [[ "$status" == 409 ]] || fail "MinIO-backed duplicate POST returned HTTP $status"
 status="$(curl --silent --output "$tmp_dir/put.json" --write-out '%{http_code}' \
     --request PUT --form "image=@$image_file" "$image_route")"
@@ -265,5 +266,50 @@ with open(sys.argv[1], encoding="utf-8") as response_file:
 assert listing["images"] == [], listing
 PY
 
-echo "PASS: MinIO S3-compatible POST/PUT limits, replacement, GET/HEAD, conditional GET, metadata, listing, namespace profile, presigned GET, and slot/resource DELETE"
+# Hold uploads open long enough for DELETE to invalidate their generation.
+# The DELETE response must not be followed by a stale upload publishing again.
+slot_race_route="$service_url/api/images/minio-smoke/concurrent-slot/1"
+curl --silent --output "$tmp_dir/slot-race-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$slot_race_route" \
+    >"$tmp_dir/slot-race-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "slot-race upload finished before DELETE"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request DELETE "$slot_race_route")"
+[[ "$status" == 204 ]] || fail "MinIO slot DELETE during upload returned HTTP $status"
+wait "$upload_pid" || true
+status="$(cat "$tmp_dir/slot-race-upload.status")"
+[[ "$status" == 409 ]] || fail "pre-delete MinIO upload returned HTTP $status instead of 409"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$slot_race_route")"
+[[ "$status" == 404 ]] || fail "pre-delete MinIO upload recreated the slot (HTTP $status)"
+
+resource_race_route="$service_url/api/images/minio-smoke/concurrent-resource"
+curl --silent --output "$tmp_dir/resource-race-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$resource_race_route/1" \
+    >"$tmp_dir/resource-race-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "resource-race upload finished before DELETE"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request DELETE "$resource_race_route")"
+[[ "$status" == 204 ]] || fail "MinIO resource DELETE during upload returned HTTP $status"
+wait "$upload_pid" || true
+status="$(cat "$tmp_dir/resource-race-upload.status")"
+[[ "$status" == 409 ]] || fail "pre-delete MinIO resource upload returned HTTP $status instead of 409"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$resource_race_route/1")"
+[[ "$status" == 404 ]] || fail "pre-delete MinIO upload recreated resource content (HTTP $status)"
+
+cancel_route="$service_url/api/images/minio-smoke/cancelled-upload/1"
+curl --silent --output "$tmp_dir/cancelled-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$cancel_route" \
+    >"$tmp_dir/cancelled-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "cancel-test upload finished before client cancellation"
+kill "$upload_pid" 2>/dev/null || true
+wait "$upload_pid" 2>/dev/null || true
+sleep 0.2
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$cancel_route")"
+[[ "$status" == 404 ]] || fail "cancelled MinIO upload stored an incomplete object (HTTP $status)"
+
+echo "PASS: MinIO S3-compatible upload preflight, replacement, GET/HEAD, conditional GET, metadata, listing, profiles, presigned GET, DELETE races, cancellation, and resource DELETE"
 echo "Both containers used ephemeral storage; all test data was removed during cleanup."

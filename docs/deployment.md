@@ -185,6 +185,8 @@ bash scripts/verify_phase1_phase2.sh ./TEST_IMAGE_ORIGINAL.png
 
 The combined script builds the Distroless service image, runs the filesystem smoke test, pulls the MinIO-compatible test image if needed, and runs the S3-compatible smoke test. Both test backends use volatile storage and clean up their containers. Set `MINIO_IMAGE` to use a different MinIO-compatible image and `IMAGE_SERVICE_IMAGE` to choose the service image tag. The individual scripts can also be run separately.
 
+Both smoke scripts also send invalid bytes to an occupied POST slot to verify the early `409 Conflict` (resource already exists) preflight, issue slot/resource DELETE while a rate-limited upload is still in progress, and cancel a separate upload. They verify that stale uploads return `409 Conflict` and cannot recreate deleted content, and that a cancelled upload leaves no stored object.
+
 ## Versioned Releases
 
 The current `main` baseline declares version `0.1.0` in `Cargo.toml`. The initial `v0.1.0` release is created by manually running the **Release** GitHub Actions workflow on `main`; it attaches a Linux `amd64` executable and its SHA-256 checksum.

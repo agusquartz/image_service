@@ -77,6 +77,8 @@ The source byte limit is counted from received multipart chunks, including when 
 
 `POST` creates an image only when that slot is empty and returns `201 Created`. If the slot already contains an image, it returns `409 Conflict` and leaves the stored image unchanged. `PUT` creates a missing image with `201 Created` or replaces an existing image with `200 OK`; use it when replacing a slot. A successful upload stays within the configured output byte limit. The service can return `422 Unprocessable Entity` only if the configured byte limit is too small even for a 1×1 WebP image.
 
+For a slot already known to exist, `POST` checks for the conflict before reading and processing the multipart image. A final conditional storage write still protects against two concurrent create requests. Operations on one resource are coordinated within this service process: successful uploads publish in storage order, and a later successful `PUT` replaces the prior value. A slot `DELETE` invalidates uploads that began for that slot before the delete; a resource `DELETE` invalidates uploads that began for any slot in that resource. Those superseded uploads return `409 Conflict` and cannot recreate the deleted image after the delete response. Requests that begin after the delete can create or replace images normally. Coordination is in-memory and per process; it is not a durable job log or cross-replica lock.
+
 There is no `PATCH` upload method because uploads contain the complete image file; this API has no partial image representation to patch.
 
 The service validates the route parameters, reads the multipart image, verifies the source format, processes the image, and stores the resulting WebP in the requested slot.

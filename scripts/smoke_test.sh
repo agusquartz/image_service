@@ -253,8 +253,9 @@ PY
         --request POST --form "image=@$image_file" "$image_route"
     expect_status 201 "$tmp_dir/upload" \
         --request POST --form "image=@$upload_file" -H "Authorization: Bearer $api_key" "$image_route"
+    printf 'not an image' >"$tmp_dir/not-image.bin"
     expect_status 409 "$tmp_dir/conflicting-upload" \
-        --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
+        --request POST --form "image=@$tmp_dir/not-image.bin" -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 200 "$tmp_dir/put-upload" \
         --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$image_route"
     expect_status 201 "$tmp_dir/put-create" \
@@ -654,8 +655,49 @@ expect_status 201 "$tmp_dir/no-auth-write" \
     --request POST --form "image=@$image_file" "$base_url/api/images/products/no-auth/1"
 expect_status 200 "$tmp_dir/no-auth-read" "$base_url/api/images/products/no-auth/1"
 expect_status 404 "$tmp_dir/no-auth-metrics-disabled" "$base_url/metrics"
+
+slot_race_route="$base_url/api/images/products/concurrent-slot/1"
+curl --silent --output "$tmp_dir/slot-race-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$slot_race_route" \
+    >"$tmp_dir/slot-race-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "LocalFS slot-race upload finished before DELETE"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request DELETE "$slot_race_route")"
+[[ "$status" == 204 ]] || fail "LocalFS slot DELETE during upload returned HTTP $status"
+wait "$upload_pid" || true
+status="$(cat "$tmp_dir/slot-race-upload.status")"
+[[ "$status" == 409 ]] || fail "pre-delete LocalFS upload returned HTTP $status instead of 409"
+expect_status 404 "$tmp_dir/slot-race-get" "$slot_race_route"
+
+resource_race_route="$base_url/api/images/products/concurrent-resource"
+curl --silent --output "$tmp_dir/resource-race-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$resource_race_route/1" \
+    >"$tmp_dir/resource-race-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "LocalFS resource-race upload finished before DELETE"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request DELETE "$resource_race_route")"
+[[ "$status" == 204 ]] || fail "LocalFS resource DELETE during upload returned HTTP $status"
+wait "$upload_pid" || true
+status="$(cat "$tmp_dir/resource-race-upload.status")"
+[[ "$status" == 409 ]] || fail "pre-delete LocalFS resource upload returned HTTP $status instead of 409"
+expect_status 404 "$tmp_dir/resource-race-get" "$resource_race_route/1"
+
+cancel_route="$base_url/api/images/products/cancelled-upload/1"
+curl --silent --output "$tmp_dir/cancelled-upload.json" --write-out '%{http_code}' \
+    --limit-rate 512k --form "image=@$image_file" "$cancel_route" \
+    >"$tmp_dir/cancelled-upload.status" &
+upload_pid=$!
+sleep 0.5
+kill -0 "$upload_pid" 2>/dev/null || fail "LocalFS cancel-test upload finished before client cancellation"
+kill "$upload_pid" 2>/dev/null || true
+wait "$upload_pid" 2>/dev/null || true
+sleep 0.2
+expect_status 404 "$tmp_dir/cancelled-upload-get" "$cancel_route"
+
 stop_service
-echo "PASS: explicitly unprotected read/write mode works without an API key"
+echo "PASS: explicitly unprotected mode and LocalFS slot/resource DELETE races and cancellation"
 
 start_service rate-limit
 local_rate_route="$base_url/api/images/products/rate-limit"

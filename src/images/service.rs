@@ -14,7 +14,7 @@ use super::{
     dtos::{ImageInfoResponse, ImageListResponse, ImageSummary, PresignResponse, UploadResponse},
     model::{ImageKey, IncomingImage},
     reduction::reduce_to_webp,
-    store::StoredMetadata,
+    store::{ImageOperationToken, StoredMetadata},
 };
 
 pub(crate) struct ImageDelivery {
@@ -35,6 +35,7 @@ pub(crate) async fn upload(
     incoming: IncomingImage,
     replace_existing: bool,
     admission: UploadAdmission,
+    operation: ImageOperationToken,
 ) -> Result<(UploadResponse, bool), ApiError> {
     let policy = state.processing_policy_for(&key.namespace);
     let webp = reduce_to_webp(
@@ -51,12 +52,12 @@ pub(crate) async fn upload(
     let was_created = if replace_existing {
         state
             .store
-            .write(key, webp.clone(), state.max_slots)
+            .write_with_token(key, webp.clone(), state.max_slots, &operation)
             .await?
     } else {
         state
             .store
-            .create(key, webp.clone(), state.max_slots)
+            .create_with_token(key, webp.clone(), state.max_slots, &operation)
             .await?;
         true
     };

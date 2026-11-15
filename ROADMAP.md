@@ -234,6 +234,8 @@ DELETE /api/images/{namespace}/{resource_id}
 
 The operation uses the OpenDAL-backed `ImageStore`, follows `IMAGE_WRITE_AUTH` (required by default), and returns `204 No Content` for both existing and missing slots.
 
+POST, PUT, slot DELETE, and resource DELETE are coordinated per resource inside one service process. Uploads capture resource and slot generations before reading the body; a later delete invalidates an earlier upload so it cannot recreate deleted content after the delete completes. A known duplicate POST is rejected before image parsing, while a final conditional storage write still handles races between concurrent POST requests. Concurrent successful PUTs are ordered by storage publication; the last successful commit determines the stored image. This coordination is in memory, so it does not persist or recover jobs after a restart and does not coordinate separate replicas.
+
 ### Resource Listing and HEAD
 
 Implemented APIs:
