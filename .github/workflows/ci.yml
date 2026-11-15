@@ -35,8 +35,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check supported feature builds
+        run: |
+          cargo check -p image_service --no-default-features --locked
+          cargo check -p image_service --no-default-features --features ipc --locked
+          cargo check -p image_service --no-default-features --features images --locked
+          cargo check -p image_service --no-default-features --features all --locked
+
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-features --locked

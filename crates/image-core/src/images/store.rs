@@ -67,15 +67,6 @@ impl ImageStore {
         }
     }
 
-    /// Checks whether the configured storage backend can currently serve
-    /// operations. OpenDAL performs a bounded list probe at the storage root.
-    pub async fn check(&self) -> Result<(), ApiError> {
-        self.operator
-            .check()
-            .await
-            .map_err(|error| ApiError::Storage(error.to_string()))
-    }
-
     fn operation_lock_for_resource(
         &self,
         namespace: &str,

@@ -4,8 +4,11 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY crates ./crates
 
-RUN cargo build --release --locked
+ARG IMAGE_SERVICE_FEATURES=images
+RUN cargo build --release --locked --package image_service \
+    --no-default-features --features "${IMAGE_SERVICE_FEATURES}"
 
 # Export a platform-specific Linux executable for GitHub release assets.
 FROM scratch AS binary

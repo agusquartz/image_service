@@ -1,59 +1,28 @@
-use crate::{
-    config::{MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION},
-    error::ApiError,
-    state::UploadAdmission,
-};
-
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, imageops::FilterType};
-
-use std::{io::Cursor, sync::Arc, time::Instant};
-
-use tokio::sync::Semaphore;
-
+use processor_contract::{
+    Capability, MAX_DECODE_ALLOC, MAX_IMAGE_DIMENSION, ProcessingError, ProcessingOutput,
+    ProcessingRequest, Processor,
+};
+use std::{io::Cursor, time::Instant};
 use webp::Encoder;
 
-use super::model::IncomingImage;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageProcessor;
 
-/// Converts an incoming image into a WebP image that satisfies the
-/// configured output size limit.
-///
-/// Image decoding and compression are CPU-intensive operations.
-/// Therefore:
-///
-/// 1. A semaphore limits the number of concurrent jobs.
-/// 2. Processing is moved to Tokio's blocking thread pool.
-/// 3. The async runtime remains available for HTTP and filesystem I/O.
-pub(crate) async fn reduce_to_webp(
-    semaphore: Arc<Semaphore>,
-    incoming: IncomingImage,
-    admission: UploadAdmission,
-    max_output_bytes: usize,
-    output_width: u32,
-    output_height: u32,
-) -> Result<Vec<u8>, ApiError> {
-    let queue_started = Instant::now();
-    let permit = semaphore.acquire_owned().await.map_err(|error| {
-        ApiError::Internal(format!("Image processing semaphore closed: {error}"))
-    })?;
-    let queue_wait_us = queue_started.elapsed().as_micros() as u64;
+impl Processor for ImageProcessor {
+    fn capability(&self) -> Capability {
+        Capability::Image
+    }
 
-    tokio::task::spawn_blocking(move || {
-        // Keep the permit alive for the complete duration of the
-        // blocking image-processing operation.
-        let _permit = permit;
-        let _admission = admission;
-
-        process_image_blocking(
-            &incoming.bytes,
-            incoming.mime.as_deref(),
-            max_output_bytes,
-            output_width,
-            output_height,
-            queue_wait_us,
-        )
-    })
-    .await
-    .map_err(|error| ApiError::Internal(format!("Image processing task failed: {error}")))?
+    fn process(&self, request: ProcessingRequest) -> Result<ProcessingOutput, ProcessingError> {
+        let (bytes, width, height) = process_image_blocking(request)?;
+        Ok(ProcessingOutput {
+            bytes,
+            media_type: "image/webp",
+            width,
+            height,
+        })
+    }
 }
 
 /// Performs format validation, decoding and WebP compression.
@@ -61,32 +30,27 @@ pub(crate) async fn reduce_to_webp(
 /// This function is synchronous because the image library and WebP
 /// encoder perform CPU-bound work.
 fn process_image_blocking(
-    bytes: &[u8],
-    declared_mime: Option<&str>,
-    max_output_bytes: usize,
-    output_width: u32,
-    output_height: u32,
-    queue_wait_us: u64,
-) -> Result<Vec<u8>, ApiError> {
+    request: ProcessingRequest,
+) -> Result<(Vec<u8>, u32, u32), ProcessingError> {
     let processing_started = Instant::now();
     let decode_started = Instant::now();
-    let format = image::guess_format(bytes)
-        .map_err(|_| ApiError::UnsupportedMediaType("Unknown image format".to_string()))?;
+    let format = image::guess_format(&request.source)
+        .map_err(|_| ProcessingError::UnsupportedMediaType("Unknown image format".to_string()))?;
 
     if !supported_format(format) {
-        return Err(ApiError::UnsupportedMediaType(format!(
+        return Err(ProcessingError::UnsupportedMediaType(format!(
             "Unsupported image format: {format:?}"
         )));
     }
 
-    if !declared_mime_is_acceptable(declared_mime, format) {
-        return Err(ApiError::UnsupportedMediaType(format!(
+    if !declared_mime_is_acceptable(request.declared_media_type.as_deref(), format) {
+        return Err(ProcessingError::UnsupportedMediaType(format!(
             "Declared MIME type ({}) does not match the detected image format ({format:?})",
-            declared_mime.unwrap_or_default()
+            request.declared_media_type.as_deref().unwrap_or_default()
         )));
     }
 
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut reader = ImageReader::with_format(Cursor::new(request.source.as_ref()), format);
 
     // Decode limits provide an additional defense against malformed or
     // intentionally expensive image files.
@@ -101,15 +65,15 @@ fn process_image_blocking(
     reader.limits(limits);
 
     let mut decoder = reader.into_decoder().map_err(|error| {
-        ApiError::UnprocessableEntity(format!("Could not initialize image decoder: {error}"))
+        ProcessingError::InvalidInput(format!("Could not initialize image decoder: {error}"))
     })?;
 
     let orientation = decoder.orientation().map_err(|error| {
-        ApiError::UnprocessableEntity(format!("Could not read image orientation: {error}"))
+        ProcessingError::InvalidInput(format!("Could not read image orientation: {error}"))
     })?;
 
     let mut image = DynamicImage::from_decoder(decoder).map_err(|error| {
-        ApiError::UnprocessableEntity(format!("Could not decode image: {error}"))
+        ProcessingError::InvalidInput(format!("Could not decode image: {error}"))
     })?;
 
     // Normalize the physical pixel layout before any resize or encoding
@@ -121,13 +85,18 @@ fn process_image_blocking(
 
     let decode_us = decode_started.elapsed().as_micros() as u64;
     let compression_started = Instant::now();
-    let result = compress_webp(image, max_output_bytes, output_width, output_height);
+    let result = compress_webp(
+        image,
+        request.max_output_bytes,
+        request.output_width,
+        request.output_height,
+    );
     let compression_us = compression_started.elapsed().as_micros() as u64;
 
     if tracing::enabled!(target: "image_processing_profile", tracing::Level::DEBUG) {
         tracing::debug!(
             target: "image_processing_profile",
-            queue_wait_us,
+            queue_wait_us = request.queue_wait_us,
             decode_us,
             compression_us,
             processing_us = processing_started.elapsed().as_micros() as u64,
@@ -140,7 +109,7 @@ fn process_image_blocking(
 
 /// Returns whether the detected source format is accepted by the
 /// service.
-pub(super) fn supported_format(format: ImageFormat) -> bool {
+pub fn supported_format(format: ImageFormat) -> bool {
     matches!(
         format,
         ImageFormat::Jpeg
@@ -157,10 +126,7 @@ pub(super) fn supported_format(format: ImageFormat) -> bool {
 ///
 /// This prevents clients from disguising arbitrary formats by merely
 /// changing the Content-Type header.
-pub(super) fn declared_mime_is_acceptable(
-    declared_mime: Option<&str>,
-    format: ImageFormat,
-) -> bool {
+pub fn declared_mime_is_acceptable(declared_mime: Option<&str>, format: ImageFormat) -> bool {
     let Some(declared_mime) = declared_mime else {
         return true;
     };
@@ -206,18 +172,18 @@ fn compress_webp(
     max_output_bytes: usize,
     output_width: u32,
     output_height: u32,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<(Vec<u8>, u32, u32), ProcessingError> {
     let cropped = crop_to_target_ratio(image, output_width, output_height);
     let (mut width, mut height) = (output_width, output_height);
 
     loop {
         let target = cropped.resize_exact(width, height, FilterType::Lanczos3);
         if let Some(encoded) = encode_webp_with_limit(&target, max_output_bytes, width, height) {
-            return Ok(encoded);
+            return Ok((encoded, width, height));
         }
 
         if width == 1 && height == 1 {
-            return Err(ApiError::UnprocessableEntity(format!(
+            return Err(ProcessingError::InvalidInput(format!(
                 "The configured output byte limit ({max_output_bytes}) is too small for even a 1x1 WebP image"
             )));
         }
@@ -225,7 +191,7 @@ fn compress_webp(
         let next_width = ((width as f32 * 0.8).floor() as u32).max(1);
         let next_height = ((height as f32 * 0.8).floor() as u32).max(1);
         if (next_width, next_height) == (width, height) {
-            return Err(ApiError::UnprocessableEntity(format!(
+            return Err(ProcessingError::InvalidInput(format!(
                 "The configured output byte limit ({max_output_bytes}) is too small for a WebP image"
             )));
         }
@@ -325,11 +291,12 @@ mod tests {
     #[test]
     fn encodes_at_exact_dimensions_and_within_configured_byte_limit() {
         let image = image::DynamicImage::new_rgb8(2000, 1000);
-        let output = compress_webp(image, 1024 * 1024, 1024, 1024)
+        let (output, width, height) = compress_webp(image, 1024 * 1024, 1024, 1024)
             .expect("image should fit the configured byte limit");
         let decoded = image::load_from_memory_with_format(&output, image::ImageFormat::WebP)
             .expect("output should be valid WebP");
-        assert_eq!((decoded.width(), decoded.height()), (1024, 1024));
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+        assert_eq!((width, height), (1024, 1024));
         assert!(output.len() <= 1024 * 1024);
     }
 }

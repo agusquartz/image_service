@@ -39,6 +39,7 @@ pub(crate) async fn upload(
 ) -> Result<(UploadResponse, bool), ApiError> {
     let policy = state.processing_policy_for(&key.namespace);
     let webp = reduce_to_webp(
+        state.image_processor.clone(),
         state.image_jobs.clone(),
         incoming,
         admission,

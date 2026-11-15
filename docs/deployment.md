@@ -70,6 +70,30 @@ For a release build:
 cargo build --release
 ```
 
+This builds the compatible image service using the default `images` feature.
+Feature variants are:
+
+```bash
+cargo build --release --locked --no-default-features
+cargo build --release --locked --no-default-features --features ipc
+cargo build --release --locked --no-default-features --features all
+```
+
+Builds without `images` expose health/readiness and optional metrics only. The
+`ipc` feature includes versioned worker-protocol DTOs but no worker transport or
+job dispatch yet. Use the default build for a functioning image API.
+
+The Dockerfile explicitly builds package `image_service`. Its default is
+`IMAGE_SERVICE_FEATURES=images`; use `--build-arg IMAGE_SERVICE_FEATURES=all`
+to include all implemented features, or `--build-arg IMAGE_SERVICE_FEATURES=ipc`
+to build the Core with the protocol DTOs but without image routes:
+
+```bash
+docker build --tag image-service:local .
+docker build --build-arg IMAGE_SERVICE_FEATURES=all --tag image-service:all .
+docker build --build-arg IMAGE_SERVICE_FEATURES=ipc --tag image-service:core-ipc .
+```
+
 Then run the generated binary.
 
 The default bind address is:
