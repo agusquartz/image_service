@@ -6,6 +6,7 @@ debug
 
 # Local smoke-test fixture; never commit the test image.
 TEST_IMAGE_ORIGINAL.png
+/bench/results/
 
 *.log
 .DS_Store
