@@ -2,26 +2,37 @@
 
 ## Supported Versions
 
-Image Service is currently in early development and does not yet have a stable release.
-
-Until the first supported release is published, security fixes are applied to the latest code on the `main` branch.
+Image Service has a published production-baseline release. Security fixes are
+provided for the latest stable release line and the current `main` branch.
 
 | Version | Supported |
 | --- | --- |
-| `main` | Yes |
-| Unreleased snapshots or older commits | No guarantee |
+| Latest stable release line (`v0.1.x`, currently `v0.1.0`) | Yes |
+| `main` (unreleased development) | Best effort |
+| Older release lines, snapshots, or commits | No |
 
-This policy will be updated when versioned releases are published.
+Users should upgrade to the latest stable release to receive security fixes.
+The project does not currently promise backports to older release lines. This
+table will be updated when a new stable release line is published or support
+changes.
 
 ## Reporting a Vulnerability
 
 Please **do not report security vulnerabilities through public GitHub issues, pull requests, discussions, or other public project channels**.
 
-The preferred reporting method is GitHub's private vulnerability reporting feature for this repository.
+If the repository's **Security** tab offers **Report a vulnerability**, use it
+to submit a private report visible to the maintainers.
 
-If the repository shows a **Report a vulnerability** option under its Security section, use that option to submit the report privately to the maintainers.
+If private reporting is unavailable, contact a repository maintainer through
+a private channel before sharing exploit details. Do not put exploit details,
+credentials, private URLs, sensitive images, or other confidential information
+in a public issue. The project does not publish a separate security email
+address.
 
-If private vulnerability reporting is not available, do not publish exploit details, credentials, private URLs, sensitive images, or other confidential information in a public issue. A dedicated external security-reporting address has not yet been established.
+Maintainers will acknowledge and triage reports as promptly as practical,
+coordinate remediation with the reporter, and disclose confirmed issues after
+a fix or mitigation is available. Response and remediation times are not
+guaranteed; please do not publicly disclose an unpatched vulnerability.
 
 ## What to Include
 
@@ -32,6 +43,8 @@ When a private reporting channel is available, a useful report should include:
 - Reproduction steps or a minimal proof of concept.
 - The expected security impact.
 - The version, commit, or deployment configuration tested.
+- For container deployments, the image tag and digest, target architecture,
+  and whether the image came from GHCR or a local build.
 - Any relevant logs or error messages with secrets and personal data removed.
 - Suggested mitigations, if known.
 
@@ -55,9 +68,11 @@ Normal bugs that do not have a security impact can be reported using the public 
 
 ## Disclosure
 
-Please allow maintainers a reasonable opportunity to investigate and prepare a fix before publicly disclosing vulnerability details.
-
-The project will aim to communicate clearly about confirmed vulnerabilities and remediation when a supported release process is established.
+Please allow maintainers a reasonable opportunity to investigate and prepare a
+fix before publicly disclosing vulnerability details. For confirmed issues,
+the project will communicate the affected versions, impact, mitigation, and
+fixed release through a GitHub security advisory or release notes as
+appropriate.
 
 ## Third-Party Dependencies
 
