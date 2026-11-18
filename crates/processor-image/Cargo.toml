@@ -1,11 +1,12 @@
 [package]
-name = "image-processor-image"
+name = "processor-image"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
 
 [dependencies]
+bytes = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 webp = "0.3"
 tracing = "0.1"

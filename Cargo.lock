@@ -485,6 +485,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "file-core"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dirs",
+ "httpdate",
+ "image",
+ "opendal",
+ "processor-contract",
+ "processor-image",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "worker-protocol",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -933,39 +956,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "image-core"
-version = "0.1.0"
-dependencies = [
- "axum",
- "dirs",
- "httpdate",
- "image",
- "image-processor-image",
- "image-worker-protocol",
- "opendal",
- "processor-contract",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "image-processor-image"
-version = "0.1.0"
-dependencies = [
- "image",
- "processor-contract",
- "tracing",
- "webp",
-]
-
-[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,19 +966,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "image-worker-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "image_service"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
- "image-core",
+ "file-core",
 ]
 
 [[package]]
@@ -1560,6 +1542,17 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "serde",
+]
+
+[[package]]
+name = "processor-image"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "image",
+ "processor-contract",
+ "tracing",
+ "webp",
 ]
 
 [[package]]
@@ -2893,6 +2886,14 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "writeable"

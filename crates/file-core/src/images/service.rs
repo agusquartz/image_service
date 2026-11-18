@@ -2,7 +2,6 @@ use crate::{
     error::ApiError,
     state::{AppState, UploadAdmission},
 };
-use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -48,8 +47,6 @@ pub(crate) async fn upload(
         policy.output_height,
     )
     .await?;
-    let webp = Bytes::from(webp);
-
     let was_created = if replace_existing {
         state
             .store

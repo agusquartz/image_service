@@ -1,5 +1,5 @@
 [package]
-name = "image-core"
+name = "file-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -7,8 +7,8 @@ publish = false
 
 [features]
 default = ["images"]
-images = ["dep:image", "dep:image-processor-image"]
-ipc = ["dep:image-worker-protocol"]
+images = ["dep:image", "dep:processor-image"]
+worker-protocol = ["dep:worker-protocol"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
@@ -25,8 +25,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 processor-contract = { path = "../processor-contract" }
-image-processor-image = { path = "../image-processor-image", optional = true }
-image-worker-protocol = { path = "../image-worker-protocol", optional = true }
+processor-image = { path = "../processor-image", optional = true }
+worker-protocol = { path = "../worker-protocol", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"

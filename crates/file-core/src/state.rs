@@ -127,7 +127,7 @@ impl AppState {
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
 
             #[cfg(feature = "images")]
-            image_processor: Arc::new(image_processor_image::ImageProcessor),
+            image_processor: Arc::new(processor_image::ImageProcessor),
 
             #[cfg(feature = "images")]
             upload_slots: Arc::new(Semaphore::new(config.max_uploads_in_flight)),

@@ -1,7 +1,4 @@
 use bytes::Bytes;
-
-pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
-pub const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,7 +21,7 @@ pub struct ProcessingRequest {
 
 #[derive(Clone, Debug)]
 pub struct ProcessingOutput {
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
     pub media_type: &'static str,
     pub width: u32,
     pub height: u32,

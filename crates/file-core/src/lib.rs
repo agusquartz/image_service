@@ -51,5 +51,5 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[cfg(feature = "ipc")]
-pub use image_worker_protocol as ipc_protocol;
+#[cfg(feature = "worker-protocol")]
+pub use worker_protocol as protocol;

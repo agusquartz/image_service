@@ -10,5 +10,5 @@ use std::error::Error;
 /// Business logic should not be added to this file.
 fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
-    image_core::run()
+    file_core::run()
 }
