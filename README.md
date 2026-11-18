@@ -6,7 +6,7 @@
 
 **A self-hosted, single-tenant image processing and storage service built with Rust and Axum.**
 
-Image Service accepts uploaded images, validates and decodes them with defensive limits, center-crops to the configured aspect ratio, and encodes WebP under the configured output-size limit. It uses the configured target dimensions unless further downscaling is needed to meet that byte limit.
+Image Service validates and decodes uploaded images with defensive limits, then stores WebP within the configured output-size limit. A valid static WebP that already has the target dimensions, needs no orientation transform, and fits the byte limit is preserved as-is. Other inputs are cropped, resized, or encoded only as needed; output uses the configured target dimensions unless further downscaling is needed to meet the byte limit.
 
 Storage is provided through OpenDAL. The currently compiled backends are local filesystem and S3/S3-compatible object storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so the service can evolve toward configurable processing policies and multiple storage backends.
 
@@ -36,6 +36,7 @@ config:
   flowchart:
     rankSpacing: 60
     nodeSpacing: 45
+    minNodeWidth: 210
     curve: basis
 
   themeCSS: |
@@ -58,7 +59,11 @@ config:
 
     .node .label p {
       padding: 4.5px 9px;
+      width: 210px !important;
+      min-width: 210px !important;
+      box-sizing: border-box;
       margin: 0;
+      text-align: center;
     }
 
     .edgeLabel {
@@ -98,12 +103,26 @@ config:
       stroke: rgba(249,249,247,0.50);
     }
 ---
-flowchart TD
-    A[Application] -->|HTTP| B[Image Service]
-    B -->|"Validation<br/>↓<br/>Processing<br/>↓<br/>Storage"| C[Optimized image]
+flowchart TB
+    CLIENT[HTTP clients<br/>ERP, web apps, SDKs, services]
+    CORE[FILE CORE<br/>Axum, AuthN/AuthZ, OpenDAL<br/>configuration, request admission]
+    INPROC[InProcess path<br/>direct call through the Processor contract]
+    REMOTE[Remote / IPC path<br/>protocol DTOs exist, transport not implemented]
+    LOCAL_PROCESSORS[InProcess processors<br/>Image: implemented<br/>Video: not implemented yet]
+    WORKER_IMAGE[worker-image<br/>not implemented yet]
+    WORKER_VIDEO[worker-video<br/>not implemented yet]
+    OTHER_WORKERS[Other workers<br/>document/blob and other capabilities<br/>not implemented yet]
+
+    CLIENT -->|HTTP| CORE
+    CORE --> INPROC
+    CORE -. future worker dispatch .-> REMOTE
+    INPROC --> LOCAL_PROCESSORS
+    REMOTE -. future transport .-> WORKER_IMAGE
+    REMOTE -. future transport .-> WORKER_VIDEO
+    REMOTE -. future transport .-> OTHER_WORKERS
 ```
 
-This keeps image-specific infrastructure outside the consuming application while leaving room for future storage and processing capabilities.
+The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. Dashed paths are future work. The remote path, worker processes, and video processing are not implemented; `worker-protocol` currently provides versioned DTOs only. The current Core has no worker registry or job scheduler.
 
 ## Deployment Model and Production Use
 
@@ -131,6 +150,7 @@ The version currently on `main` is used in production by two companies running a
 - Configurable target output dimensions (1024×1024 by default, center-cropped without distortion; further downscaled only if needed to meet the byte limit).
 - Optional named WebP processing profiles assigned by namespace; profiles override only explicitly configured input/output limits or dimensions and inherit the existing global settings for the rest.
 - Lossy WebP quality search from the same resampled pixels to meet the maximum output byte limit.
+- Valid WebP inputs that already meet the configured dimensions and byte limit pass through without lossy re-encoding.
 - Decoder width, height, and allocation limits.
 - Limited concurrent image-processing jobs.
 - Resource-based image organization.
@@ -163,11 +183,11 @@ The default `images` feature preserves the complete HTTP API and is the supporte
 ```bash
 cargo build --release --locked
 cargo build --release --locked --no-default-features
-cargo build --release --locked --no-default-features --features ipc
+cargo build --release --locked --no-default-features --features worker-protocol
 cargo build --release --locked --no-default-features --features all
 ```
 
-The no-image builds expose health/readiness and optional metrics only; image routes and local image processing are excluded. The `ipc` feature currently includes versioned worker-protocol data types, but does not yet connect to or dispatch jobs to workers. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
+The no-image builds expose health/readiness and optional metrics only; image routes and local image processing are excluded. The `worker-protocol` feature currently includes versioned worker/job data types, but does not yet provide worker transport or dispatch. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
 
 ## API Overview
 
@@ -240,6 +260,8 @@ config:
 
     .node .label p {
       padding: 4.5px 9px;
+      min-width: 210px;
+      box-sizing: border-box;
       margin: 0;
     }
 
@@ -280,10 +302,36 @@ config:
       stroke: rgba(249,249,247,0.50);
     }
 ---
-flowchart TD
-    HTTP --> Handlers --> Service
-    Service --> ImageProcessing[Image processing] --> Storage
+flowchart TB
+    CLIENT[HTTP clients<br/>ERP, web apps, SDKs, and other services]
+    BINARY[image_service executable]
+    CORE[file-core<br/>Axum API, authentication, request admission<br/>image use cases, storage coordination]
+    CONTRACT[processor-contract<br/>In-process processor interface]
+    IMAGE[processor-image<br/>Decode, validate, and optimize WebP]
+    STORAGE[OpenDAL<br/>Backend-independent storage]
+    LOCAL[Local filesystem]
+    S3[S3-compatible object storage]
+    PROTOCOL[worker-protocol<br/>Versioned job and storage DTOs only]
+
+    subgraph FUTURE["Future extension — not implemented"]
+        SCHEDULER[Worker registry and job scheduling]
+        REMOTE[Remote transport<br/>UDS or gRPC]
+        WORKERS[Remote workers<br/>Image, video, document, and blob capabilities]
+        SCHEDULER --> REMOTE --> WORKERS
+    end
+
+    CLIENT -->|HTTP| BINARY --> CORE
+    CORE --> CONTRACT -->|In process| IMAGE
+    IMAGE -->|Processed result| CORE
+    CORE --> STORAGE
+    STORAGE --> LOCAL
+    STORAGE --> S3
+    CORE -. "optional Cargo feature: DTOs only" .-> PROTOCOL
+    CORE -. "future dispatch" .-> SCHEDULER
+    PROTOCOL -. "future transport may use these types" .-> REMOTE
 ```
+
+The solid paths show the current implementation. The dashed paths are planned: there is no worker registry, job scheduler, remote transport, or remote worker runtime yet. The `worker-protocol` crate currently provides versioned data types only.
 
 The core rule is simple:
 
