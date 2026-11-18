@@ -8,7 +8,9 @@ COPY crates ./crates
 
 ARG IMAGE_SERVICE_FEATURES=images
 RUN cargo build --release --locked --package image_service \
-    --no-default-features --features "${IMAGE_SERVICE_FEATURES}"
+    --no-default-features --features "${IMAGE_SERVICE_FEATURES}" \
+    && mkdir -p /var/lib/image-service \
+    && chown 65532:65532 /var/lib/image-service
 
 # Export a platform-specific Linux executable for GitHub release assets.
 FROM scratch AS binary
@@ -25,6 +27,11 @@ LABEL org.opencontainers.image.source="https://github.com/agusquartz/image_servi
       org.opencontainers.image.version="${BUILD_VERSION}"
 
 COPY --from=builder /app/target/release/image_service /image_service
+COPY --from=builder --chown=65532:65532 /var/lib/image-service /var/lib/image-service
+
+ENV IMAGE_JOB_DB_PATH=/var/lib/image-service/jobs.sqlite3
+
+VOLUME ["/var/lib/image-service"]
 
 EXPOSE 3000
 
