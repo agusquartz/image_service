@@ -59,12 +59,14 @@ default (`images`)                 compatible image service
 
 The `worker-protocol` crate defines versioned registration, job, result, and
 `StorageRef` data types for image, video, document, and blob capabilities. The
-`job-scheduler` crate now provides a durable SQLite/WAL catalog and bounded
-in-process dispatcher for internal jobs. No inventory, audit, or repair job
-handlers are registered yet. Unix socket connections, worker registration,
-remote dispatch, and worker failover remain future work. A no-image build can
-run the generic catalog, but image jobs require an image handler or later remote
-worker dispatch.
+`job-scheduler` crate provides a durable SQLite/WAL catalog and bounded
+in-process dispatcher. When storage usage reporting is enabled, `file-core`
+registers a periodic idle-time inventory job. A separate SQLite catalog keeps
+the last completed snapshot of valid image slots and their byte sizes; a failed
+or interrupted scan does not replace that snapshot. Image policy audits,
+repairs, Unix socket connections, worker registration, remote dispatch, and
+worker failover remain future work. A no-image build can run the generic job
+catalog, but cannot register the image inventory handler.
 
 ### Current Runtime and Planned Worker Boundary
 
@@ -81,11 +83,19 @@ payload, policy snapshot, dependencies, lease, retry, progress, and result state
 in SQLite/WAL. Due schedules materialize idempotent jobs; the in-memory
 dispatcher claims only a bounded number and recovers expired leases after
 restart. Background work waits for a quiet HTTP period and can also be
-restricted to a daily UTC window. The service currently has no registered
-system-job producers or handlers, so this infrastructure does not yet
-enumerate storage or audit and rewrite images. UDS/gRPC worker registration and
-remote dispatch are also not implemented. Existing image requests continue
-through the in-process processor.
+restricted to a daily UTC window. With `IMAGE_STORAGE_USAGE_ENABLED=true`, the
+service adds a recurring storage inventory producer and an OpenDAL-backed
+handler. It streams object listings, stores batches in a separate SQLite
+catalog, and promotes a completed scan only after the full listing succeeds.
+Usage queries read only this catalog and never list the backend on the request
+path. External storage edits become visible after reconciliation; image policy
+audit and repair jobs are not implemented. UDS/gRPC worker registration and
+remote dispatch are also future work. Existing image requests continue through
+the in-process processor.
+
+See [Background Jobs](jobs.md) for the current registered work, scheduling
+gates, persistence and recovery behavior, and guidance for adding internal
+handlers.
 
 ---
 

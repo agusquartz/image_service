@@ -40,6 +40,7 @@ HTTP HEAD                      yes
 HTTP resource listing          yes
 HTTP image deletion            yes
 HTTP image information         yes
+Storage usage reporting        yes (opt-in; persistent inventory and authenticated aggregate queries)
 Presigned read URLs            yes (backend capability required)
 Cache validators               yes
 Upload methods                 POST (create-only), PUT (create or replace)
@@ -59,7 +60,7 @@ Read/write rate limits        yes (per socket IP, configurable fixed windows)
 Observability                 yes (JSON tracing logs, request IDs, optional Prometheus metrics)
 
 Delete endpoint                yes
-Database                       no
+Operational SQLite catalogs    yes (durable jobs; opt-in storage inventory)
 Processing profiles            yes (optional namespace-specific WebP settings)
 Runtime processing policy      yes (profiles override input/output byte limits and dimensions; omitted fields inherit global settings and built-in defaults)
 Cargo workspace                yes (Core, processor contract, image processor, and versioned worker protocol crates; default image build remains compatible)
@@ -115,9 +116,22 @@ Read and write access are independently controlled by `IMAGE_READ_AUTH` and `IMA
 
 Separate in-process read/write fixed-window rate limits default to 600 and 60 requests per socket IP per 60 seconds. Excess requests receive `429` and `Retry-After`; setting a limit to `0` disables that class. The service emits structured JSON logs through `tracing` to stdout, adds a generated `X-Request-ID` header, and can expose bounded Prometheus HTTP metrics at `/metrics`.
 
+## Implemented: Storage Usage Reporting
+
+When `IMAGE_STORAGE_USAGE_ENABLED=true`, the in-process durable scheduler runs
+periodic OpenDAL inventory scans during configured idle periods and exposes
+authenticated aggregate queries for all valid image WebP slots, optionally
+filtered to a namespace, resource, or slot. A separate SQLite/WAL catalog
+serves queries without listing the storage backend per request. Scans are
+batched and only a fully completed scan replaces the previous snapshot;
+failures leave the prior snapshot queryable. The API reports scan status and
+freshness because direct external changes to LocalFS or S3 become visible on
+the next successful reconciliation. This is not a Prometheus metric and does
+not add namespace or resource labels to `/metrics`. See [HTTP API](docs/api.md#storage-usage-reporting) and [configuration](docs/configuration.md#storage-usage-catalog).
+
 ## Future Features
 
-This section lists only work that is not implemented. Existing namespace processing profiles, cache validators, HTTP metrics, authentication, resource operations, and storage backends are documented under Current Capabilities and the implemented sections above.
+This section lists only work that is not implemented. Existing namespace processing profiles, storage usage inventory, cache validators, HTTP metrics, authentication, resource operations, and storage backends are documented under Current Capabilities and the implemented sections above.
 
 The items below describe planned architectural directions rather than functionality that should be assumed to exist today.
 
@@ -403,7 +417,6 @@ Future observability work may add:
 - Input/output byte and compression-ratio metrics.
 - Resize/encoding attempts and processing failures.
 - Storage operation duration, failures, and backend labels.
-- An authenticated storage-usage reporting API for total bytes/object count and scoped namespace/resource/slot totals. This is an inventory/query capability, distinct from Prometheus time-series metrics; large stores may need cached or persisted accounting rather than a full object listing per request.
 - OpenTelemetry exporters and distributed tracing.
 
 Future metrics should avoid namespace/resource labels by default, to prevent high-cardinality series and avoid exposing customer identifiers.
@@ -434,13 +447,14 @@ daily UTC time window. SQLite is the source of truth; memory only holds the
 bounded set of claimed jobs. The database path must be backed by persistent
 storage in deployments.
 
-This branch adds the scheduler foundation only. It does not yet register
-inventory, audit, or repair handlers, so no maintenance scan or image rewrite
-runs yet. User-facing POST and PUT remain synchronous. `worker-protocol`
-contains versioned DTOs; UDS/gRPC connections, remote worker registration,
-dispatch and failover remain future work. A no-image build can store generic
-jobs, but needs a matching handler or a later remote worker before it can
-execute image jobs.
+When storage usage reporting is enabled, the service registers a recurring
+inventory job that scans valid image WebP slots through OpenDAL and updates a
+persistent SQLite catalog. Authenticated aggregate queries read the latest
+completed snapshot without listing storage on the HTTP request path. Failed or
+interrupted scans do not replace the last complete snapshot. User-facing POST
+and PUT remain synchronous. Policy audit and repair jobs, `worker-protocol`
+dispatch, UDS/gRPC connections, remote worker registration, and failover remain
+future work.
 
 Future work can use this scheduler for mandatory internal jobs:
 

@@ -172,6 +172,15 @@ pub struct AppConfig {
     /// Retention for completed internal jobs and their event history.
     pub job_retention_days: u64,
 
+    /// Whether to expose authenticated storage usage and run inventory scans.
+    pub storage_usage_enabled: bool,
+
+    /// Persistent catalog containing the latest completed storage inventory.
+    pub storage_catalog_path: PathBuf,
+
+    /// Interval between full storage inventory reconciliations.
+    pub storage_inventory_interval_seconds: u64,
+
     /// Maximum uploaded image payload size, in bytes.
     pub max_source_bytes: usize,
 
@@ -405,6 +414,31 @@ impl AppConfig {
         let background_idle_seconds =
             parse_bounded_u64("IMAGE_BACKGROUND_IDLE_SECONDS", 30, 0, 86_400)?;
         let job_retention_days = parse_bounded_u64("IMAGE_JOB_RETENTION_DAYS", 30, 1, 3650)?;
+        let storage_usage_enabled = parse_bool_env("IMAGE_STORAGE_USAGE_ENABLED", false)?;
+        let storage_catalog_path = match env::var("IMAGE_STORAGE_CATALOG_DB_PATH") {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IMAGE_STORAGE_CATALOG_DB_PATH cannot be empty",
+                ));
+            }
+            Err(env::VarError::NotPresent) => {
+                job_database_path.with_file_name("storage-catalog.sqlite3")
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Could not read IMAGE_STORAGE_CATALOG_DB_PATH: {error}"),
+                ));
+            }
+        };
+        let storage_inventory_interval_seconds = parse_bounded_u64(
+            "IMAGE_STORAGE_INVENTORY_INTERVAL_SECONDS",
+            3600,
+            60,
+            31 * 24 * 60 * 60,
+        )?;
         let background_window_utc = env::var("IMAGE_BACKGROUND_WINDOW_UTC")
             .ok()
             .map(|window| window.trim().to_string())
@@ -440,6 +474,8 @@ impl AppConfig {
                 "IMAGE_API_KEY is required when IMAGE_READ_AUTH or IMAGE_WRITE_AUTH is 'required'",
             ));
         }
+
+        validate_storage_usage_auth(storage_usage_enabled, api_key.as_deref())?;
 
         let rate_limit = RateLimitConfig {
             read_requests: parse_bounded_u32(
@@ -547,6 +583,9 @@ impl AppConfig {
             background_idle_seconds,
             background_window_utc,
             job_retention_days,
+            storage_usage_enabled,
+            storage_catalog_path,
+            storage_inventory_interval_seconds,
             max_source_bytes,
             max_output_bytes,
             output_width,
@@ -815,6 +854,16 @@ fn validate_metrics_auth(
     Ok(())
 }
 
+fn validate_storage_usage_auth(enabled: bool, api_key: Option<&str>) -> io::Result<()> {
+    if enabled && api_key.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IMAGE_API_KEY is required when IMAGE_STORAGE_USAGE_ENABLED=true",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,6 +908,13 @@ mod tests {
         assert!(validate_metrics_auth(false, true, None).is_ok());
         assert!(validate_metrics_auth(true, false, None).is_ok());
         assert!(validate_metrics_auth(true, true, Some("secret")).is_ok());
+    }
+
+    #[test]
+    fn storage_usage_requires_a_key_only_when_enabled() {
+        assert!(validate_storage_usage_auth(false, None).is_ok());
+        assert!(validate_storage_usage_auth(true, None).is_err());
+        assert!(validate_storage_usage_auth(true, Some("secret")).is_ok());
     }
 
     #[test]

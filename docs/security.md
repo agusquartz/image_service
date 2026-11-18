@@ -66,6 +66,15 @@ The intended deployment is one service instance per customer. Authentication key
 
 The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
+Storage usage reporting is opt-in through `IMAGE_STORAGE_USAGE_ENABLED`. When
+enabled, `GET /api/storage/usage` and `POST /api/storage/reconcile` always
+require `IMAGE_API_KEY`, even if image reads are public. The endpoints return
+`Cache-Control: no-store`; the aggregate storage totals are operational data,
+not public image metadata. Enabling reporting without a key prevents startup.
+The SQLite inventory database contains object keys, namespace/resource/slot
+identifiers, sizes, and available storage validators, so protect and back up
+its volume with the same care as the durable job database.
+
 ## Rate Limiting and Observability
 
 Read and write requests have separate fixed-window budgets per socket peer IP. Defaults are 600 reads and 60 writes per 60 seconds. Set the corresponding request count to `0` to disable that budget. The bearer key is not the limiter identity; requests with or without a key from the same source IP share the budget. Health routes bypass the limiter. This is not a per-person quota: CGNAT, corporate NAT, reverse proxies, and CDNs may make many legitimate users share one IP and can cause collective `429` responses. The service does not trust caller-supplied `X-Forwarded-For` or `Forwarded`; behind an intermediary, it sees the intermediary's address. Avoid low limits for shared public traffic, size them for the aggregate traffic, or enforce fairness at a trusted edge. Disabling the application limit with `0` removes that layer of protection. Counters are in-memory and per process, so replicas do not share them.

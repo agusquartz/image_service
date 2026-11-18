@@ -22,6 +22,9 @@ POST /api/images/{namespace}/{resource_id}/{slot}/presign
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}
 DELETE /api/images/{namespace}/{resource_id}
+
+GET  /api/storage/usage
+POST /api/storage/reconcile
 ```
 
 Example image identifier:
@@ -51,6 +54,40 @@ With the filesystem backend, this resolves to:
 ```
 
 With S3 storage, `products/845/02.webp` is used as the object key.
+
+## Storage Usage Reporting
+
+Storage usage reporting is opt-in. Set `IMAGE_STORAGE_USAGE_ENABLED=true` to
+enable the inventory job and routes. The endpoints always require
+`Authorization: Bearer <IMAGE_API_KEY>`, even when image reads are configured
+as public. Enabling the feature without an API key prevents startup.
+
+`GET /api/storage/usage` returns counts and byte totals from the latest
+completed inventory. Optional query parameters narrow the result:
+
+```text
+GET /api/storage/usage?namespace=products
+GET /api/storage/usage?namespace=products&resource_id=845
+GET /api/storage/usage?namespace=products&resource_id=845&slot=1
+```
+
+The endpoint only reads the local SQLite catalog; it never scans LocalFS or
+S3 synchronously. The response includes scan status, the last completed scan
+time, snapshot age, and a `stale` flag. Counts cover objects with canonical
+image-slot key paths following `{namespace}/{resource_id}/{slot}.webp`; the
+scanner reads metadata and does not decode object contents. External changes to
+storage appear after a successful reconciliation, so results are an inventory
+snapshot rather than transactionally current storage accounting.
+
+`POST /api/storage/reconcile` requests an immediate reconciliation and returns
+`202 Accepted` (request queued for background processing) with a durable job ID. The job still obeys the configured idle
+period and UTC window. Repeated active manual requests are deduplicated.
+
+The recurring interval defaults to one hour. The inventory writes a staging
+snapshot in batches and promotes it only after the full scan succeeds; failed
+or interrupted jobs leave the previous complete snapshot queryable. Keep both
+the job database and catalog database on persistent local storage. The default
+catalog path is `storage-catalog.sqlite3` beside `IMAGE_JOB_DB_PATH`.
 
 ---
 

@@ -6,7 +6,7 @@ mod multipart;
 mod reduction;
 mod service;
 mod store;
-mod validation;
+pub(crate) mod validation;
 
 // Re-export the storage abstraction because AppState needs it.
 pub(crate) use store::ImageStore;
