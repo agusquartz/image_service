@@ -1,4 +1,6 @@
 #[cfg(feature = "images")]
+use crate::storage_usage::StorageCatalog;
+#[cfg(feature = "images")]
 use crate::{config::UPLOAD_BUDGET_UNIT_BYTES, error::ApiError, images::ImageStore};
 use crate::{
     config::{
@@ -57,6 +59,16 @@ pub struct AppState {
 
     /// Durable internal job queue and bounded in-process dispatcher.
     pub job_scheduler: JobScheduler,
+
+    /// Persistent object usage snapshot; disabled unless explicitly enabled.
+    #[cfg(feature = "images")]
+    pub storage_catalog: Option<StorageCatalog>,
+
+    pub storage_usage_enabled: bool,
+
+    pub storage_inventory_interval_seconds: u64,
+
+    pub background_idle_seconds: u64,
 
     /// Tracks foreground HTTP activity so background work waits for quiet periods.
     pub activity: Arc<ActivityTracker>,
@@ -142,10 +154,24 @@ impl AppState {
                 ..SchedulerConfig::default()
             },
         )?;
+        #[cfg(feature = "images")]
+        let storage_catalog = if config.storage_usage_enabled {
+            Some(
+                StorageCatalog::open(&config.storage_catalog_path)
+                    .map_err(std::io::Error::other)?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             lifecycle: ServiceLifecycle::default(),
             job_scheduler,
+            #[cfg(feature = "images")]
+            storage_catalog,
+            storage_usage_enabled: config.storage_usage_enabled,
+            storage_inventory_interval_seconds: config.storage_inventory_interval_seconds,
+            background_idle_seconds: config.background_idle_seconds,
             activity: Arc::new(ActivityTracker::default()),
 
             storage_operator: operator.clone(),

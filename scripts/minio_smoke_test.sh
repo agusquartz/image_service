@@ -16,6 +16,7 @@ tmp_dir="$(mktemp -d)"
 
 fail() {
     echo "FAIL: $*" >&2
+    docker logs "$service_name" >&2 2>/dev/null || true
     exit 1
 }
 
@@ -63,6 +64,9 @@ docker run --detach --rm \
     --env IMAGE_BIND=0.0.0.0:3000 \
     --env IMAGE_READ_AUTH=none \
     --env IMAGE_WRITE_AUTH=none \
+    --env IMAGE_API_KEY=storage-usage-smoke-key \
+    --env IMAGE_STORAGE_USAGE_ENABLED=true \
+    --env IMAGE_BACKGROUND_IDLE_SECONDS=0 \
     --env IMAGE_STORAGE_SCHEME=s3 \
     --env IMAGE_STORAGE_BUCKET="$bucket" \
     --env IMAGE_STORAGE_REGION=us-east-1 \
@@ -375,5 +379,41 @@ sleep 0.2
 status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$cancel_route")"
 [[ "$status" == 404 ]] || fail "cancelled MinIO upload stored an incomplete object (HTTP $status)"
 
-echo "PASS: MinIO uploads, replacement, snapshot-consistent GETs during external writes, stale conditional validators, HEAD, metadata, listing, profiles, presigned GET, DELETE races, cancellation, and resource DELETE"
+usage_route="$service_url/api/storage/usage"
+status="$(curl --silent --output "$tmp_dir/usage-unauthorized.json" --write-out '%{http_code}' "$usage_route")"
+[[ "$status" == 401 ]] || fail "MinIO storage usage endpoint returned HTTP $status without its independent API key"
+status="$(curl --silent --output "$tmp_dir/reconcile.json" --write-out '%{http_code}' \
+    --request POST --header 'Authorization: Bearer storage-usage-smoke-key' \
+    "$service_url/api/storage/reconcile")"
+[[ "$status" == 202 ]] || fail "MinIO storage reconciliation returned HTTP $status"
+for _ in $(seq 1 100); do
+    status="$(curl --silent --dump-header "$tmp_dir/usage.headers" --output "$tmp_dir/usage.json" --write-out '%{http_code}' \
+        --header 'Authorization: Bearer storage-usage-smoke-key' "$usage_route?namespace=minio-smoke&resource_id=resource-delete-extra&slot=1")"
+    [[ "$status" == 200 ]] || fail "MinIO storage usage query returned HTTP $status"
+    if python3 - "$tmp_dir/usage.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    payload = json.load(f)
+sys.exit(0 if payload["scan_status"] == "complete" and payload["object_count"] == 1 and payload["total_bytes"] > 0 else 1)
+PY
+    then
+        break
+    fi
+    sleep 0.2
+done
+grep -qi '^Cache-Control: no-store' "$tmp_dir/usage.headers" || fail "storage usage response did not disable caching"
+python3 - "$tmp_dir/usage.json" <<'PY' || fail "MinIO inventory did not include the stored slot"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    payload = json.load(f)
+assert payload["scope"] == {"namespace": "minio-smoke", "resource_id": "resource-delete-extra", "slot": 1}, payload
+assert payload["object_count"] == 1 and payload["total_bytes"] > 0, payload
+assert payload["stale"] is False, payload
+PY
+
+echo "PASS: MinIO uploads, replacement, snapshot-consistent GETs during external writes, stale conditional validators, HEAD, metadata, listing, profiles, presigned GET, DELETE races, cancellation, resource DELETE, and authenticated storage usage reconciliation"
 echo "Both containers used ephemeral storage; all test data was removed during cleanup."

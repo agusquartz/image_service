@@ -1,4 +1,6 @@
 #[cfg(feature = "images")]
+use crate::storage_usage::{get_usage, request_reconciliation};
+#[cfg(feature = "images")]
 use crate::{
     config::MULTIPART_OVERHEAD_BYTES,
     images::handler::{
@@ -14,6 +16,8 @@ use crate::{
 
 #[cfg(feature = "images")]
 use axum::extract::DefaultBodyLimit;
+#[cfg(feature = "images")]
+use axum::routing::post;
 use axum::{
     Router,
     extract::{Request, State},
@@ -81,6 +85,11 @@ pub fn build_router(state: AppState) -> Router {
             // source image size because multipart requests include
             // additional metadata and boundary bytes.
             .layer(DefaultBodyLimit::max(max_request_bytes));
+        if state.storage_usage_enabled {
+            router = router
+                .route("/api/storage/usage", get(get_usage))
+                .route("/api/storage/reconcile", post(request_reconciliation));
+        }
     }
 
     if metrics_enabled {

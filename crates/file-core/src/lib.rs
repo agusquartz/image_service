@@ -13,6 +13,8 @@ mod rate_limit;
 mod router;
 mod server;
 mod state;
+#[cfg(feature = "images")]
+mod storage_usage;
 
 use std::{error::Error, time::Duration};
 use tokio::net::TcpListener;
@@ -32,13 +34,26 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let job_scheduler = state.job_scheduler.clone();
     let activity = state.activity.clone();
     let ready_flag = lifecycle.ready_flag();
-    let app = router::build_router(state);
     let bind_address = config.bind_address.clone();
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_seconds);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    #[cfg(feature = "images")]
+    if let Some(catalog) = state.storage_catalog.clone() {
+        runtime
+            .block_on(storage_usage::register_jobs(
+                &state.job_scheduler,
+                catalog,
+                state.storage_operator.clone(),
+                state.storage_inventory_interval_seconds,
+                state.activity.clone(),
+                state.background_idle_seconds,
+            ))
+            .map_err(std::io::Error::other)?;
+    }
+    let app = router::build_router(state);
     let result = runtime.block_on(async move {
         let listener = TcpListener::bind(&bind_address).await?;
         let job_runtime = job_scheduler.start(activity, ready_flag);

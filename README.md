@@ -122,7 +122,7 @@ flowchart TB
     REMOTE -. future transport .-> OTHER_WORKERS
 ```
 
-The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. The generic SQLite/WAL job scheduler is also implemented, though no inventory, audit, or repair job handlers are registered yet. Dashed paths are future work: remote worker dispatch, worker processes, and video processing. `worker-protocol` currently provides versioned DTOs only.
+The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. When enabled, a durable SQLite/WAL job runs storage inventory scans and maintains a queryable snapshot. Dashed paths are future work: policy audits, repairs, remote worker dispatch, worker processes, and video processing. `worker-protocol` currently provides versioned DTOs only.
 
 ## Deployment Model and Production Use
 
@@ -205,7 +205,14 @@ POST /api/images/{namespace}/{resource_id}/{slot}/presign
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}
 DELETE /api/images/{namespace}/{resource_id}
+
+GET  /api/storage/usage?namespace=products&resource_id=845&slot=1
+POST /api/storage/reconcile
 ```
+
+Storage usage routes are opt-in through `IMAGE_STORAGE_USAGE_ENABLED=true` and
+always require the configured API key, independently of image read
+authentication. See [HTTP API](docs/api.md#storage-usage-reporting).
 
 Example:
 
@@ -333,7 +340,7 @@ flowchart TB
     PROTOCOL -. "future transport may use these types" .-> REMOTE
 ```
 
-The solid paths show implemented components. The scheduler persists and dispatches generic internal jobs in-process, but no inventory, audit, or repair handlers are registered yet. The dashed paths are planned: worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
+The solid paths show implemented components. The scheduler persists and dispatches internal jobs in-process; when enabled, a storage inventory handler maintains a persistent snapshot. Policy audits and repairs remain future work. Dashed paths show the planned worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
 
 The core rule is simple:
 
@@ -391,6 +398,7 @@ See [Configuration](docs/configuration.md).
 ## Documentation
 
 - [Architecture](docs/architecture.md) — module boundaries, responsibilities, project structure, upload/fetch flows, and design principles.
+- [Background Jobs](docs/jobs.md) — registered jobs, triggers, idle scheduling, retries, persistence, and shutdown behavior.
 - [Configuration](docs/configuration.md) — environment variables, resource rules, validation, processing limits, and concurrency.
 - [HTTP API](docs/api.md) — endpoints, responses, headers, status codes, and examples.
 - [Client Examples](docs/clients.md) — cURL, JavaScript Fetch, Java, Python, and Rust.

@@ -554,8 +554,8 @@ Invalid, empty, or zero values fall back to the default.
 
 The service initializes a SQLite/WAL database for internal system jobs. The
 database is required and is not controlled by an enable/disable setting.
-Inventory, audit, and repair producers will be added in later work; this
-release provides the durable queue and dispatcher foundation. Existing image
+Storage inventory is registered when `IMAGE_STORAGE_USAGE_ENABLED=true`;
+image policy audit and repair producers remain future work. Existing image
 HTTP operations remain synchronous.
 
 `IMAGE_JOB_DB_PATH` selects the SQLite file. When unset, it uses the platform's
@@ -595,6 +595,37 @@ for one Core instance on persistent local storage; do not put its WAL files on
 NFS/SMB or share one SQLite file between Core replicas. Remote workers, when
 implemented, will use the same durable job identity and leases; clients do not
 choose local versus remote execution.
+
+### Storage usage catalog
+
+Storage usage reporting is opt-in to preserve existing deployments. Set
+`IMAGE_STORAGE_USAGE_ENABLED=true` to initialize a separate persistent SQLite
+catalog, register an hourly inventory job, and expose `GET /api/storage/usage`
+and `POST /api/storage/reconcile`. The reporting endpoints always require
+`Authorization: Bearer <IMAGE_API_KEY>`, regardless of `IMAGE_READ_AUTH`; the
+service refuses to start if reporting is enabled without an API key. Inventory
+runs only when the internal scheduler's quiet-period and optional UTC-window
+conditions permit it.
+
+The scanner streams object listings through OpenDAL and persists batches. A
+completed scan atomically replaces the prior inventory; partial or failed
+scans do not alter the last complete snapshot. Queries aggregate the SQLite
+catalog and do not list storage on the request path. The data covers valid
+objects with canonical image-slot WebP key paths under the current layout; the
+scan reads metadata and does not decode object contents. Changes made directly
+in LocalFS/S3 are reflected after a successful reconciliation, so consumers
+should consider snapshot age and stale state.
+
+`IMAGE_STORAGE_CATALOG_DB_PATH` selects the catalog database. When omitted, it
+uses `storage-catalog.sqlite3` beside `IMAGE_JOB_DB_PATH`. Keep its SQLite WAL
+files on the same persistent local volume; Docker's declared
+`/var/lib/image-service` volume covers both databases by default.
+
+`IMAGE_STORAGE_INVENTORY_INTERVAL_SECONDS` sets the interval between automatic
+full reconciliations. Default: `3600` seconds; valid range `60..=2678400`.
+The first scan is scheduled immediately but still waits for the scheduler's
+idle/window rules. `POST /api/storage/reconcile` can enqueue a manual scan;
+active manual requests are deduplicated.
 
 ### `IMAGE_MAX_INPUT_BYTES`
 

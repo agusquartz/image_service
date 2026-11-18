@@ -13,6 +13,7 @@ worker-protocol = ["dep:worker-protocol"]
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"], optional = true }
 dirs = "5.0"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +29,7 @@ processor-contract = { path = "../processor-contract" }
 processor-image = { path = "../processor-image", optional = true }
 worker-protocol = { path = "../worker-protocol", optional = true }
 job-scheduler = { path = "../job-scheduler" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
