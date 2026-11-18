@@ -15,19 +15,19 @@ readme = "README.md"
 [workspace]
 members = [
     ".",
-    "crates/image-core",
+    "crates/file-core",
     "crates/processor-contract",
-    "crates/image-processor-image",
-    "crates/image-worker-protocol",
+    "crates/processor-image",
+    "crates/worker-protocol",
 ]
 resolver = "2"
 
 [features]
 default = ["images"]
-images = ["image-core/images"]
-ipc = ["image-core/ipc"]
-all = ["images", "ipc"]
+images = ["file-core/images"]
+worker-protocol = ["file-core/worker-protocol"]
+all = ["images", "worker-protocol"]
 
 [dependencies]
-image-core = { path = "crates/image-core", default-features = false }
+file-core = { path = "crates/file-core", default-features = false }
 dotenvy = "0.15.7"

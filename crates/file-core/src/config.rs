@@ -34,7 +34,7 @@ pub const MAX_SLOT_NUMBER: u8 = u8::MAX;
 ///
 /// This helps protect the service from extremely large or maliciously
 /// crafted images.
-pub const MAX_IMAGE_DIMENSION: u32 = processor_contract::MAX_IMAGE_DIMENSION;
+pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
 
 /// Maximum source image dimensions accepted for converted output.
 pub const DEFAULT_OUTPUT_WIDTH: u32 = 1024;
