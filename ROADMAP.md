@@ -18,10 +18,12 @@ file-core
   +----> OpenDAL -> LocalFS or S3-compatible storage
 ```
 
-The `worker-protocol` crate currently contains versioned DTOs only. A worker
-registry, durable job scheduler, remote transport, and remote worker runtime
-remain future work; the current Tokio blocking-pool handoff is in-process
-execution, not a job queue.
+The `worker-protocol` crate contains versioned DTOs only. The generic durable
+SQLite/WAL job catalog and in-process scheduler are implemented; system-job
+producers/handlers, worker registry, remote transport, and remote worker runtime
+remain future work. The current Tokio blocking-pool handoff for HTTP image
+processing remains synchronous in-process execution, separate from the job
+queue.
 
 The project should remain simple where possible. New abstractions should be introduced only when they solve a real deployment or application requirement.
 
@@ -423,31 +425,44 @@ The current per-process rate limiter does not share counters across replicas and
 
 The current API processes images synchronously before returning success.
 
-The workspace now has a generic `file-core`, a `Processor` contract and versioned
-worker/job/`StorageRef` protocol DTOs. The `worker-protocol` feature can compile
-those protocol types without a local processor. It does not yet persist jobs, open a worker connection,
-dispatch work, or recover after a restart; those require the future durable job
-catalog and worker-dispatch implementation.
+The workspace now includes a durable SQLite/WAL job catalog and bounded
+in-process dispatcher for internal system tasks. It persists recurring
+interval schedules and queue/kind, payload and policy snapshots, dependencies,
+leases, retry state, progress and results. Due schedules create idempotent
+jobs. The dispatcher waits for a quiet period and may also be restricted to a
+daily UTC time window. SQLite is the source of truth; memory only holds the
+bounded set of claimed jobs. The database path must be backed by persistent
+storage in deployments.
 
-A future optional mode could support queued processing:
+This branch adds the scheduler foundation only. It does not yet register
+inventory, audit, or repair handlers, so no maintenance scan or image rewrite
+runs yet. User-facing POST and PUT remain synchronous. `worker-protocol`
+contains versioned DTOs; UDS/gRPC connections, remote worker registration,
+dispatch and failover remain future work. A no-image build can store generic
+jobs, but needs a matching handler or a later remote worker before it can
+execute image jobs.
+
+Future work can use this scheduler for mandatory internal jobs:
 
 ```text
-POST upload
+scheduled inventory
     |
     v
-source storage
+scoped audit jobs
+    |
+findings and repair jobs
     |
     v
-queue
+in-process handler or eligible remote worker
     |
     v
-worker
-    |
-    v
-processed derivative
+checkpointed result
 ```
 
-This could be useful for large workloads while preserving the current synchronous mode for simpler deployments.
+Clients do not choose or disable these system tasks. The scheduler controls
+whether work runs in a quiet period or configured UTC window, limits its
+concurrency, and gives foreground HTTP traffic priority. Async user uploads,
+staging, and `202 Accepted` responses are separate future API work.
 
 ---
 

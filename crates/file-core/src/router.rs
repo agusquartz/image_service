@@ -14,7 +14,14 @@ use crate::{
 
 #[cfg(feature = "images")]
 use axum::extract::DefaultBodyLimit;
-use axum::{Router, middleware, routing::get};
+use axum::{
+    Router,
+    extract::{Request, State},
+    middleware,
+    middleware::Next,
+    response::Response,
+    routing::get,
+};
 
 /// Builds the complete HTTP router for the image service.
 ///
@@ -83,7 +90,25 @@ pub fn build_router(state: AppState) -> Router {
     router
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            track_foreground_activity,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             observe_request,
         ))
         .with_state(state)
+}
+
+async fn track_foreground_activity(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let _activity = if path.starts_with("/health") || path == "/metrics" {
+        None
+    } else {
+        Some(state.activity.enter())
+    };
+    next.run(request).await
 }

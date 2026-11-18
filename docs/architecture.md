@@ -27,6 +27,7 @@ crates/
 │   └── images/                   # Image API and storage adapters; enabled by `images`
 ├── processor-contract/src/       # Processor capability and in-process request/result types
 ├── processor-image/src/          # Decode, crop, resize, WebP encoding
+├── job-scheduler/src/            # SQLite/WAL job catalog, leases, retries, local dispatcher
 └── worker-protocol/src/          # Versioned worker/job/storage-reference DTOs
 ```
 
@@ -49,35 +50,42 @@ builds are checked in CI:
 
 ```text
 default (`images`)                 compatible image service
---no-default-features              core, health/readiness, optional metrics
+--no-default-features              core, health/readiness, optional metrics, durable job catalog
 --no-default-features --features worker-protocol
-                                   core plus generic worker protocol types, no local processor
+                                   core, durable job catalog, protocol types, no local processor
 --no-default-features --features all
-                                   image service and worker protocol types
+                                   image service, durable job catalog, and worker protocol types
 ```
 
-The `worker-protocol` crate currently defines versioned registration, job,
-result, and `StorageRef` data types for image, video, document, and blob
-capabilities. It does not yet implement a Unix socket, worker connection,
-scheduling, leases, retries, or remote processing. The
-no-image build is an architectural base, not a deployable replacement for the
-default image service until worker transport and dispatch are implemented.
+The `worker-protocol` crate defines versioned registration, job, result, and
+`StorageRef` data types for image, video, document, and blob capabilities. The
+`job-scheduler` crate now provides a durable SQLite/WAL catalog and bounded
+in-process dispatcher for internal jobs. No inventory, audit, or repair job
+handlers are registered yet. Unix socket connections, worker registration,
+remote dispatch, and worker failover remain future work. A no-image build can
+run the generic catalog, but image jobs require an image handler or later remote
+worker dispatch.
 
 ### Current Runtime and Planned Worker Boundary
 
-The running service currently handles HTTP requests in `file-core`, invokes
+The running service handles HTTP requests in `file-core`, invokes
 `processor-image` in-process through the `Processor` interface, and persists
 the result through OpenDAL. Tokio's blocking-pool handoff and the image
-processing admission limit bound CPU-heavy work; they are not a durable job
-scheduler. Storage backends currently include LocalFS and S3-compatible object
-storage.
+processing admission limit bound CPU-heavy HTTP work. A separate durable job
+scheduler is initialized at startup for internal background tasks; user-facing
+image operations remain synchronous.
 
-The workspace has a `worker-protocol` crate for versioned job and storage
-reference DTOs. The optional Cargo feature compiles those types, but it does not
-start a worker registry, schedule jobs, or open a UDS/gRPC connection. A future
-worker architecture may add those pieces and remote image, video, document, or
-other processors behind the same Core boundary. Until then, the supported
-image-processing path is local and in-process.
+The optional `worker-protocol` feature compiles versioned worker DTOs. The
+durable scheduler stores recurring interval definitions and job queue, kind,
+payload, policy snapshot, dependencies, lease, retry, progress, and result state
+in SQLite/WAL. Due schedules materialize idempotent jobs; the in-memory
+dispatcher claims only a bounded number and recovers expired leases after
+restart. Background work waits for a quiet HTTP period and can also be
+restricted to a daily UTC window. The service currently has no registered
+system-job producers or handlers, so this infrastructure does not yet
+enumerate storage or audit and rewrite images. UDS/gRPC worker registration and
+remote dispatch are also not implemented. Existing image requests continue
+through the in-process processor.
 
 ---
 
@@ -213,7 +221,7 @@ products/845/01.webp
 
 No compression logic belongs in this layer.
 
-The operation coordinator is an in-memory consistency mechanism for one service process. It serializes publication/deletion for the same resource and keeps unrelated resources independent. It does not persist pending work or coordinate multiple replicas; durable recovery belongs to the future job catalog and staging design.
+The operation coordinator is an in-memory consistency mechanism for one service process. It serializes publication/deletion for the same resource and keeps unrelated resources independent. It does not yet persist image operations or coordinate multiple replicas. The durable job catalog currently provides generic internal job state; connecting image publication/recovery to it is future work.
 
 ### Configuration and Shared State
 

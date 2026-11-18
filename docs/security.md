@@ -113,6 +113,13 @@ X-Content-Type-Options: nosniff
 
 ## Production Recommendations
 
+The internal scheduler persists job payloads, policy snapshots, progress, and
+errors in SQLite. Keep its database directory on a persistent local volume
+with restrictive ownership; include the database and its WAL/SHM sidecars in
+the backup and restore plan. Do not place the WAL database on NFS/SMB or share
+it between service replicas. Job payloads must contain references and
+operational metadata only, never image bytes, API keys, or presigned URLs.
+
 Before exposing the service publicly, consider:
 
 - TLS termination.

@@ -8,7 +8,7 @@ use std::error::Error;
 /// - Delegating service startup to the reusable Core crate.
 ///
 /// Business logic should not be added to this file.
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     dotenvy::dotenv().ok();
     file_core::run()
 }

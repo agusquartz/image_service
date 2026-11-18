@@ -147,6 +147,7 @@ The runtime stage uses Distroless and runs as its non-root user. The HTTP server
 docker run --rm --read-only \
   --publish 127.0.0.1:3000:3000 \
   --tmpfs /tmp/image-storage:rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755 \
+  --mount type=volume,src=image-service-state,dst=/var/lib/image-service \
   --env IMAGE_BIND=0.0.0.0:3000 \
   --env IMAGE_STORAGE_SCHEME=fs \
   --env IMAGE_STORAGE_ROOT=/tmp/image-storage \
@@ -154,7 +155,11 @@ docker run --rm --read-only \
   image-service:local
 ```
 
-This `tmpfs` setup is intended for temporary testing: image data disappears when the container stops. Use durable storage for real deployments.
+The image storage in this example is temporary, but the named volume preserves
+the internal jobs database across container recreation. Keep that volume for
+real deployments. For a fully volatile test, replace the named mount with
+`--tmpfs /var/lib/image-service:rw,nosuid,size=64m,uid=65532,gid=65532,mode=0755`;
+queued jobs and their checkpoints will then disappear with the container.
 
 ### Multi-architecture images and release binaries
 
@@ -450,17 +455,17 @@ Health routes bypass API authentication and application rate limits.
 
 ## Graceful Shutdown
 
-The process handles SIGTERM and SIGINT. It marks readiness false, stops accepting new connections, and drains active HTTP requests for up to `IMAGE_SHUTDOWN_TIMEOUT_SECONDS` (25 seconds by default). If the deadline expires, the server abandons active connections and exits; image work already running in Tokio's `spawn_blocking` pool cannot be cancelled safely and may be interrupted when the process exits.
+The process handles SIGTERM and SIGINT. It marks readiness false, stops claiming new background jobs, stops accepting new connections, and drains active HTTP requests for up to `IMAGE_SHUTDOWN_TIMEOUT_SECONDS` (25 seconds by default). It then drains the job dispatcher for up to the same timeout. If either deadline expires, remaining work may be interrupted; an active durable job keeps its lease and becomes eligible for recovery after that lease expires.
 
-The container runtime's stop grace period must exceed the service drain timeout so the service can finish its shutdown path. With the default timeout, configure at least 35 seconds, for example:
+The container runtime's stop grace period must allow both the HTTP drain and the durable job dispatcher drain. Each can use up to `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`; with the default, configure at least 60 seconds, for example:
 
 ```yaml
 services:
   image-service:
-    stop_grace_period: 35s
+    stop_grace_period: 60s
 ```
 
-For `docker run`, use `--stop-timeout 35` or a larger value. A force stop or host failure can still interrupt active work; uploads are published only after processing finishes, but an interrupted request may need to be retried.
+For `docker run`, use `--stop-timeout 60` or a larger value. A force stop or host failure can still interrupt active work; uploads are published only after processing finishes, but an interrupted request may need to be retried.
 
 ---
 

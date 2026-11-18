@@ -19,6 +19,7 @@ members = [
     "crates/processor-contract",
     "crates/processor-image",
     "crates/worker-protocol",
+    "crates/job-scheduler",
 ]
 resolver = "2"
 
