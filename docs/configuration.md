@@ -548,7 +548,53 @@ Invalid, empty, or zero values fall back to the default.
 
 `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` limits the entire multipart read. Default: `120`; valid range `1..=86400`. A timeout returns `408 Request Timeout` (request timed out). Upload admission remains reserved while the source is being processed, even if the client disconnects after CPU work starts; the existing `IMAGE_MAX_CONCURRENCY` continues to limit the encoder separately. The body budget covers compressed source bytes, not decoder buffers, WebP output, HTTP/proxy buffers or allocator overhead. Set container memory limits with those additional costs in mind.
 
-`IMAGE_SHUTDOWN_TIMEOUT_SECONDS` sets the maximum HTTP drain period after SIGINT or SIGTERM. Default: `25`; valid range `1..=3600`. The service stops accepting new connections and waits for active requests until they finish or the deadline expires. Set the container/orchestrator stop grace period longer than this timeout; for example, use `stop_grace_period: 35s` with the default. Tokio blocking image tasks cannot be forcibly cancelled once running; after the HTTP deadline, the process exits and the operating system terminates any remaining work.
+`IMAGE_SHUTDOWN_TIMEOUT_SECONDS` sets the maximum HTTP drain period after SIGINT or SIGTERM. Default: `25`; valid range `1..=3600`. The service stops accepting new connections and waits for active requests until they finish or the deadline expires, then drains the background dispatcher for up to the same timeout. Set the container/orchestrator stop grace period longer than both periods; for example, use `stop_grace_period: 60s` with the default. A job that exceeds the deadline keeps its lease in SQLite; after the lease expires, it can be retried. Tokio blocking image tasks cannot be forcibly cancelled once running; the process exit terminates any remaining work.
+
+### Durable internal job scheduler
+
+The service initializes a SQLite/WAL database for internal system jobs. The
+database is required and is not controlled by an enable/disable setting.
+Inventory, audit, and repair producers will be added in later work; this
+release provides the durable queue and dispatcher foundation. Existing image
+HTTP operations remain synchronous.
+
+`IMAGE_JOB_DB_PATH` selects the SQLite file. When unset, it uses the platform's
+local application data directory under `image-service/jobs.sqlite3`. The
+service creates parent directories. Keep the file, `-wal`, and `-shm` files on
+the same persistent local volume. The Docker image sets the path to
+`/var/lib/image-service/jobs.sqlite3` and declares `/var/lib/image-service` as
+a volume. A temporary filesystem for this directory loses queued jobs when
+the container stops.
+
+`IMAGE_BACKGROUND_JOB_CONCURRENCY` limits the number of internal jobs claimed
+at once. Default: `1`; valid range `1..=64`.
+
+`IMAGE_BACKGROUND_IDLE_SECONDS` is the quiet period with no active API request
+before the dispatcher can claim background work. Default: `30`; valid range
+`0..=86400`. Setting `0` removes the quiet-period delay, but the dispatcher
+still checks that no API request is active before claiming a new unit. A unit
+already running is not preempted if a request arrives; the scheduler claims no
+further unit until the quiet condition is met again.
+
+`IMAGE_BACKGROUND_WINDOW_UTC` optionally restricts background work to a daily
+UTC window in `HH:MM-HH:MM` format, for example `22:00-06:00`. It is combined
+with the idle-period condition. Omit it to allow jobs whenever the service has
+been quiet long enough. Convert a customer's local maintenance window to UTC
+when configuring this value.
+
+`IMAGE_JOB_RETENTION_DAYS` controls how long terminal job records and their
+event history remain in SQLite. Default: `30`; valid range `1..=3650`. Jobs
+still referenced as dependencies by another job are retained until that
+dependency chain is no longer needed.
+
+The scheduler gives foreground HTTP activity priority between work units. Its
+current concurrency limit bounds in-flight background handlers; a running
+handler must checkpoint and keep each unit reasonably small. Finer CPU/IO
+quotas and per-queue policies can be added as job types are introduced. SQLite is intended
+for one Core instance on persistent local storage; do not put its WAL files on
+NFS/SMB or share one SQLite file between Core replicas. Remote workers, when
+implemented, will use the same durable job identity and leases; clients do not
+choose local versus remote execution.
 
 ### `IMAGE_MAX_INPUT_BYTES`
 

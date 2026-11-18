@@ -122,7 +122,7 @@ flowchart TB
     REMOTE -. future transport .-> OTHER_WORKERS
 ```
 
-The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. Dashed paths are future work. The remote path, worker processes, and video processing are not implemented; `worker-protocol` currently provides versioned DTOs only. The current Core has no worker registry or job scheduler.
+The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. The generic SQLite/WAL job scheduler is also implemented, though no inventory, audit, or repair job handlers are registered yet. Dashed paths are future work: remote worker dispatch, worker processes, and video processing. `worker-protocol` currently provides versioned DTOs only.
 
 ## Deployment Model and Production Use
 
@@ -187,7 +187,7 @@ cargo build --release --locked --no-default-features --features worker-protocol
 cargo build --release --locked --no-default-features --features all
 ```
 
-The no-image builds expose health/readiness and optional metrics only; image routes and local image processing are excluded. The `worker-protocol` feature currently includes versioned worker/job data types, but does not yet provide worker transport or dispatch. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
+The no-image builds expose health/readiness, optional metrics, and the durable internal job catalog; image routes and local image processing are excluded. The `worker-protocol` feature includes versioned worker/job data types, but does not yet provide remote worker transport or dispatch. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
 
 ## API Overview
 
@@ -312,12 +312,13 @@ flowchart TB
     LOCAL[Local filesystem]
     S3[S3-compatible object storage]
     PROTOCOL[worker-protocol<br/>Versioned job and storage DTOs only]
+    SCHEDULER[Internal job scheduler<br/>SQLite WAL, interval schedules, leases, retries]
+    JOBDB[(Persistent job catalog)]
 
     subgraph FUTURE["Future extension — not implemented"]
-        SCHEDULER[Worker registry and job scheduling]
         REMOTE[Remote transport<br/>UDS or gRPC]
         WORKERS[Remote workers<br/>Image, video, document, and blob capabilities]
-        SCHEDULER --> REMOTE --> WORKERS
+        REMOTE --> WORKERS
     end
 
     CLIENT -->|HTTP| BINARY --> CORE
@@ -326,12 +327,13 @@ flowchart TB
     CORE --> STORAGE
     STORAGE --> LOCAL
     STORAGE --> S3
+    CORE -->|internal system jobs| SCHEDULER --> JOBDB
     CORE -. "optional Cargo feature: DTOs only" .-> PROTOCOL
-    CORE -. "future dispatch" .-> SCHEDULER
+    SCHEDULER -. "future worker dispatch" .-> REMOTE
     PROTOCOL -. "future transport may use these types" .-> REMOTE
 ```
 
-The solid paths show the current implementation. The dashed paths are planned: there is no worker registry, job scheduler, remote transport, or remote worker runtime yet. The `worker-protocol` crate currently provides versioned data types only.
+The solid paths show implemented components. The scheduler persists and dispatches generic internal jobs in-process, but no inventory, audit, or repair handlers are registered yet. The dashed paths are planned: worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
 
 The core rule is simple:
 
@@ -352,6 +354,11 @@ IMAGE_MAX_UPLOADS_IN_FLIGHT
 IMAGE_UPLOAD_MEMORY_BUDGET_BYTES
 IMAGE_UPLOAD_READ_TIMEOUT_SECONDS
 IMAGE_SHUTDOWN_TIMEOUT_SECONDS
+IMAGE_JOB_DB_PATH
+IMAGE_BACKGROUND_JOB_CONCURRENCY
+IMAGE_BACKGROUND_IDLE_SECONDS
+IMAGE_BACKGROUND_WINDOW_UTC
+IMAGE_JOB_RETENTION_DAYS
 IMAGE_MAX_INPUT_BYTES
 IMAGE_MAX_OUTPUT_BYTES
 IMAGE_OUTPUT_WIDTH
