@@ -157,6 +157,21 @@ pub struct AppConfig {
     /// Maximum time to drain active HTTP requests after SIGINT or SIGTERM.
     pub shutdown_timeout_seconds: u64,
 
+    /// Persistent SQLite database for internal system jobs.
+    pub job_database_path: PathBuf,
+
+    /// Maximum concurrent background jobs. User requests remain the priority.
+    pub background_job_concurrency: usize,
+
+    /// Quiet period with no active HTTP operations before background work can start.
+    pub background_idle_seconds: u64,
+
+    /// Optional daily UTC window for background work, formatted as HH:MM-HH:MM.
+    pub background_window_utc: Option<String>,
+
+    /// Retention for completed internal jobs and their event history.
+    pub job_retention_days: u64,
+
     /// Maximum uploaded image payload size, in bytes.
     pub max_source_bytes: usize,
 
@@ -225,6 +240,10 @@ impl AppConfig {
     /// - `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES`
     /// - `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS`
     /// - `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`
+    /// - `IMAGE_JOB_DB_PATH`
+    /// - `IMAGE_BACKGROUND_JOB_CONCURRENCY`
+    /// - `IMAGE_BACKGROUND_IDLE_SECONDS`
+    /// - `IMAGE_BACKGROUND_WINDOW_UTC`
     /// - `IMAGE_MAX_INPUT_BYTES`
     /// - `IMAGE_MAX_OUTPUT_BYTES`
     /// - `IMAGE_OUTPUT_WIDTH`
@@ -362,6 +381,38 @@ impl AppConfig {
             1,
             3600,
         )?;
+        let job_database_path = match env::var("IMAGE_JOB_DB_PATH") {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IMAGE_JOB_DB_PATH cannot be empty",
+                ));
+            }
+            Err(env::VarError::NotPresent) => dirs::data_local_dir()
+                .ok_or_else(|| io::Error::other("Could not determine the local data directory"))?
+                .join("image-service")
+                .join("jobs.sqlite3"),
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Could not read IMAGE_JOB_DB_PATH: {error}"),
+                ));
+            }
+        };
+        let background_job_concurrency =
+            parse_bounded_usize("IMAGE_BACKGROUND_JOB_CONCURRENCY", 1, 1, 64)?;
+        let background_idle_seconds =
+            parse_bounded_u64("IMAGE_BACKGROUND_IDLE_SECONDS", 30, 0, 86_400)?;
+        let job_retention_days = parse_bounded_u64("IMAGE_JOB_RETENTION_DAYS", 30, 1, 3650)?;
+        let background_window_utc = env::var("IMAGE_BACKGROUND_WINDOW_UTC")
+            .ok()
+            .map(|window| window.trim().to_string())
+            .filter(|window| !window.is_empty());
+        if let Some(window) = &background_window_utc {
+            job_scheduler::DailyUtcWindow::parse(window)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        }
         let max_slots = parse_bounded_u32(
             "IMAGE_MAX_SLOTS",
             u32::from(DEFAULT_MAX_SLOTS),
@@ -491,6 +542,11 @@ impl AppConfig {
             upload_memory_budget_bytes,
             upload_read_timeout_seconds,
             shutdown_timeout_seconds,
+            job_database_path,
+            background_job_concurrency,
+            background_idle_seconds,
+            background_window_utc,
+            job_retention_days,
             max_source_bytes,
             max_output_bytes,
             output_width,
