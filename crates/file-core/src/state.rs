@@ -9,6 +9,7 @@ use crate::{
     rate_limit::RateLimiter,
 };
 
+use job_scheduler::{ActivityTracker, DailyUtcWindow, JobScheduler, SchedulerConfig};
 use opendal::Operator;
 #[cfg(feature = "images")]
 use processor_contract::Processor;
@@ -44,11 +45,21 @@ impl ServiceLifecycle {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
+
+    pub(crate) fn ready_flag(&self) -> Arc<AtomicBool> {
+        self.ready.clone()
+    }
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub lifecycle: ServiceLifecycle,
+
+    /// Durable internal job queue and bounded in-process dispatcher.
+    pub job_scheduler: JobScheduler,
+
+    /// Tracks foreground HTTP activity so background work waits for quiet periods.
+    pub activity: Arc<ActivityTracker>,
 
     /// Shared storage operator used by readiness and optional image routes.
     pub storage_operator: Operator,
@@ -112,11 +123,30 @@ pub struct AppState {
 
 impl AppState {
     /// Creates the shared application state from runtime configuration.
-    pub fn from_config(config: &AppConfig) -> Result<Self, opendal::Error> {
+    pub fn from_config(
+        config: &AppConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let operator = Operator::via_iter(&config.storage.scheme, config.storage.options.clone())?;
+        let daily_utc_window = config
+            .background_window_utc
+            .as_deref()
+            .map(DailyUtcWindow::parse)
+            .transpose()?;
+        let job_scheduler = JobScheduler::open(
+            &config.job_database_path,
+            SchedulerConfig {
+                concurrency: config.background_job_concurrency,
+                idle_seconds: config.background_idle_seconds,
+                daily_utc_window,
+                retention_days: config.job_retention_days,
+                ..SchedulerConfig::default()
+            },
+        )?;
 
         Ok(Self {
             lifecycle: ServiceLifecycle::default(),
+            job_scheduler,
+            activity: Arc::new(ActivityTracker::default()),
 
             storage_operator: operator.clone(),
 

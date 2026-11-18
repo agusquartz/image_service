@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 processor-contract = { path = "../processor-contract" }
 processor-image = { path = "../processor-image", optional = true }
 worker-protocol = { path = "../worker-protocol", optional = true }
+job-scheduler = { path = "../job-scheduler" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

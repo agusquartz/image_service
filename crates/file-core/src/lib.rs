@@ -17,7 +17,7 @@ mod state;
 use std::{error::Error, time::Duration};
 use tokio::net::TcpListener;
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -29,6 +29,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let config = config::AppConfig::from_env()?;
     let state = state::AppState::from_config(&config)?;
     let lifecycle = state.lifecycle.clone();
+    let job_scheduler = state.job_scheduler.clone();
+    let activity = state.activity.clone();
+    let ready_flag = lifecycle.ready_flag();
     let app = router::build_router(state);
     let bind_address = config.bind_address.clone();
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_seconds);
@@ -38,10 +41,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .build()?;
     let result = runtime.block_on(async move {
         let listener = TcpListener::bind(&bind_address).await?;
+        let job_runtime = job_scheduler.start(activity, ready_flag);
         lifecycle.set_ready(true);
         tracing::info!(address = %bind_address, "image service listening");
         tracing::info!(backend = %config.storage.scheme, "image storage configured");
-        server::serve(listener, app, lifecycle, shutdown_timeout).await
+        let result = server::serve(listener, app, lifecycle, shutdown_timeout).await;
+        job_runtime.shutdown(shutdown_timeout).await;
+        result
     });
     runtime.shutdown_timeout(Duration::ZERO);
     if let Err(error) = &result {
@@ -50,6 +56,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     result?;
     Ok(())
 }
+
+pub use job_scheduler as jobs;
 
 #[cfg(feature = "worker-protocol")]
 pub use worker_protocol as protocol;
