@@ -2,18 +2,26 @@
 
 [← Back to README](README.md)
 
-Image Service is intentionally small. The long-term goal is to make deployment-specific behavior configurable while preserving a stable core pipeline:
+Image Service is intentionally small. Today, one `image_service` process runs
+`file-core`, invokes `processor-image` in-process, and stores results through
+OpenDAL. The long-term goal is to make deployment-specific behavior
+configurable while preserving this stable core pipeline:
 
 ```text
 HTTP
   |
   v
-Application Service
+file-core
   |
-  +----> Processing
+  +----> processor-contract -> processor-image (in process)
   |
-  +----> Storage
+  +----> OpenDAL -> LocalFS or S3-compatible storage
 ```
+
+The `worker-protocol` crate currently contains versioned DTOs only. A worker
+registry, durable job scheduler, remote transport, and remote worker runtime
+remain future work; the current Tokio blocking-pool handoff is in-process
+execution, not a job queue.
 
 The project should remain simple where possible. New abstractions should be introduced only when they solve a real deployment or application requirement.
 
@@ -42,7 +50,7 @@ OpenDAL storage abstraction    yes
 Runtime-selectable storage     yes
 Atomic filesystem writes       yes
 
-WebP reduction                 yes
+WebP reduction                 yes (valid WebP inputs meeting exact target dimensions and output byte limit pass through without lossy re-encoding; all inputs are still fully decoded/validated)
 Configurable image limits      yes (input/output bytes, output width/height)
 Read/write authentication      yes (both private by default; API key required at startup)
 Read/write rate limits        yes (per socket IP, configurable fixed windows)
@@ -393,6 +401,7 @@ Future observability work may add:
 - Input/output byte and compression-ratio metrics.
 - Resize/encoding attempts and processing failures.
 - Storage operation duration, failures, and backend labels.
+- An authenticated storage-usage reporting API for total bytes/object count and scoped namespace/resource/slot totals. This is an inventory/query capability, distinct from Prometheus time-series metrics; large stores may need cached or persisted accounting rather than a full object listing per request.
 - OpenTelemetry exporters and distributed tracing.
 
 Future metrics should avoid namespace/resource labels by default, to prevent high-cardinality series and avoid exposing customer identifiers.
@@ -414,9 +423,9 @@ The current per-process rate limiter does not share counters across replicas and
 
 The current API processes images synchronously before returning success.
 
-The workspace now has a `Processor` contract and versioned worker/job/`StorageRef`
-protocol DTOs. The `ipc` feature can compile those protocol types without the
-local image processor. It does not yet persist jobs, open a worker connection,
+The workspace now has a generic `file-core`, a `Processor` contract and versioned
+worker/job/`StorageRef` protocol DTOs. The `worker-protocol` feature can compile
+those protocol types without a local processor. It does not yet persist jobs, open a worker connection,
 dispatch work, or recover after a restart; those require the future durable job
 catalog and worker-dispatch implementation.
 
@@ -689,26 +698,26 @@ runtime worker transport can be added as separate members when implemented:
 
 ```text
 crates/
-├── image-core/                 # implemented
+├── file-core/                  # implemented
 ├── processor-contract/         # implemented
-├── image-processor-image/      # implemented
-├── image-worker-protocol/      # DTOs implemented; transport pending
-├── image-processor-video/      # future, when required
-├── image-processor-document/   # future, when required
-└── image-worker-runtime/       # future IPC registration and dispatch
+├── processor-image/            # implemented
+├── worker-protocol/            # DTOs implemented; transport pending
+├── processor-video/            # future, when required
+├── processor-document/         # future, when required
+└── worker-runtime/              # future registration and dispatch
 ```
 
 If storage construction becomes sufficiently complex, a dedicated infrastructure crate or module could be introduced:
 
 ```text
-crates/image-core/src/
+crates/file-core/src/
 ├── storage.rs
 ```
 
 or:
 
 ```text
-crates/image-core/src/
+crates/file-core/src/
 ├── storage/
 │   └── mod.rs
 ```

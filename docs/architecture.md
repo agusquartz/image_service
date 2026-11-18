@@ -19,15 +19,15 @@ Namespaces group resources within that customer's instance. They do not create s
 ```text
 src/main.rs                       # Minimal executable entry point
 crates/
-├── image-core/src/               # HTTP, auth, config, storage, lifecycle, use cases
+├── file-core/src/                # HTTP, auth, config, storage, lifecycle, use cases
 │   ├── auth.rs
 │   ├── config.rs
 │   ├── router.rs
 │   ├── state.rs
 │   └── images/                   # Image API and storage adapters; enabled by `images`
 ├── processor-contract/src/       # Processor capability and in-process request/result types
-├── image-processor-image/src/    # Decode, crop, resize, WebP encoding
-└── image-worker-protocol/src/    # Versioned worker/job/storage-reference DTOs
+├── processor-image/src/          # Decode, crop, resize, WebP encoding
+└── worker-protocol/src/          # Versioned worker/job/storage-reference DTOs
 ```
 
 The layout follows a simple rule:
@@ -36,30 +36,48 @@ The layout follows a simple rule:
 
 ## Cargo Workspace and Features
 
-The root `image_service` binary delegates startup to `image-core`. The default
-`images` feature enables the existing image routes and the `image-processor-image`
-crate, preserving the service behavior and configuration by default. The image
-processor implements the shared `Processor` contract; the Core retains HTTP
+The existing root `image_service` binary delegates startup to the generic
+`file-core` crate. The default `images` feature enables the current image routes
+and the `processor-image` crate, preserving service behavior and configuration
+by default. The image processor implements the shared `Processor` contract;
+the Core retains HTTP
 admission, the bounded Tokio blocking-pool handoff, storage, and response
 handling.
 
-The root package forwards `images` and `ipc` features to the Core. Supported
+The root package forwards `images` and `worker-protocol` features to the Core. Supported
 builds are checked in CI:
 
 ```text
 default (`images`)                 compatible image service
 --no-default-features              core, health/readiness, optional metrics
---no-default-features --features ipc
-                                   core plus worker protocol types, no local image processor
+--no-default-features --features worker-protocol
+                                   core plus generic worker protocol types, no local processor
 --no-default-features --features all
                                    image service and worker protocol types
 ```
 
-The `image-worker-protocol` crate currently defines versioned registration,
-job, result, and `StorageRef` data types. It does not yet implement a Unix socket,
-worker registration, scheduling, leases, retries, or remote processing. The
+The `worker-protocol` crate currently defines versioned registration, job,
+result, and `StorageRef` data types for image, video, document, and blob
+capabilities. It does not yet implement a Unix socket, worker connection,
+scheduling, leases, retries, or remote processing. The
 no-image build is an architectural base, not a deployable replacement for the
-default image service until the later IPC dispatch branch is implemented.
+default image service until worker transport and dispatch are implemented.
+
+### Current Runtime and Planned Worker Boundary
+
+The running service currently handles HTTP requests in `file-core`, invokes
+`processor-image` in-process through the `Processor` interface, and persists
+the result through OpenDAL. Tokio's blocking-pool handoff and the image
+processing admission limit bound CPU-heavy work; they are not a durable job
+scheduler. Storage backends currently include LocalFS and S3-compatible object
+storage.
+
+The workspace has a `worker-protocol` crate for versioned job and storage
+reference DTOs. The optional Cargo feature compiles those types, but it does not
+start a worker registry, schedule jobs, or open a UDS/gRPC connection. A future
+worker architecture may add those pieces and remote image, video, document, or
+other processors behind the same Core boundary. Until then, the supported
+image-processing path is local and in-process.
 
 ---
 
@@ -101,9 +119,9 @@ The HTTP layer should not implement image compression or storage backend operati
 
 ### Process Lifecycle
 
-Files: root `src/main.rs`, `image-core/src/lib.rs`, `server.rs`, and lifecycle state in `state.rs`.
+Files: root `src/main.rs`, `file-core/src/lib.rs`, `server.rs`, and lifecycle state in `state.rs`.
 
-`main.rs` loads `.env` and delegates startup to `image-core::run`, which builds the Tokio runtime with a bounded shutdown wait. `server.rs` handles SIGTERM/SIGINT, marks the shared lifecycle state as not ready, and asks Axum to stop accepting connections and drain active requests until the configured deadline. Readiness checks the configured OpenDAL backend; liveness only reports whether the process is running.
+`main.rs` loads `.env` and delegates startup to `file_core::run`, which builds the Tokio runtime with a bounded shutdown wait. `server.rs` handles SIGTERM/SIGINT, marks the shared lifecycle state as not ready, and asks Axum to stop accepting connections and drain active requests until the configured deadline. Readiness checks the configured OpenDAL backend; liveness only reports whether the process is running.
 
 ### Application / Service Layer
 
@@ -129,7 +147,7 @@ The service layer represents application behavior rather than transport or infra
 File:
 
 ```text
-image-processor-image/src/lib.rs
+processor-image/src/lib.rs
 ```
 
 Responsibilities:
@@ -139,9 +157,10 @@ Responsibilities:
 - Apply decoder safety limits.
 - Resolve the optional namespace processing profile, inheriting unspecified values from global configuration.
 - Decode source images.
-- Encode WebP.
+- Preserve a fully validated WebP unchanged when its orientation and dimensions already match policy and its bytes fit the output limit.
+- Encode non-WebP inputs to WebP; re-encode WebP only when output dimensions or byte limits require it.
 - Reduce WebP quality.
-- Resize images when necessary.
+- Crop or resize images only when necessary.
 - Enforce the final output-size target.
 - Move CPU-heavy work away from the async executor.
 - Respect the image-processing concurrency limit.
@@ -151,22 +170,18 @@ This crate has no knowledge of HTTP routes, namespaces, storage backends, or Axu
 Conceptually:
 
 ```text
-source bytes + declared MIME
-             |
-             v
-      format validation
-             |
-             v
-           decode
-             |
-             v
-      WebP compression
-             |
-             v
-      resize if needed
-             |
-             v
-        WebP bytes
+source bytes -> detect format/MIME -> decode and validate
+                                      |
+                                      v
+                              check output policy
+                               /             \
+           compliant static WebP             needs adjustment
+                    |                         |
+                    v                         v
+           reuse original bytes        crop/resize/encode
+                               \             /
+                                v           v
+                                 stored WebP
 ```
 
 ### Storage Layer
@@ -253,10 +268,10 @@ Reduction Layer
   +----> Detect format
   +----> Verify MIME
   +----> Decode with safety limits
-  +----> Encode as WebP
-  +----> Reduce quality
-  +----> Center-crop to target aspect ratio and resample once to exact dimensions
-  +----> Find a lossy WebP quality that fits the output byte limit
+  +----> Keep compliant static WebP bytes unchanged
+  +----> Otherwise crop/resize only if dimensions require it
+  +----> Encode non-WebP, or re-encode WebP if limits require it
+  +----> Reduce quality/dimensions only as needed for the byte limit
   |
   v
 Storage Layer
