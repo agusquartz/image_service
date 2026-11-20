@@ -16,6 +16,8 @@ use opendal::Operator;
 #[cfg(feature = "images")]
 use processor_contract::Processor;
 
+#[cfg(feature = "images")]
+use std::hash::{Hash, Hasher};
 use std::{
     collections::HashMap,
     sync::{
@@ -25,12 +27,20 @@ use std::{
 };
 
 #[cfg(feature = "images")]
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 /// Keeps admission capacity reserved while the compressed source remains in memory.
 #[cfg(feature = "images")]
 pub(crate) struct UploadAdmission {
     _slot: OwnedSemaphorePermit,
+    _body_budget: OwnedSemaphorePermit,
+}
+
+#[cfg(feature = "images")]
+const STAGED_UPLOAD_BUFFER_RESERVATION_BYTES: usize = 5 * 1024 * 1024;
+
+#[cfg(feature = "images")]
+pub(crate) struct BackgroundReadAdmission {
     _body_budget: OwnedSemaphorePermit,
 }
 
@@ -59,6 +69,10 @@ pub struct AppState {
 
     /// Durable internal job queue and bounded in-process dispatcher.
     pub job_scheduler: JobScheduler,
+
+    /// Queue and staging limits for asynchronous image processing.
+    pub async_image_max_jobs: usize,
+    pub async_image_max_bytes: u64,
 
     /// Persistent object usage snapshot; disabled unless explicitly enabled.
     #[cfg(feature = "images")]
@@ -90,6 +104,8 @@ pub struct AppState {
     upload_slots: Arc<Semaphore>,
     #[cfg(feature = "images")]
     upload_body_budget: Arc<Semaphore>,
+    #[cfg(feature = "images")]
+    async_resource_locks: Arc<Vec<Mutex<()>>>,
     #[cfg(feature = "images")]
     pub upload_read_timeout_seconds: u64,
 
@@ -167,6 +183,8 @@ impl AppState {
         Ok(Self {
             lifecycle: ServiceLifecycle::default(),
             job_scheduler,
+            async_image_max_jobs: config.async_image_max_jobs,
+            async_image_max_bytes: config.async_image_max_bytes,
             #[cfg(feature = "images")]
             storage_catalog,
             storage_usage_enabled: config.storage_usage_enabled,
@@ -191,6 +209,8 @@ impl AppState {
             upload_body_budget: Arc::new(Semaphore::new(
                 config.upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES,
             )),
+            #[cfg(feature = "images")]
+            async_resource_locks: Arc::new((0..256).map(|_| Mutex::new(())).collect()),
             #[cfg(feature = "images")]
             upload_read_timeout_seconds: config.upload_read_timeout_seconds,
 
@@ -255,6 +275,43 @@ impl AppState {
             self.upload_body_budget.clone(),
             max_input_bytes,
         )
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn admit_staging_upload(&self) -> Result<UploadAdmission, ApiError> {
+        reserve_upload(
+            self.upload_slots.clone(),
+            self.upload_body_budget.clone(),
+            STAGED_UPLOAD_BUFFER_RESERVATION_BYTES,
+        )
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn async_resource_lock(&self, namespace: &str, resource_id: &str) -> &Mutex<()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        namespace.hash(&mut hasher);
+        resource_id.hash(&mut hasher);
+        let index = hasher.finish() as usize % self.async_resource_locks.len();
+        &self.async_resource_locks[index]
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn admit_background_read(
+        &self,
+        bytes: usize,
+    ) -> Result<BackgroundReadAdmission, ApiError> {
+        let units = u32::try_from(bytes.div_ceil(UPLOAD_BUDGET_UNIT_BYTES))
+            .map_err(|_| ApiError::Internal("Background read size exceeds budget units".into()))?;
+        let body_budget = self
+            .upload_body_budget
+            .clone()
+            .try_acquire_many_owned(units)
+            .map_err(|_| {
+                ApiError::ServiceUnavailable("Background image memory budget is busy".into())
+            })?;
+        Ok(BackgroundReadAdmission {
+            _body_budget: body_budget,
+        })
     }
 }
 

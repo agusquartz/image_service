@@ -1,5 +1,10 @@
 #[cfg(feature = "images")]
-use crate::storage_usage::{get_usage, request_reconciliation};
+use crate::image_jobs::{create_image_job, get_image_job_status, replace_image_job};
+#[cfg(feature = "images")]
+use crate::storage_usage::{
+    get_policy_audit, get_policy_audit_findings, get_usage, request_reconciliation,
+    start_policy_audit,
+};
 #[cfg(feature = "images")]
 use crate::{
     config::MULTIPART_OVERHEAD_BYTES,
@@ -45,6 +50,9 @@ use axum::{
 /// DELETE /api/images/{namespace}/{resource_id}/{slot}
 /// GET  /api/images/{namespace}/{resource_id}
 /// DELETE /api/images/{namespace}/{resource_id}
+/// POST /api/image-jobs/{namespace}/{resource_id}/{slot} (async create)
+/// PUT  /api/image-jobs/{namespace}/{resource_id}/{slot} (async create or replace)
+/// GET  /api/image-jobs/{job_id}
 /// ```
 pub fn build_router(state: AppState) -> Router {
     let metrics_enabled = state.metrics_enabled;
@@ -79,6 +87,11 @@ pub fn build_router(state: AppState) -> Router {
                     .put(replace_image)
                     .delete(delete_image),
             )
+            .route(
+                "/api/image-jobs/{namespace}/{resource_id}/{slot}",
+                post(create_image_job).put(replace_image_job),
+            )
+            .route("/api/image-jobs/{job_id}", get(get_image_job_status))
             // Multipart parsing is still constrained by Axum's body limit.
             //
             // The limit is intentionally slightly larger than the maximum
@@ -88,7 +101,13 @@ pub fn build_router(state: AppState) -> Router {
         if state.storage_usage_enabled {
             router = router
                 .route("/api/storage/usage", get(get_usage))
-                .route("/api/storage/reconcile", post(request_reconciliation));
+                .route("/api/storage/reconcile", post(request_reconciliation))
+                .route("/api/storage/audits", post(start_policy_audit))
+                .route("/api/storage/audits/{audit_id}", get(get_policy_audit))
+                .route(
+                    "/api/storage/audits/{audit_id}/findings",
+                    get(get_policy_audit_findings),
+                );
         }
     }
 
@@ -114,7 +133,8 @@ async fn track_foreground_activity(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let _activity = if path.starts_with("/health") || path == "/metrics" {
+    let is_audit_observation = path.starts_with("/api/storage/audits/");
+    let _activity = if path.starts_with("/health") || path == "/metrics" || is_audit_observation {
         None
     } else {
         Some(state.activity.enter())

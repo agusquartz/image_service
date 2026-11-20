@@ -47,18 +47,52 @@ pub(crate) async fn upload(
         policy.output_height,
     )
     .await?;
-    let was_created = if replace_existing {
+    let target_lock = state.async_resource_lock(&key.namespace, &key.resource_id);
+    let _target_guard = target_lock.lock().await;
+    crate::image_jobs::cancel_target_for_sync_mutation(state, key).await?;
+    let mutation_id = crate::storage_usage::begin_http_mutation(
+        state,
+        key,
+        if replace_existing { "PUT" } else { "POST" },
+    )
+    .await?;
+    let write_result = if replace_existing {
         state
             .store
             .write_with_token(key, webp.clone(), state.max_slots, &operation)
-            .await?
+            .await
     } else {
         state
             .store
             .create_with_token(key, webp.clone(), state.max_slots, &operation)
-            .await?;
-        true
+            .await
+            .map(|metadata| (true, metadata))
     };
+    let (was_created, written_metadata) = match write_result {
+        Ok(result) => result,
+        Err(error) => {
+            crate::storage_usage::queue_mutation_recovery(
+                state,
+                mutation_id,
+                if replace_existing { "PUT" } else { "POST" },
+                &key.namespace,
+                &key.resource_id,
+                Some(key.slot),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    crate::storage_usage::complete_http_mutation(
+        state,
+        mutation_id,
+        &key.namespace,
+        &key.resource_id,
+        Some(key.slot),
+        Some(&policy),
+        Some(&written_metadata),
+    )
+    .await?;
 
     let relative = relative_image_url(key);
 
@@ -98,7 +132,32 @@ pub(crate) async fn fetch(state: &AppState, key: &ImageKey) -> Result<ImageDeliv
 }
 
 pub(crate) async fn delete(state: &AppState, key: &ImageKey) -> Result<(), ApiError> {
-    state.store.delete(key).await
+    let target_lock = state.async_resource_lock(&key.namespace, &key.resource_id);
+    let _target_guard = target_lock.lock().await;
+    crate::image_jobs::cancel_target_for_sync_mutation(state, key).await?;
+    let mutation_id = crate::storage_usage::begin_http_mutation(state, key, "DELETE").await?;
+    if let Err(error) = state.store.delete(key).await {
+        crate::storage_usage::queue_mutation_recovery(
+            state,
+            mutation_id,
+            "DELETE",
+            &key.namespace,
+            &key.resource_id,
+            Some(key.slot),
+        )
+        .await;
+        return Err(error);
+    }
+    crate::storage_usage::complete_http_mutation(
+        state,
+        mutation_id,
+        &key.namespace,
+        &key.resource_id,
+        Some(key.slot),
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn delete_resource(
@@ -106,7 +165,33 @@ pub(crate) async fn delete_resource(
     namespace: &str,
     resource_id: &str,
 ) -> Result<(), ApiError> {
-    state.store.delete_resource(namespace, resource_id).await
+    let target_lock = state.async_resource_lock(namespace, resource_id);
+    let _target_guard = target_lock.lock().await;
+    crate::image_jobs::cancel_resource_for_sync_delete(state, namespace, resource_id).await?;
+    let mutation_id =
+        crate::storage_usage::begin_resource_delete(state, namespace, resource_id).await?;
+    if let Err(error) = state.store.delete_resource(namespace, resource_id).await {
+        crate::storage_usage::queue_mutation_recovery(
+            state,
+            mutation_id,
+            "DELETE",
+            namespace,
+            resource_id,
+            None,
+        )
+        .await;
+        return Err(error);
+    }
+    crate::storage_usage::complete_http_mutation(
+        state,
+        mutation_id,
+        namespace,
+        resource_id,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn stat(state: &AppState, key: &ImageKey) -> Result<StoredMetadata, ApiError> {
@@ -228,7 +313,7 @@ fn relative_image_url_for(namespace: &str, resource_id: &str, slot: u8) -> Strin
 }
 
 /// Builds the API-relative URL for an image.
-fn relative_image_url(key: &ImageKey) -> String {
+pub(crate) fn relative_image_url(key: &ImageKey) -> String {
     format!(
         "/api/images/{}/{}/{}",
         key.namespace, key.resource_id, key.slot,
@@ -255,7 +340,7 @@ fn relative_image_url(key: &ImageKey) -> String {
 /// ```text
 /// https://images.example.com/api/images/products/123/1
 /// ```
-fn public_image_url(state: &AppState, relative: &str) -> String {
+pub(crate) fn public_image_url(state: &AppState, relative: &str) -> String {
     match &state.public_base_url {
         Some(base) => {
             format!("{base}{relative}")

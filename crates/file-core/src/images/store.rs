@@ -1,6 +1,7 @@
 use crate::{config::MAX_SLOT_NUMBER, error::ApiError};
 
 use axum::body::Bytes;
+use futures_util::StreamExt;
 use opendal::{EntryMode, ErrorKind, Operator, raw::PresignedRequest};
 use std::{
     collections::HashMap,
@@ -20,7 +21,7 @@ pub(crate) struct StoredImage {
     pub last_modified: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredMetadata {
     pub content_length: u64,
     pub etag: Option<String>,
@@ -147,7 +148,9 @@ impl ImageStore {
         max_slots: u8,
     ) -> Result<(), ApiError> {
         let token = self.begin_operation(key).await;
-        self.create_with_token(key, bytes, max_slots, &token).await
+        self.create_with_token(key, bytes, max_slots, &token)
+            .await
+            .map(|_| ())
     }
 
     pub async fn create_with_token(
@@ -156,7 +159,7 @@ impl ImageStore {
         bytes: Bytes,
         max_slots: u8,
         token: &ImageOperationToken,
-    ) -> Result<(), ApiError> {
+    ) -> Result<StoredMetadata, ApiError> {
         if key.slot > max_slots {
             return Err(slot_limit_error(key.slot, max_slots));
         }
@@ -164,7 +167,8 @@ impl ImageStore {
         let _operation_guard = self.lock_current_operation(key, token).await?;
         let object_key = image_object_key(key);
 
-        self.operator
+        let metadata = self
+            .operator
             .write_with(&object_key, bytes)
             .if_not_exists(true)
             .await
@@ -176,7 +180,7 @@ impl ImageStore {
                 }
             })?;
 
-        Ok(())
+        Ok(stored_metadata_from(metadata))
     }
 
     /// Stores a processed WebP image, creating or replacing the slot.
@@ -190,7 +194,9 @@ impl ImageStore {
         max_slots: u8,
     ) -> Result<bool, ApiError> {
         let token = self.begin_operation(key).await;
-        self.write_with_token(key, bytes, max_slots, &token).await
+        self.write_with_token(key, bytes, max_slots, &token)
+            .await
+            .map(|(created, _)| created)
     }
 
     pub async fn write_with_token(
@@ -199,7 +205,7 @@ impl ImageStore {
         bytes: Bytes,
         max_slots: u8,
         token: &ImageOperationToken,
-    ) -> Result<bool, ApiError> {
+    ) -> Result<(bool, StoredMetadata), ApiError> {
         let _operation_guard = self.lock_current_operation(key, token).await?;
         let object_key = image_object_key(key);
 
@@ -219,13 +225,14 @@ impl ImageStore {
             .if_not_exists(true)
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(metadata) => Ok((true, stored_metadata_from(metadata))),
             Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {
-                self.operator
+                let metadata = self
+                    .operator
                     .write(&object_key, bytes)
                     .await
                     .map_err(|error| ApiError::Storage(error.to_string()))?;
-                Ok(false)
+                Ok((false, stored_metadata_from(metadata)))
             }
             Err(error) => Err(ApiError::Storage(error.to_string())),
         }
@@ -327,6 +334,52 @@ impl ImageStore {
             && current.last_modified == metadata.last_modified)
     }
 
+    /// Replaces an object only while it still matches the version that was read.
+    /// Object stores use conditional writes; LocalFS serializes the comparison
+    /// and write against mutations made by this process.
+    pub async fn replace_if_unchanged(
+        &self,
+        key: &ImageKey,
+        expected: &StoredMetadata,
+        bytes: Bytes,
+    ) -> Result<bool, ApiError> {
+        let object_key = image_object_key(key);
+        if self.operator.info().full_capability().write_with_if_match {
+            let Some(etag) = expected.etag.as_deref() else {
+                return Ok(false);
+            };
+            return match self
+                .operator
+                .write_with(&object_key, bytes)
+                .if_match(etag)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
+                Err(error) => Err(ApiError::Storage(error.to_string())),
+            };
+        }
+
+        let state = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+        let _operation_guard = state.lock_owned().await;
+        let current = match self.stat(key).await {
+            Ok(metadata) => metadata,
+            Err(ApiError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if current.content_length != expected.content_length
+            || current.etag != expected.etag
+            || current.last_modified != expected.last_modified
+        {
+            return Ok(false);
+        }
+        self.operator
+            .write(&object_key, bytes)
+            .await
+            .map_err(|error| ApiError::Storage(error.to_string()))?;
+        Ok(true)
+    }
+
     async fn read_object(&self, object_key: &str) -> Result<Vec<u8>, ApiError> {
         match self.operator.read(object_key).await {
             Ok(buffer) => Ok(buffer.to_vec()),
@@ -341,6 +394,60 @@ impl ImageStore {
     #[cfg(test)]
     pub async fn read(&self, key: &ImageKey) -> Result<Vec<u8>, ApiError> {
         self.read_object(&image_object_key(key)).await
+    }
+
+    pub async fn open_staged_writer(&self, staging_id: &str) -> Result<opendal::Writer, ApiError> {
+        self.operator
+            .writer(&staging_object_key(staging_id))
+            .await
+            .map_err(|error| ApiError::Storage(error.to_string()))
+    }
+
+    pub async fn read_staged(&self, staging_id: &str) -> Result<Vec<u8>, ApiError> {
+        self.read_object(&staging_object_key(staging_id)).await
+    }
+
+    pub async fn delete_staged(&self, staging_id: &str) -> Result<(), ApiError> {
+        let key = staging_object_key(staging_id);
+        match self.operator.delete(&key).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
+    pub async fn list_staged_ids(&self) -> Result<Vec<String>, ApiError> {
+        let mut lister = match self
+            .operator
+            .lister_with("__image_jobs/")
+            .recursive(true)
+            .await
+        {
+            Ok(lister) => lister,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ApiError::Storage(error.to_string())),
+        };
+        let mut ids = Vec::new();
+        while let Some(entry) = lister.next().await {
+            let entry = entry.map_err(|error| ApiError::Storage(error.to_string()))?;
+            let Some(id) = entry
+                .path()
+                .strip_prefix("__image_jobs/")
+                .and_then(|path| path.split('/').next())
+            else {
+                continue;
+            };
+            if !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+            {
+                ids.push(id.to_owned());
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Deletes an image. Missing objects are treated as successful deletion.
@@ -485,6 +592,18 @@ fn image_object_key(key: &ImageKey) -> String {
     format!("{}/{}/{:02}.webp", key.namespace, key.resource_id, key.slot)
 }
 
+fn staging_object_key(staging_id: &str) -> String {
+    format!("__image_jobs/{staging_id}/original")
+}
+
+fn stored_metadata_from(metadata: opendal::Metadata) -> StoredMetadata {
+    StoredMetadata {
+        content_length: metadata.content_length(),
+        etag: metadata.etag().map(str::to_owned),
+        last_modified: metadata.last_modified().map(SystemTime::from),
+    }
+}
+
 fn slot_limit_error(slot: u8, max_slots: u8) -> ApiError {
     ApiError::BadRequest(format!(
         "cannot create slot {slot}: IMAGE_MAX_SLOTS is {max_slots}"
@@ -562,6 +681,29 @@ mod tests {
         let actual = store.read(&key).await.expect("Image read should succeed");
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn conditional_maintenance_write_never_replaces_a_newer_version() {
+        let (_temp_dir, store) = test_store();
+        let key = test_key(1);
+        store
+            .write(&key, Bytes::from_static(b"old"), 5)
+            .await
+            .unwrap();
+        let (captured, _) = store.read_snapshot(&key).await.unwrap();
+
+        store
+            .write(&key, Bytes::from_static(b"newer-version"), 5)
+            .await
+            .unwrap();
+        let published = store
+            .replace_if_unchanged(&key, &captured, Bytes::from_static(b"reprocessed"))
+            .await
+            .unwrap();
+
+        assert!(!published);
+        assert_eq!(store.read(&key).await.unwrap(), b"newer-version");
     }
 
     #[tokio::test]

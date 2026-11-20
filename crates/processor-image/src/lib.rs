@@ -13,6 +13,72 @@ const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageProcessor;
 
+/// Metadata from fully decoding an image without transforming or writing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageInspection {
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+    pub animated: bool,
+}
+
+/// Detects and fully decodes image bytes without encoding or modifying them.
+/// The same dimension and allocation limits used by upload processing apply.
+pub fn inspect_image(source: &[u8]) -> Result<ImageInspection, ProcessingError> {
+    let format = image::guess_format(source)
+        .map_err(|_| ProcessingError::UnsupportedMediaType("Unknown image format".to_string()))?;
+    if !supported_format(format) {
+        return Err(ProcessingError::UnsupportedMediaType(format!(
+            "Unsupported image format: {format:?}"
+        )));
+    }
+
+    let animated = if format == ImageFormat::WebP {
+        image::codecs::webp::WebPDecoder::new(Cursor::new(source))
+            .map_err(|error| {
+                ProcessingError::InvalidInput(format!("Could not inspect WebP input: {error}"))
+            })?
+            .has_animation()
+    } else {
+        false
+    };
+    let mut reader = ImageReader::with_format(Cursor::new(source), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|error| {
+        ProcessingError::InvalidInput(format!("Could not initialize image decoder: {error}"))
+    })?;
+    let orientation = decoder.orientation().map_err(|error| {
+        ProcessingError::InvalidInput(format!("Could not read image orientation: {error}"))
+    })?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|error| {
+        ProcessingError::InvalidInput(format!("Could not decode image: {error}"))
+    })?;
+    image.apply_orientation(orientation);
+
+    Ok(ImageInspection {
+        format: format_name(format).to_string(),
+        width: image.width(),
+        height: image.height(),
+        animated,
+    })
+}
+
+fn format_name(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Png => "png",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        _ => "unsupported",
+    }
+}
+
 impl Processor for ImageProcessor {
     fn capability(&self) -> Capability {
         Capability::Image
@@ -301,9 +367,12 @@ fn crop_and_resize(image: DynamicImage, output_width: u32, output_height: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageProcessor, compress_webp, crop_and_resize, declared_mime_is_acceptable};
+    use super::{
+        ImageProcessor, compress_webp, crop_and_resize, declared_mime_is_acceptable, inspect_image,
+    };
     use bytes::Bytes;
     use processor_contract::{ProcessingRequest, Processor};
+    use std::io::Cursor;
 
     fn request(
         source: Bytes,
@@ -343,6 +412,33 @@ mod tests {
             Some("image/jpeg"),
             image::ImageFormat::Png
         ));
+    }
+
+    #[test]
+    fn inspection_decodes_webp_without_reencoding_and_reports_dimensions() {
+        let source = webp(32, 24);
+        let original = source.clone();
+        let inspected = inspect_image(&source).expect("valid WebP should inspect");
+        assert_eq!(inspected.format, "webp");
+        assert_eq!((inspected.width, inspected.height), (32, 24));
+        assert!(!inspected.animated);
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn inspection_reports_other_valid_formats_for_policy_audits() {
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 6)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .expect("PNG should encode");
+        let inspected = inspect_image(source.get_ref()).expect("valid PNG should inspect");
+        assert_eq!(inspected.format, "png");
+        assert_eq!((inspected.width, inspected.height), (8, 6));
+    }
+
+    #[test]
+    fn inspection_rejects_invalid_or_truncated_image_data() {
+        assert!(inspect_image(b"not an image").is_err());
     }
 
     #[test]
