@@ -115,6 +115,25 @@ pub struct NewJob {
     pub run_after: Option<SystemTime>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetJobMode {
+    CreateOnly,
+    Supersede,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetEnqueueResult {
+    Enqueued {
+        id: String,
+        superseded_stage_id: Option<String>,
+        superseded_was_running: bool,
+    },
+    ActiveConflict(String),
+    ExistingIdempotent(String),
+    IdempotencyConflict,
+    CapacityExceeded,
+}
+
 #[derive(Clone, Debug)]
 pub struct IntervalSchedule {
     pub id: String,
@@ -310,6 +329,188 @@ impl JobStore {
         .await
     }
 
+    /// Enqueues a job that owns one logical target. The active dedupe key is
+    /// the target reservation: create-only jobs conflict, while replacement
+    /// jobs cancel or fence the previous owner in the same SQLite transaction.
+    pub async fn enqueue_targeted(
+        &self,
+        job: NewJob,
+        mode: TargetJobMode,
+        max_active_jobs: usize,
+        max_active_bytes: u64,
+        job_bytes: u64,
+    ) -> Result<TargetEnqueueResult, JobError> {
+        validate_job_name("queue", &job.queue)?;
+        validate_job_name("kind", &job.kind)?;
+        let dedupe_key = job
+            .dedupe_key
+            .clone()
+            .ok_or_else(|| JobError::new("targeted jobs require a dedupe key"))?;
+        if job.max_attempts == 0 || job.max_attempts > 100 {
+            return Err(JobError::new("max_attempts must be between 1 and 100"));
+        }
+        let payload = serde_json::to_string(&job.payload)?;
+        let idempotency_key = job
+            .payload
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let request_fingerprint = job
+            .payload
+            .get("request_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let policy = serde_json::to_string(&job.policy_snapshot)?;
+        let progress = "{}".to_string();
+        let now = now_ms();
+        let run_after = system_time_ms(job.run_after.unwrap_or_else(SystemTime::now));
+        let connection = self.connection.clone();
+
+        run_blocking(connection, move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(idempotency_key) = &idempotency_key {
+                let existing: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT id,payload_json FROM jobs WHERE json_extract(payload_json,'$.idempotency_key')=?1 ORDER BY created_at_ms DESC LIMIT 1",
+                        [idempotency_key],
+                        |row| Ok((row.get(0)?,row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((id, existing_payload)) = existing {
+                    let existing_fingerprint = serde_json::from_str::<serde_json::Value>(&existing_payload)
+                        .ok()
+                        .and_then(|payload| payload.get("request_fingerprint")?.as_str().map(str::to_owned));
+                    if existing_fingerprint == request_fingerprint {
+                        return Ok(TargetEnqueueResult::ExistingIdempotent(id));
+                    }
+                    return Ok(TargetEnqueueResult::IdempotencyConflict);
+                }
+            }
+            let active: Option<(String, String, String)> = transaction
+                .query_row(
+                    "SELECT id, state, payload_json FROM jobs WHERE dedupe_key = ?1 AND state IN ('pending','running','retry_wait')",
+                    [&dedupe_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let mut superseded_stage_id = None;
+            let mut superseded_was_running = false;
+            if let Some((active_id, active_state, active_payload)) = &active {
+                if mode == TargetJobMode::CreateOnly {
+                    return Ok(TargetEnqueueResult::ActiveConflict(active_id.clone()));
+                }
+                superseded_stage_id = serde_json::from_str::<serde_json::Value>(active_payload)
+                    .ok()
+                    .and_then(|payload| payload.get("stage_id")?.as_str().map(str::to_owned));
+                if active_state == "running" {
+                    superseded_was_running = true;
+                    let fenced_key = format!("{dedupe_key}:superseded:{active_id}");
+                    transaction.execute(
+                        "UPDATE jobs SET dedupe_key=?2,cancel_requested=1,last_error='superseded by a newer target job',updated_at_ms=?3 WHERE id=?1",
+                        params![active_id, fenced_key, now],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO job_events(job_id,event,occurred_at_ms,detail_json) VALUES (?1,'superseded',?2,'{}')",
+                        params![active_id, now],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE jobs SET state='cancelled',last_error='superseded by a newer target job',updated_at_ms=?2,finished_at_ms=?2 WHERE id=?1",
+                        params![active_id, now],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO job_events(job_id,event,occurred_at_ms,detail_json) VALUES (?1,'superseded',?2,'{}')",
+                        params![active_id, now],
+                    )?;
+                }
+            }
+
+            let (active_count, active_bytes): (i64, i64) = transaction.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(CAST(json_extract(payload_json,'$.source_bytes') AS INTEGER)),0) FROM jobs WHERE queue=?1 AND state IN ('pending','running','retry_wait')",
+                [&job.queue],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )?;
+            // A superseded pending job was marked cancelled above and is no
+            // longer counted. A superseded running job remains active until
+            // its handler observes cancellation and reaches a terminal state;
+            // keep its source bytes in the capacity total during that window.
+            let active_count = active_count.max(0) as usize;
+            let active_bytes = active_bytes.max(0) as u64;
+            if active_count >= max_active_jobs
+                || active_bytes.saturating_add(job_bytes) > max_active_bytes
+            {
+                return Ok(TargetEnqueueResult::CapacityExceeded);
+            }
+
+            let id = Uuid::new_v4().to_string();
+            let parent_id = job.dependencies.first().cloned();
+            transaction.execute(
+                "INSERT INTO jobs (id, queue, kind, parent_id, dedupe_key, payload_json, policy_json, state, priority, attempts, max_attempts, run_after_ms, progress_json, created_at_ms, updated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,0,?9,?10,?11,?12,?12)",
+                params![id,job.queue,job.kind,parent_id,dedupe_key,payload,policy,job.priority,job.max_attempts,run_after,progress,now],
+            )?;
+            transaction.execute(
+                "INSERT INTO job_events(job_id,event,occurred_at_ms,detail_json) VALUES (?1,'enqueued',?2,'{}')",
+                params![id,now],
+            )?;
+            transaction.commit()?;
+            Ok(TargetEnqueueResult::Enqueued {
+                id,
+                superseded_stage_id,
+                superseded_was_running,
+            })
+        })
+        .await
+    }
+
+    pub async fn cancel_target(
+        &self,
+        dedupe_key: String,
+    ) -> Result<Option<(String, bool)>, JobError> {
+        let connection = self.connection.clone();
+        run_blocking(connection, move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let active: Option<(String, String, String)> = transaction
+                .query_row(
+                    "SELECT id,state,payload_json FROM jobs WHERE dedupe_key=?1 AND state IN ('pending','running','retry_wait')",
+                    [&dedupe_key],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                )
+                .optional()?;
+            let mut cancelled_stage = None;
+            if let Some((id,state,payload)) = active {
+                let now = now_ms();
+                let stage_id = serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .and_then(|payload| payload.get("stage_id")?.as_str().map(str::to_owned));
+                if state == "running" {
+                    transaction.execute("UPDATE jobs SET dedupe_key=?2,cancel_requested=1,updated_at_ms=?3 WHERE id=?1", params![id,format!("{dedupe_key}:cancelled:{id}"),now])?;
+                } else {
+                    transaction.execute("UPDATE jobs SET state='cancelled',last_error='cancelled by a synchronous image mutation',updated_at_ms=?2,finished_at_ms=?2 WHERE id=?1",params![id,now])?;
+                }
+                transaction.execute("INSERT INTO job_events(job_id,event,occurred_at_ms,detail_json) VALUES (?1,'cancel_requested',?2,'{}')",params![id,now])?;
+                cancelled_stage = stage_id.map(|stage| (stage, state == "running"));
+            }
+            transaction.commit()?;
+            Ok(cancelled_stage)
+        }).await
+    }
+
+    pub async fn cancellation_requested(&self, id: String) -> Result<bool, JobError> {
+        let connection = self.connection.clone();
+        run_blocking(connection, move |connection| {
+            connection
+                .query_row(
+                    "SELECT cancel_requested FROM jobs WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+        .await
+    }
+
     pub async fn register_interval_schedule(
         &self,
         schedule: IntervalSchedule,
@@ -428,6 +629,42 @@ impl JobStore {
                 .query_row(
                     "SELECT id, queue, kind, parent_id, dedupe_key, payload_json, policy_json, state, priority, attempts, max_attempts, lease_owner, lease_until_ms, run_after_ms, progress_json, result_json, last_error, cancel_requested, created_at_ms, updated_at_ms FROM jobs WHERE id = ?1",
                     [id],
+                    row_to_job,
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn get_active_by_dedupe_key(
+        &self,
+        dedupe_key: String,
+    ) -> Result<Option<JobRecord>, JobError> {
+        let connection = self.connection.clone();
+        run_blocking(connection, move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, queue, kind, parent_id, dedupe_key, payload_json, policy_json, state, priority, attempts, max_attempts, lease_owner, lease_until_ms, run_after_ms, progress_json, result_json, last_error, cancel_requested, created_at_ms, updated_at_ms FROM jobs WHERE dedupe_key=?1 AND state IN ('pending','running','retry_wait')",
+                    [dedupe_key],
+                    row_to_job,
+                )
+                .optional()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn get_by_idempotency_key(
+        &self,
+        idempotency_key: String,
+    ) -> Result<Option<JobRecord>, JobError> {
+        let connection = self.connection.clone();
+        run_blocking(connection, move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, queue, kind, parent_id, dedupe_key, payload_json, policy_json, state, priority, attempts, max_attempts, lease_owner, lease_until_ms, run_after_ms, progress_json, result_json, last_error, cancel_requested, created_at_ms, updated_at_ms FROM jobs WHERE json_extract(payload_json,'$.idempotency_key')=?1 ORDER BY created_at_ms DESC LIMIT 1",
+                    [idempotency_key],
                     row_to_job,
                 )
                 .optional()
@@ -841,6 +1078,19 @@ pub type JobFuture<'a> = Pin<Box<dyn Future<Output = JobOutcome> + Send + 'a>>;
 
 pub trait JobHandler: Send + Sync + 'static {
     fn execute<'a>(&'a self, context: JobContext) -> JobFuture<'a>;
+
+    fn after_terminal<'a>(
+        &'a self,
+        _job: &'a JobRecord,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    /// Whether jobs of this kind may run while foreground HTTP requests are
+    /// active. The default keeps maintenance work behind the idle gate.
+    fn run_during_foreground_activity(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -962,7 +1212,6 @@ impl JobScheduler {
                 tracing::error!(error = %error, "could not materialize due scheduled jobs");
             }
             if !service_ready.load(Ordering::Acquire)
-                || !activity.is_idle_for(Duration::from_secs(self.config.idle_seconds))
                 || self
                     .config
                     .daily_utc_window
@@ -974,9 +1223,6 @@ impl JobScheduler {
                 }
                 continue;
             }
-
-            self.prune_terminal_jobs_if_due().await;
-
             let handlers = self.handlers.read().await.clone();
             if handlers.is_empty() {
                 tokio::select! {
@@ -985,7 +1231,21 @@ impl JobScheduler {
                 }
                 continue;
             }
-            let kinds = handlers.keys().cloned().collect::<Vec<_>>();
+            let idle = activity.is_idle_for(Duration::from_secs(self.config.idle_seconds));
+            let kinds = handlers
+                .iter()
+                .filter(|(_, handler)| idle || handler.run_during_foreground_activity())
+                .map(|(kind, _)| kind.clone())
+                .collect::<Vec<_>>();
+            if kinds.is_empty() {
+                tokio::select! {
+                    _ = stop.changed() => {},
+                    _ = time::sleep(self.config.poll_interval) => {},
+                }
+                continue;
+            }
+
+            self.prune_terminal_jobs_if_due().await;
             let job = match self
                 .store
                 .claim(worker_id.clone(), kinds, self.config.lease_duration)
@@ -1081,6 +1341,21 @@ impl JobScheduler {
         };
         if let Err(error) = result {
             tracing::error!(job_id = %job.id, error = %error, "could not persist job result");
+            return;
+        }
+        match self.store.get(job.id.clone()).await {
+            Ok(Some(record))
+                if matches!(
+                    record.status,
+                    JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+                ) =>
+            {
+                handler.after_terminal(&record).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(job_id = %job.id, error = %error, "could not load terminal job for cleanup")
+            }
         }
     }
 
