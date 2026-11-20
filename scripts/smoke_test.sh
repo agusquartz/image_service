@@ -88,6 +88,29 @@ expect_read_status() {
     fi
 }
 
+wait_for_image_job() {
+    local job_id="$1"
+    local output_file="$2"
+    local status
+    for _ in $(seq 1 100); do
+        status="$(curl --silent --show-error --output "$output_file" --write-out '%{http_code}' \
+            -H "Authorization: Bearer $api_key" "$base_url/api/image-jobs/$job_id")"
+        [[ "$status" == 200 ]] || fail "image job status returned HTTP $status"
+        if python3 - "$output_file" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+sys.exit(0 if value["status"] in ("succeeded", "failed", "cancelled", "superseded") else 1)
+PY
+        then
+            return
+        fi
+        sleep 0.2
+    done
+    fail "image job did not reach a terminal state"
+}
+
 start_service() {
     local auth_mode="$1"
     read_auth_policy="required"
@@ -131,11 +154,14 @@ start_service() {
             read_auth_policy="none"
             metrics_auth_required=false
             ;;
+        storage-audit)
+            args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_STORAGE_USAGE_ENABLED=true --env IMAGE_BACKGROUND_IDLE_SECONDS=0)
+            ;;
         *) args+=(--env IMAGE_API_KEY="$api_key" --env IMAGE_METRICS_ENABLED=true) ;;
     esac
 
     case "$auth_mode" in
-        default|public-read|private-read-public-write|none|rate-limit|metrics-public) ;;
+        default|public-read|private-read-public-write|none|rate-limit|metrics-public|storage-audit) ;;
         dimensions) args+=(--env IMAGE_OUTPUT_WIDTH=64 --env IMAGE_OUTPUT_HEIGHT=64) ;;
         profiles)
             args+=(
@@ -223,6 +249,111 @@ PY
         echo "PASS: IMAGE_MAX_OUTPUT_BYTES rejects output that cannot fit"
         return
     fi
+    if [[ "$auth_mode" == "storage-audit" ]]; then
+        local audit_route="$base_url/api/storage/audits"
+        expect_status 401 "$tmp_dir/audit-unauthorized" --header 'Content-Type: application/json' --data '{}' "$audit_route"
+        expect_status 201 "$tmp_dir/audit-fixture" --request POST --form "image=@$image_file" \
+            -H "Authorization: Bearer $api_key" "$base_url/api/images/products/audit-fixture/1"
+        expect_status 202 "$tmp_dir/audit-reconcile" --request POST -H "Authorization: Bearer $api_key" \
+            "$base_url/api/storage/reconcile"
+        local inventory_ready=false
+        for _ in $(seq 1 100); do
+            status="$(curl --silent --show-error --output "$tmp_dir/audit-usage.json" --write-out '%{http_code}' \
+                -H "Authorization: Bearer $api_key" "$base_url/api/storage/usage?namespace=products&resource_id=audit-fixture")"
+            if [[ "$status" == 200 ]] && python3 - "$tmp_dir/audit-usage.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+sys.exit(0 if value["scan_status"] == "complete" and value["object_count"] == 1 else 1)
+PY
+            then
+                inventory_ready=true
+                break
+            fi
+            sleep 0.2
+        done
+        [[ "$inventory_ready" == true ]] || fail "LocalFS reconciliation did not index the audit fixture"
+
+        # The mutation journal must keep the completed dashboard snapshot in
+        # sync with writes without waiting for another full reconciliation.
+        expect_status 204 "$tmp_dir/audit-live-delete" --request DELETE \
+            -H "Authorization: Bearer $api_key" "$base_url/api/images/products/audit-fixture/1"
+        expect_status 200 "$tmp_dir/audit-live-usage-delete" \
+            -H "Authorization: Bearer $api_key" "$base_url/api/storage/usage?namespace=products&resource_id=audit-fixture"
+        python3 - "$tmp_dir/audit-live-usage-delete" <<'PY' || fail "LocalFS DELETE did not immediately update usage totals"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["object_count"] == 0 and value["total_bytes"] == 0, value
+PY
+        expect_status 201 "$tmp_dir/audit-live-post" --request POST --form "image=@$image_file" \
+            -H "Authorization: Bearer $api_key" "$base_url/api/images/products/audit-fixture/1"
+        expect_status 200 "$tmp_dir/audit-live-usage-post" \
+            -H "Authorization: Bearer $api_key" "$base_url/api/storage/usage?namespace=products&resource_id=audit-fixture"
+        python3 - "$tmp_dir/audit-live-usage-post" <<'PY' || fail "LocalFS POST did not immediately update usage totals"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["object_count"] == 1 and value["total_bytes"] > 0, value
+PY
+        status="$(request_status_with_headers "$tmp_dir/audit-created" "$tmp_dir/audit-created.headers" \
+            --header 'Content-Type: application/json' --data '{"namespace":"products","resource_id":"audit-fixture"}' \
+            -H "Authorization: Bearer $api_key" "$audit_route")"
+        [[ "$status" == 202 ]] || fail "LocalFS policy audit creation returned HTTP $status"
+        grep -qi '^Cache-Control: no-store' "$tmp_dir/audit-created.headers" || fail "policy audit response did not disable caching"
+        local audit_id
+        audit_id="$(python3 - "$tmp_dir/audit-created" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["audit_id"])
+PY
+)"
+        local audit_ready=false
+        for _ in $(seq 1 100); do
+            status="$(request_status_with_headers "$tmp_dir/audit-status" "$tmp_dir/audit-status.headers" \
+                -H "Authorization: Bearer $api_key" "$base_url/api/storage/audits/$audit_id")"
+            [[ "$status" == 200 ]] || fail "LocalFS audit status returned HTTP $status"
+            if python3 - "$tmp_dir/audit-status" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+sys.exit(0 if value["status"] == "complete" else 1)
+PY
+            then
+                audit_ready=true
+                break
+            fi
+            sleep 0.2
+        done
+        [[ "$audit_ready" == true ]] || fail "LocalFS policy audit did not complete"
+        grep -qi '^Cache-Control: no-store' "$tmp_dir/audit-status.headers" || fail "audit status response did not disable caching"
+        python3 - "$tmp_dir/audit-status" <<'PY' || fail "LocalFS policy audit did not report the compliant fixture"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["inspected"] == 1 and value["compliant"] == 1 and value["violations"] == 0, value
+PY
+        expect_status 200 "$tmp_dir/audit-findings" -H "Authorization: Bearer $api_key" \
+            "$base_url/api/storage/audits/$audit_id/findings?limit=1"
+        python3 - "$tmp_dir/audit-findings" <<'PY' || fail "compliant LocalFS audit unexpectedly returned findings"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    assert json.load(f)["findings"] == []
+PY
+        stop_service
+        echo "PASS: authenticated LocalFS inventory and compliant durable policy audit"
+        return
+    fi
 
     expect_status 204 "$tmp_dir/health" "$base_url/health"
     expect_status 204 "$tmp_dir/health-live" "$base_url/health/live"
@@ -264,6 +395,66 @@ PY
         --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/2"
     expect_status 204 "$tmp_dir/put-create-cleanup" \
         --request DELETE -H "Authorization: Bearer $api_key" "$route/2"
+
+    if [[ "$auth_mode" == "default" ]]; then
+        local async_route="$base_url/api/image-jobs/products/$resource-async/1"
+        expect_status 401 "$tmp_dir/async-unauthorized" --request POST --form "image=@$image_file" "$async_route"
+        local async_status
+        async_status="$(request_status_with_headers "$tmp_dir/async-created" "$tmp_dir/async-created.headers" \
+            --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$async_route")"
+        [[ "$async_status" == "202" ]] || fail "async POST returned HTTP $async_status: $(cat "$tmp_dir/async-created")"
+        grep -qi '^Location: /api/image-jobs/' "$tmp_dir/async-created.headers" || fail "async POST omitted its job status Location"
+        local async_job_id
+        async_job_id="$(python3 - "$tmp_dir/async-created" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["job_id"])
+PY
+)"
+        expect_status 401 "$tmp_dir/async-status-unauthorized" "$base_url/api/image-jobs/$async_job_id"
+        wait_for_image_job "$async_job_id" "$tmp_dir/async-status"
+        python3 - "$tmp_dir/async-status" <<'PY' || fail "async POST job did not succeed"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["status"] == "succeeded" and value["result"]["size_bytes"] > 0, value
+PY
+        expect_status 200 "$tmp_dir/async-get" -H "Authorization: Bearer $api_key" \
+            "$base_url/api/images/products/$resource-async/1"
+        expect_status 409 "$tmp_dir/async-post-conflict" --request POST --form "image=@$image_file" \
+            -H "Authorization: Bearer $api_key" "$async_route"
+
+        local async_put_key="smoke-put-$resource"
+        async_status="$(request_status_with_headers "$tmp_dir/async-put" "$tmp_dir/async-put.headers" \
+            --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" \
+            -H "Idempotency-Key: $async_put_key" "$async_route")"
+        [[ "$async_status" == "202" ]] || fail "async PUT returned HTTP $async_status: $(cat "$tmp_dir/async-put")"
+        local async_put_job_id
+        async_put_job_id="$(python3 - "$tmp_dir/async-put" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["job_id"])
+PY
+)"
+        wait_for_image_job "$async_put_job_id" "$tmp_dir/async-put-status"
+        python3 - "$tmp_dir/async-put-status" <<'PY' || fail "async PUT job did not succeed"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["status"] == "succeeded", value
+PY
+        async_status="$(request_status_with_headers "$tmp_dir/async-put-retry" "$tmp_dir/async-put-retry.headers" \
+            --request PUT --form "image=@$image_file" -H "Authorization: Bearer $api_key" \
+            -H "Idempotency-Key: $async_put_key" "$async_route")"
+        [[ "$async_status" == "202" ]] || fail "idempotent async PUT retry returned HTTP $async_status"
+        python3 - "$tmp_dir/async-put-retry" "$async_put_job_id" <<'PY' || fail "async PUT retry did not return the existing completed job"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["job_id"] == sys.argv[2] and value["status"] == "succeeded", value
+PY
+        echo "PASS: durable async image POST/PUT, status, auth, conflicts, and idempotent retry"
+    fi
 
     expect_status 400 "$tmp_dir/post-over-slot-limit" \
         --request POST --form "image=@$image_file" -H "Authorization: Bearer $api_key" "$route/$over_limit_slot"
@@ -642,6 +833,7 @@ test_mode profiles
 test_mode max-slots
 test_mode input-limit
 test_mode output-limit
+test_mode storage-audit
 
 start_service private-read-public-write
 expect_status 201 "$tmp_dir/public-write" \

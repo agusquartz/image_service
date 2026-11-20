@@ -20,6 +20,29 @@ fail() {
     exit 1
 }
 
+wait_for_image_job() {
+    local job_id="$1"
+    local output_file="$2"
+    local status
+    for _ in $(seq 1 100); do
+        status="$(curl --silent --show-error --output "$output_file" --write-out '%{http_code}' \
+            -H 'Authorization: Bearer storage-usage-smoke-key' "$service_url/api/image-jobs/$job_id")"
+        [[ "$status" == 200 ]] || fail "MinIO image job status returned HTTP $status"
+        if python3 - "$output_file" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+sys.exit(0 if value["status"] in ("succeeded", "failed", "cancelled", "superseded") else 1)
+PY
+        then
+            return
+        fi
+        sleep 0.2
+    done
+    fail "MinIO image job did not reach a terminal state"
+}
+
 cleanup() {
     docker rm --force "$service_name" "$minio_name" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
@@ -77,8 +100,8 @@ docker run --detach --rm \
     --env IMAGE_MAX_SLOTS=1 \
     --env IMAGE_OUTPUT_WIDTH=1024 \
     --env IMAGE_OUTPUT_HEIGHT=1024 \
-    --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"max_output_bytes":25600,"output_width":32,"output_height":32}}' \
-    --env 'IMAGE_NAMESPACE_PROFILES={"profile-smoke":"avatar"}' \
+    --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"max_output_bytes":25600,"output_width":32,"output_height":32},"maintenance":{"output_width":64,"output_height":64}}' \
+    --env 'IMAGE_NAMESPACE_PROFILES={"profile-smoke":"avatar","maintenance-smoke":"maintenance"}' \
     "$image_name" >/dev/null
 
 service_port="$(docker port "$service_name" 3000/tcp | awk -F: 'NR == 1 {print $NF}')"
@@ -256,6 +279,60 @@ status="$(curl --silent --show-error \
 [[ "$status" == 200 ]] || fail "direct GET via the MinIO presigned URL returned HTTP $status"
 cmp -s "$tmp_dir/image.webp" "$tmp_dir/presigned.webp" || fail "presigned GET returned different image bytes"
 
+# Exercise durable staged processing on the S3-compatible backend.
+async_route="$service_url/api/image-jobs/minio-smoke/async-resource/1"
+status="$(curl --silent --output "$tmp_dir/async-created.json" --write-out '%{http_code}' \
+    --request POST --form "image=@$image_file" --header 'Authorization: Bearer storage-usage-smoke-key' \
+    --header 'Idempotency-Key: minio-async-post-1' "$async_route")"
+[[ "$status" == 202 ]] || fail "MinIO async POST returned HTTP $status: $(cat "$tmp_dir/async-created.json")"
+async_job_id="$(python3 - "$tmp_dir/async-created.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["job_id"])
+PY
+)"
+wait_for_image_job "$async_job_id" "$tmp_dir/async-status.json"
+python3 - "$tmp_dir/async-status.json" <<'PY' || fail "MinIO async POST job did not succeed"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["status"] == "succeeded" and value["result"]["size_bytes"] > 0, value
+PY
+status="$(curl --silent --output "$tmp_dir/async-published.webp" --write-out '%{http_code}' \
+    -H 'Authorization: Bearer storage-usage-smoke-key' "$service_url/api/images/minio-smoke/async-resource/1")"
+[[ "$status" == 200 ]] || fail "MinIO async POST result returned HTTP $status"
+status="$(curl --silent --output "$tmp_dir/async-conflict.json" --write-out '%{http_code}' \
+    --request POST --form "image=@$image_file" --header 'Authorization: Bearer storage-usage-smoke-key' "$async_route")"
+[[ "$status" == 409 ]] || fail "MinIO async duplicate POST returned HTTP $status"
+
+status="$(curl --silent --output "$tmp_dir/async-put.json" --write-out '%{http_code}' \
+    --request PUT --form "image=@$image_file" --header 'Authorization: Bearer storage-usage-smoke-key' \
+    --header 'Idempotency-Key: minio-async-put-1' "$async_route")"
+[[ "$status" == 202 ]] || fail "MinIO async PUT returned HTTP $status: $(cat "$tmp_dir/async-put.json")"
+async_put_job_id="$(python3 - "$tmp_dir/async-put.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["job_id"])
+PY
+)"
+wait_for_image_job "$async_put_job_id" "$tmp_dir/async-put-status.json"
+python3 - "$tmp_dir/async-put-status.json" <<'PY' || fail "MinIO async PUT job did not succeed"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    assert json.load(f)["status"] == "succeeded"
+PY
+status="$(curl --silent --output "$tmp_dir/async-put-retry.json" --write-out '%{http_code}' \
+    --request PUT --form "image=@$image_file" --header 'Authorization: Bearer storage-usage-smoke-key' \
+    --header 'Idempotency-Key: minio-async-put-1' "$async_route")"
+[[ "$status" == 202 ]] || fail "MinIO async PUT idempotent retry returned HTTP $status"
+python3 - "$tmp_dir/async-put-retry.json" "$async_put_job_id" <<'PY' || fail "MinIO idempotent retry did not return the completed job"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["job_id"] == sys.argv[2] and value["status"] == "succeeded", value
+PY
+echo "PASS: MinIO durable async image POST/PUT, status, conflicts, and idempotent retry"
+
 # Seed a legacy slot above the configured creation ceiling directly in S3.
 curl --fail --silent --show-error \
     --aws-sigv4 "aws:amz:us-east-1:s3" \
@@ -379,6 +456,14 @@ sleep 0.2
 status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$cancel_route")"
 [[ "$status" == 404 ]] || fail "cancelled MinIO upload stored an incomplete object (HTTP $status)"
 
+# Simulate a legacy/direct-to-storage image that violates the namespace profile.
+# Inventory verification should detect and automatically normalize it to WebP.
+curl --fail --silent --show-error \
+    --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "$access_key:$secret_key" \
+    --upload-file "$image_file" \
+    "$minio_url/$bucket/maintenance-smoke/1/01.webp" >/dev/null
+
 usage_route="$service_url/api/storage/usage"
 status="$(curl --silent --output "$tmp_dir/usage-unauthorized.json" --write-out '%{http_code}' "$usage_route")"
 [[ "$status" == 401 ]] || fail "MinIO storage usage endpoint returned HTTP $status without its independent API key"
@@ -415,5 +500,105 @@ assert payload["object_count"] == 1 and payload["total_bytes"] > 0, payload
 assert payload["stale"] is False, payload
 PY
 
-echo "PASS: MinIO uploads, replacement, snapshot-consistent GETs during external writes, stale conditional validators, HEAD, metadata, listing, profiles, presigned GET, DELETE races, cancellation, resource DELETE, and authenticated storage usage reconciliation"
+maintenance_info_route="$service_url/api/images/maintenance-smoke/1/1/info"
+maintenance_complete=false
+for _ in $(seq 1 150); do
+    status="$(curl --silent --output "$tmp_dir/maintenance-info.json" --write-out '%{http_code}' \
+        --header 'Authorization: Bearer storage-usage-smoke-key' "$maintenance_info_route")"
+    if [[ "$status" == 200 ]] && python3 - "$tmp_dir/maintenance-info.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+sys.exit(0 if value["format"] == "webp" and value["width"] == 64 and value["height"] == 64 else 1)
+PY
+    then
+        maintenance_complete=true
+        break
+    fi
+    sleep 0.2
+done
+[[ "$maintenance_complete" == true ]] || fail "automatic MinIO maintenance did not reprocess the legacy image under its namespace profile"
+
+# Service writes should adjust an already-completed usage snapshot without
+# waiting for the next full reconciliation.
+live_route="$service_url/api/images/minio-smoke/resource-delete-extra/1"
+status="$(curl --silent --output /dev/null --write-out '%{http_code}' --request DELETE \
+    --header 'Authorization: Bearer storage-usage-smoke-key' "$live_route")"
+[[ "$status" == 204 ]] || fail "MinIO catalog freshness DELETE returned HTTP $status"
+status="$(curl --silent --output "$tmp_dir/usage-after-delete.json" --write-out '%{http_code}' \
+    --header 'Authorization: Bearer storage-usage-smoke-key' \
+    "$usage_route?namespace=minio-smoke&resource_id=resource-delete-extra")"
+[[ "$status" == 200 ]] || fail "MinIO usage query after DELETE returned HTTP $status"
+python3 - "$tmp_dir/usage-after-delete.json" <<'PY' || fail "MinIO DELETE did not immediately update usage totals"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["object_count"] == 0 and value["total_bytes"] == 0, value
+PY
+status="$(curl --silent --output "$tmp_dir/live-upload.json" --write-out '%{http_code}' \
+    --request POST --header 'Authorization: Bearer storage-usage-smoke-key' \
+    --form "image=@$image_file" "$live_route")"
+[[ "$status" == 201 ]] || fail "MinIO catalog freshness POST returned HTTP $status"
+status="$(curl --silent --output "$tmp_dir/usage-after-post.json" --write-out '%{http_code}' \
+    --header 'Authorization: Bearer storage-usage-smoke-key' \
+    "$usage_route?namespace=minio-smoke&resource_id=resource-delete-extra")"
+[[ "$status" == 200 ]] || fail "MinIO usage query after POST returned HTTP $status"
+python3 - "$tmp_dir/usage-after-post.json" <<'PY' || fail "MinIO POST did not immediately update usage totals"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    value = json.load(f)
+assert value["object_count"] == 1 and value["total_bytes"] > 0, value
+PY
+
+audits_route="$service_url/api/storage/audits"
+status="$(curl --silent --output "$tmp_dir/audit-unauthorized.json" --write-out '%{http_code}' \
+    --header 'Content-Type: application/json' --data '{}' "$audits_route")"
+[[ "$status" == 401 ]] || fail "MinIO policy audit endpoint returned HTTP $status without its independent API key"
+status="$(curl --silent --output "$tmp_dir/audit-created.json" --write-out '%{http_code}' \
+    --header 'Authorization: Bearer storage-usage-smoke-key' --header 'Content-Type: application/json' \
+    --data '{"namespace":"minio-smoke"}' "$audits_route")"
+[[ "$status" == 202 ]] || fail "MinIO policy audit creation returned HTTP $status: $(cat "$tmp_dir/audit-created.json")"
+audit_id="$(python3 - "$tmp_dir/audit-created.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["audit_id"])
+PY
+)"
+for _ in $(seq 1 100); do
+    status="$(curl --silent --dump-header "$tmp_dir/audit.headers" --output "$tmp_dir/audit.json" --write-out '%{http_code}' \
+        --header 'Authorization: Bearer storage-usage-smoke-key' "$service_url/api/storage/audits/$audit_id")"
+    [[ "$status" == 200 ]] || fail "MinIO policy audit status returned HTTP $status"
+    if python3 - "$tmp_dir/audit.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    sys.exit(0 if json.load(f)["status"] == "complete" else 1)
+PY
+    then
+        break
+    fi
+    sleep 0.2
+done
+grep -qi '^Cache-Control: no-store' "$tmp_dir/audit.headers" || fail "policy audit response did not disable caching"
+status="$(curl --silent --output "$tmp_dir/audit-findings.json" --write-out '%{http_code}' \
+    --header 'Authorization: Bearer storage-usage-smoke-key' \
+    "$service_url/api/storage/audits/$audit_id/findings?limit=50")"
+[[ "$status" == 200 ]] || fail "MinIO policy audit findings returned HTTP $status"
+python3 - "$tmp_dir/audit.json" "$tmp_dir/audit-findings.json" <<'PY' || fail "policy audit did not inspect and report the externally changed invalid fixture"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    summary = json.load(f)
+with open(sys.argv[2], encoding="utf-8") as f:
+    findings = json.load(f)["findings"]
+assert summary["inventory_scan_id"], summary
+assert summary["inspected"] >= 1, summary
+assert any(item["code"] in ("invalid_or_unsupported_image", "inspection_error") for item in findings), findings
+PY
+
+echo "PASS: MinIO uploads, replacement, snapshot-consistent GETs during external writes, stale conditional validators, HEAD, metadata, listing, profiles, presigned GET, DELETE races, cancellation, resource DELETE, journaled live usage updates, automatic policy verification/maintenance, storage reconciliation, and durable policy audit"
 echo "Both containers used ephemeral storage; all test data was removed during cleanup."
