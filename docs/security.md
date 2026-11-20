@@ -19,6 +19,7 @@ The service includes several defensive measures:
 - Restricted resource-ID characters.
 - Bounded image-processing concurrency.
 - Separate upload admission and compressed-body budget before multipart reads; configurable whole-body read timeout.
+- Optional async image jobs stream uploaded source data into a private backend staging prefix, enforce the configured source-size limit, and reject detected unsupported or MIME-mismatched formats during receipt.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
 - Per-client read/write rate limits with a `429` response and `Retry-After`.
@@ -66,14 +67,37 @@ The intended deployment is one service instance per customer. Authentication key
 
 The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
+The explicit `POST` and `PUT /api/image-jobs/...` endpoints require write
+authentication and stage unprocessed uploads under the backend's private
+`__image_jobs/` prefix. `GET /api/image-jobs/{job_id}` also requires write
+authentication because it exposes the destination and processing result. Keep
+the staging backend and SQLite job database on persistent, access-controlled
+storage. Accepted jobs can survive process restarts only when both are
+persistent; staging objects are removed after terminal completion or during
+orphan cleanup at startup. The API does not expose a general job listing or
+cancellation endpoint.
+
 Storage usage reporting is opt-in through `IMAGE_STORAGE_USAGE_ENABLED`. When
-enabled, `GET /api/storage/usage` and `POST /api/storage/reconcile` always
+enabled, all `/api/storage/*` usage, reconciliation, and audit endpoints always
 require `IMAGE_API_KEY`, even if image reads are public. The endpoints return
 `Cache-Control: no-store`; the aggregate storage totals are operational data,
 not public image metadata. Enabling reporting without a key prevents startup.
-The SQLite inventory database contains object keys, namespace/resource/slot
-identifiers, sizes, and available storage validators, so protect and back up
-its volume with the same care as the durable job database.
+The SQLite storage catalog contains object keys, namespace/resource/slot
+identifiers, sizes, validators, mutation journal entries, policy verification
+results, and audit findings. Protect and back up its volume with the same care
+as the durable job database.
+
+Explicit policy audits read and decode stored image contents in bounded
+batches but do not modify them. Separately, automatic verification can enqueue
+maintenance for images that violate configured processing rules. Maintenance
+runs only through the idle/window-gated internal scheduler, uses the normal
+image processor and memory/CPU limits, and conditionally replaces only the
+object version it inspected. Invalid or uninspectable objects are not
+automatically rewritten. A successful maintenance write is journaled and
+verified again. Keep the catalog on persistent storage and restrict access to
+it as operational data. Audit results use a captured inventory watermark;
+storage can change between inventory and inspection, and objects without
+validators cannot be proven unchanged.
 
 ## Rate Limiting and Observability
 

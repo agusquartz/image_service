@@ -14,23 +14,248 @@ progress, results, errors, and events in SQLite. It is a single-Core-instance
 design: do not share the SQLite database between service replicas or put its
 WAL files on NFS/SMB.
 
-The scheduler currently runs **internal system jobs only**. It has no public
-generic job API, no endpoint for inspecting or cancelling arbitrary jobs, and
-no remote worker execution. The `worker-protocol` feature contains DTOs only.
-The storage usage API is the only current public way to request a background
-job, and it exposes a narrow operation rather than the scheduler itself.
+The scheduler runs internal system jobs and one narrow user-facing job type:
+asynchronous image processing. It has no public generic job API, no endpoint
+for listing or cancelling arbitrary jobs, and no remote worker execution. The
+`worker-protocol` feature contains DTOs only. Existing `/api/images/...`
+routes remain synchronous; the explicit `/api/image-jobs/...` routes stage an
+upload and return a durable job ID. A narrow status endpoint exposes only
+those image-processing jobs.
+
+`image.processing` is registered whenever image support is compiled. When
+`IMAGE_STORAGE_USAGE_ENABLED=true`, five additional queue names are registered:
+`storage.catalog`, `storage.inventory`, `storage.verify`,
+`storage.maintenance`, and `storage.audit`. All queues share the scheduler's
+persistent jobs database and bounded dispatcher; queues are logical partitions,
+not separate processes or dedicated threads.
+
+## Queue map
+
+### Queues registered in this build
+
+| Queue | Example job kind | Who creates work | Purpose |
+| --- | --- | --- | --- |
+| `image.processing` | `image.process.staged` | Authenticated POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}` | Reads a durable staged source, applies the captured processing profile, conditionally publishes to the target slot, updates the usage journal when enabled, and removes staging after a terminal job result. This queue may run during foreground traffic, bounded by scheduler concurrency, upload memory admission, and the image-processing semaphore. |
+| `storage.catalog` | `storage.catalog.refresh` | Pending journal recovery on startup or after a storage error | Re-stat current object/resource state and reconcile catalog entries idempotently. |
+| `storage.inventory` | `storage.inventory.reconcile` | Persisted hourly interval schedule, or authenticated `POST /api/storage/reconcile` | List canonical image-slot objects and publish a complete metadata snapshot; queue verification candidates. Scheduled priority is `-10`; manual priority is `20`. |
+| `storage.verify` | `storage.verify.object` | Catalog recovery, completed inventory, or a maintenance write | Skip decoding when size, ETag, and effective policy fingerprint match a prior verification; inspect changed/new images and queue repairable violations. Successful API uploads are recorded as compliant directly from the processor result. |
+| `storage.maintenance` | `storage.maintenance.image` | Verification finds a repairable policy violation | Reprocess one captured version under bounded resource limits and conditionally publish only if the object has not changed. Successful writes are journaled and verified again. |
+| `storage.audit` | `storage.policy.audit` | Authenticated `POST /api/storage/audits` | Inspect a pinned inventory against the captured policy snapshot and persist findings. This explicit report remains read-only. Priority is `-20`. |
+
+All registered queues feed the same scheduler. `IMAGE_BACKGROUND_JOB_CONCURRENCY`
+limits the number of jobs claimed at once, regardless of queue. The scheduler
+uses priority and age to select eligible work. Image processing may run while
+requests are active; catalog, inventory, verification, maintenance, and audit
+work wait for the configured idle period. All jobs obey service readiness,
+the optional UTC window, and lease rules. Maintenance has lower priority than
+verification, and both yield to foreground HTTP traffic. The initial inventory schedule is due
+immediately on a new database; later automatic runs use
+`IMAGE_STORAGE_INVENTORY_INTERVAL_SECONDS`. The manual reconciliation route
+and the audit creation route enqueue durable jobs; callers do not run the
+worker or manually resume an interrupted job.
+
+```mermaid
+flowchart LR
+    HTTP["HTTP API<br/>GET, POST, PUT, DELETE<br/>direct request path"]
+    ASYNC_HTTP["POST / PUT /api/image-jobs/...<br/>stream multipart into private staging"]
+    SCHEDULER["SQLite/WAL job catalog<br/>bounded in-process dispatcher"]
+    IMAGE_QUEUE["Queue: image.processing<br/>image.process.staged<br/>runs while API traffic is active"]
+    IMAGE_STATUS["GET /api/image-jobs/{job_id}<br/>narrow authenticated status"]
+    INVENTORY["Queue: storage.inventory<br/>storage.inventory.reconcile<br/>interval or POST /api/storage/reconcile"]
+    CATALOG_QUEUE["Queue: storage.catalog<br/>storage.catalog.refresh<br/>journal recovery"]
+    VERIFY["Queue: storage.verify<br/>storage.verify.object<br/>recovery, inventory, repair"]
+    MAINT["Queue: storage.maintenance<br/>storage.maintenance.image<br/>policy violation"]
+    AUDIT["Queue: storage.audit<br/>storage.policy.audit<br/>POST /api/storage/audits"]
+    OBJECTS["OpenDAL storage<br/>LocalFS or S3"]
+    IMAGE_RESULT["Published WebP slot<br/>GET remains available during async PUT"]
+    CATALOG["SQLite storage catalog<br/>inventory, journal, verification,<br/>audit findings"]
+
+    HTTP --> OBJECTS
+    HTTP -->|journal before mutation| CATALOG
+    HTTP -->|manual background request| SCHEDULER
+    ASYNC_HTTP -->|staged source + durable job row| SCHEDULER
+    ASYNC_HTTP --> OBJECTS
+    SCHEDULER --> IMAGE_QUEUE
+    IMAGE_QUEUE -->|read, process, conditional publish| OBJECTS
+    IMAGE_QUEUE --> IMAGE_RESULT
+    ASYNC_HTTP -->|202 + job id| IMAGE_STATUS
+    SCHEDULER --> INVENTORY
+    SCHEDULER --> CATALOG_QUEUE
+    SCHEDULER --> VERIFY
+    SCHEDULER --> MAINT
+    SCHEDULER --> AUDIT
+    INVENTORY -->|list keys and metadata| OBJECTS
+    INVENTORY -->|publish completed snapshot| CATALOG
+    INVENTORY -->|queue candidates| VERIFY
+    CATALOG_QUEUE -->|reconcile current storage state| CATALOG
+    VERIFY -->|stat and inspect when needed| OBJECTS
+    VERIFY -->|persist result| CATALOG
+    VERIFY -->|repairable violation| MAINT
+    MAINT -->|conditional WebP replacement| OBJECTS
+    MAINT -->|journal and verify again| VERIFY
+    AUDIT -->|read pinned inventory| CATALOG
+    AUDIT -->|read and inspect selected objects| OBJECTS
+    AUDIT -->|persist findings and checkpoints| CATALOG
+```
+
+### Asynchronous image upload pipeline
+
+`POST` and `PUT /api/image-jobs/{namespace}/{resource_id}/{slot}` are an
+explicit alternative to the synchronous image routes. The handler validates
+the target and current slot rules, streams the multipart image into the
+configured OpenDAL backend under the private `__image_jobs/` prefix, then
+atomically records a durable `image.process.staged` job in SQLite/WAL. The
+client receives `202 Accepted` only after both the staged object and job row
+exist. If job admission fails, the staged object is removed.
+
+The source body is streamed to storage instead of retained as one in-memory
+buffer while receiving. Processing later reads the staged source under the
+normal upload-memory admission and CPU-processing semaphore, applies the
+captured namespace policy, and publishes the WebP result. The job worker is
+allowed to claim this one user-facing queue while HTTP requests are active;
+its concurrency remains bounded by the shared scheduler limit and image
+processing admission. It still observes service readiness, lease and UTC
+window rules. Inventory, verification, audit, and maintenance jobs continue
+to wait for the configured quiet period.
+
+The staging object and job database must both be on persistent storage for
+accepted work to survive restart. Startup removes orphaned staging objects
+that have no active job reference. Terminal job records are retained according
+to `IMAGE_JOB_RETENTION_DAYS`; terminal staging data is deleted.
+
+The target is serialized by a bounded set of in-process resource locks. POST
+is create-only. PUT may create or replace and supersedes an older active async
+job for the same target. Synchronous POST/PUT/DELETE operations also cancel
+pending work for that target; running work checks cancellation and a publish
+fence before writing. An async PUT leaves the current image readable until
+the new result is ready. `GET /api/image-jobs/{job_id}` requires write
+authentication and reports only image-job state and result; there is no
+general job list or public cancellation endpoint. Optional `Idempotency-Key`
+allows safe retries of the same method, target, and content.
+
+### Mutation, verification, and maintenance pipeline
+
+This pipeline is implemented when storage usage is enabled. Before a POST,
+PUT, slot DELETE, or resource DELETE reaches OpenDAL, the service writes a
+durable journal row containing operation ID, method, namespace, resource,
+optional slot, status, and timestamps. Once storage succeeds, it reads current
+metadata, updates the completed catalog snapshot and any active scan, marks the
+journal applied, and returns success. POST/PUT results are known to satisfy the
+effective policy because they came from the processor, so their validators and
+policy fingerprint are recorded as compliant without decoding the result a
+second time. A resource-level DELETE records its namespace/resource scope and
+removes every indexed slot in one idempotent update.
+
+Before the first full scan, the catalog still maintains an incremental live
+snapshot for writes made through this service. Usage can therefore report
+those objects immediately while returning `scan_status: "never"` and
+`stale: true`; an audit still requires a completed full-inventory watermark.
+
+OpenDAL and SQLite do not share a transaction. If the process exits between a
+storage mutation and catalog update, the journal survives; startup recovery
+copies pending rows into `storage.catalog`. Storage failures enqueue the same
+recovery work immediately. Recovery re-stats actual storage state rather than
+replaying a stale byte delta, so retries and DELETE-then-PUT sequences do not
+double-count. Service mutations update dashboard totals promptly. Direct
+LocalFS/S3 changes appear after the next full reconciliation.
+
+The inventory job lists keys and metadata only, then submits candidates to
+`storage.verify`. Recovery and inventory candidates compare size, ETag, and a fingerprint of the
+effective global/profile policy with its last result. If they match, image
+decoding is skipped. Otherwise it inspects format, animation, dimensions, and
+output size and records the result in `storage_verification_state`. A policy
+change alters the fingerprint, so the next inventory pass schedules inspection
+under the new rules.
+
+Repairable violations create low-priority `storage.maintenance.image` jobs.
+Maintenance waits for the idle gate, reads and processes one captured version
+under the existing memory and CPU limits, then conditionally replaces it: S3
+backends use ETag `If-Match`; LocalFS serializes metadata comparison and write
+under the resource lock. A newer image is not overwritten. The replacement is
+journaled and verified again. Invalid or uninspectable objects are recorded
+without automatic overwrite; a failed repair leaves the existing object in
+place and the job failure in SQLite.
+
+| Queue | Example job kind | Who creates work | Purpose |
+| --- | --- | --- | --- |
+| `storage.catalog` | `storage.catalog.refresh` | Startup recovery for pending journal rows or after storage errors | Reconcile actual current slot/resource state and queue verification for present objects. |
+| `storage.inventory` | `storage.inventory.reconcile` | Persisted periodic schedule or authenticated manual reconcile | List storage, promote the complete metadata snapshot, then queue candidates for verification. |
+| `storage.verify` | `storage.verify.object` | Catalog recovery, inventory completion, or maintenance write | Skip unchanged versions; inspect changed objects and enqueue maintenance for repairable violations. API uploads are marked compliant from the processor result. |
+| `storage.maintenance` | `storage.maintenance.image` | Verification of a repairable violation | Reprocess one version, conditionally replace it, journal the write, then verify again. |
+
+```mermaid
+flowchart LR
+    MUTATION["POST / PUT / DELETE<br/>HTTP mutation request"] --> JOURNAL["Durable mutation journal<br/>method, keys, operation id"]
+    JOURNAL --> STORAGE_WRITE["OpenDAL write or delete"]
+    STORAGE_WRITE -->|success| INLINE["Apply idempotent catalog delta<br/>before successful HTTP response"]
+    INLINE --> CATALOG["Usage catalog<br/>dashboard bytes and object counts"]
+    JOURNAL -. "startup or storage failure" .-> CATALOG_QUEUE["Queue: storage.catalog<br/>storage.catalog.refresh"]
+    CATALOG_QUEUE -->|reconcile actual key state| CATALOG
+
+    SCHEDULE["Automatic interval schedule"] --> DISCOVERY_QUEUE["Queue: storage.inventory<br/>storage.inventory.reconcile"]
+    DISCOVERY_QUEUE -->|list keys and metadata| STORAGE["OpenDAL storage"]
+    DISCOVERY_QUEUE -->|candidate keys| VERIFY_QUEUE["Queue: storage.verify<br/>storage.verify.object"]
+    DISCOVERY_QUEUE --> CATALOG
+    VERIFY_QUEUE -->|stat and inspect selected image| STORAGE
+    VERIFY_QUEUE -->|current and compliant| CATALOG
+    VERIFY_QUEUE -->|repairable policy violation| MAINT_QUEUE["Queue: storage.maintenance<br/>storage.maintenance.image"]
+    MAINT_QUEUE -->|conditional publish| STORAGE
+    MAINT_QUEUE -->|enqueue post-write check| VERIFY_QUEUE
+    CATALOG --> DASHBOARD["Authenticated usage API"]
+```
+
+The journal records operation ID, HTTP method, namespace, resource, optional
+slot, status, and timestamps. Updates reconcile actual current state rather
+than replaying stale byte deltas. Resource DELETE is recorded as a scope, not
+an in-memory list of every slot. Verification jobs are deduplicated by object
+key, ETag, and size. Conditional maintenance protects newer uploads.
+
+There is no separate human `review` queue in this design. Durable job status
+and the post-maintenance verification job provide the review trail. The
+existing synchronous upload contract remains: a new or replaced image is
+available to `GET` after the request succeeds. The explicit async endpoint
+returns before processing; its status resource reports when the result is
+published. Background maintenance keeps the currently published image
+readable until a validated replacement can be published safely. A failed
+repair leaves the old object in place and records the failure for inspection.
+
+The image-job status endpoint is not a generic job-status API. The usage API
+exposes aggregate bytes and object counts, not per-object verification state
+or maintenance progress. The internal scheduler queue is not exposed.
+
+The periodic listing remains necessary to discover direct changes in LocalFS
+or S3 that bypass the service journal. When no mutations or detected changes
+exist, there are no per-object catalog, verification, or maintenance jobs to
+run. The periodic listing still incurs backend listing requests; no portable
+OpenDAL notification currently tells the service that external storage changed.
 
 ## Registered work
 
 | Job kind | Queue | How it is created | What it does | Current state |
 | --- | --- | --- | --- | --- |
-| `storage.inventory.reconcile` | `storage.inventory` | Periodic schedule when `IMAGE_STORAGE_USAGE_ENABLED=true`; also by `POST /api/storage/reconcile` | Streams the storage listing, indexes canonical image-slot WebP metadata in batches of 250, then promotes a complete catalog snapshot | Implemented |
+| `image.process.staged` | `image.processing` | Authenticated POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}` | Processes a durable staged source and publishes a WebP result; status is available from `GET /api/image-jobs/{job_id}` | Implemented |
+| `storage.catalog.refresh` | `storage.catalog` | Startup recovery for pending journal rows or after storage errors | Reconciles current slot/resource state and queues verification for present images | Implemented |
+| `storage.inventory.reconcile` | `storage.inventory` | Periodic schedule or `POST /api/storage/reconcile` | Lists canonical image-slot metadata in batches of 250, promotes a complete snapshot, and queues verification candidates | Implemented |
+| `storage.verify.object` | `storage.verify` | Catalog recovery, inventory completion, or maintenance write | Skips unchanged versions; otherwise inspects and records policy compliance, queueing repairable violations. API uploads are marked compliant from the processor result. | Implemented |
+| `storage.maintenance.image` | `storage.maintenance` | Verification finds a repairable violation | Reprocesses a captured version, conditionally replaces it, journals the write, then verifies again | Implemented |
+| `storage.policy.audit` | `storage.audit` | `POST /api/storage/audits` when storage usage is enabled | Inspects a pinned inventory and policy snapshot in small batches; records findings without changing objects | Implemented |
 
-The inventory job reads object keys and metadata. It does not read or decode
-image bodies and it does not repair or rewrite objects. A failed or interrupted
-scan leaves the last successfully completed snapshot available. See the
+The inventory job reads object keys and metadata. It does not decode image
+bodies or repair objects. A failed or interrupted scan leaves the last
+successfully completed snapshot available. See the
 [storage usage API](api.md#storage-usage-reporting) for its query and response
 semantics.
+
+The policy audit is separate from automatic verification and remains read-only. It decodes image bodies to inspect WebP format,
+animation, dimensions, and output size; it does not transform or write objects.
+It captures the effective global and namespace profile settings at start,
+checks indexed size and ETag when available, and retains the source inventory
+while queued or running. Progress and findings are persisted in the storage
+catalog so a retry or process restart resumes after the last object recorded.
+It uses the image upload memory budget and image-processing semaphore, limits
+each batch to ten objects, and waits for the foreground idle period between
+batches. `GET /api/storage/audits/{audit_id}` reports progress and
+`GET /api/storage/audits/{audit_id}/findings` returns paginated results.
 
 Periodic schedule details:
 
@@ -75,9 +300,17 @@ closing does not stop an already running handler. Other handlers must make
 their work units bounded and honor checkpoints/cancellation if they need
 similar yielding behavior.
 
-`IMAGE_BACKGROUND_IDLE_SECONDS=0` removes the delay since last activity, but
-the dispatcher still requires zero active API requests. An optional UTC
-window is an additional condition, not a replacement for idleness.
+The quiet-period gate applies to system catalog and policy work. The
+`image.processing` handler opts into dispatch during foreground HTTP activity,
+so it can process explicitly accepted user uploads even on a busy service.
+It remains bounded by the shared scheduler concurrency, upload memory budget,
+and image-processing semaphore. All work still obeys readiness, handler,
+dependency, lease, due-time, and optional UTC-window checks.
+
+`IMAGE_BACKGROUND_IDLE_SECONDS=0` removes the delay since last activity for
+system jobs, but the dispatcher still requires zero active API requests before
+claiming those jobs. An optional UTC window is an additional condition, not a
+replacement for idleness.
 
 ## Adding another system job
 
@@ -148,11 +381,18 @@ work and inventory state when the container is removed.
   worker transport or cross-instance coordination.
 - Persisted jobs whose handler is not registered remain unclaimed; disabling a
   feature does not delete their rows.
-- There is no public job listing, job detail, or cancellation API.
-- Storage policy audits, repair/recompression, inventory of other processor
-  types, and configurable per-queue scheduling policies are not implemented.
-- The scheduler persists jobs and periodic schedule definitions, but currently
-  only the storage inventory handler is registered by the application.
+- There is no public generic job listing or cancellation API. Only image-job
+  details are exposed through `GET /api/image-jobs/{job_id}`.
+- The periodic inventory still lists all canonical image slots. Verification
+  jobs are cheap when metadata and policy match, but the scheduler currently
+  does not compare the listing to its prior snapshot before enqueueing them.
+- Automatic repair applies only to canonical image slots and the image
+  processor's current WebP policy. It does not cover other processor types.
+- There is no per-queue concurrency or time-window configuration; priorities
+  share the scheduler-wide concurrency limit and idle/window gates.
+- Aggregate usage is public through authenticated API endpoints, but journal,
+  verification, and maintenance job detail is internal and not exposed to a
+  dashboard.
 
 These boundaries are intentional for the current release. New system jobs
 should document their trigger, queue, idempotency, checkpoints, retry policy,
@@ -166,7 +406,7 @@ load impact, and shutdown behavior before registration.
   registration, startup, and graceful drain.
 - `crates/file-core/src/state.rs`: scheduler configuration and shared
   activity/readiness state.
-- `crates/file-core/src/storage_usage.rs`: inventory schedule, manual trigger,
-  batching, quiet-period yielding, and snapshot promotion.
+- `crates/file-core/src/storage_usage.rs`: inventory and audit handlers,
+  authenticated API triggers, checkpoints, findings, and catalog persistence.
 - [Configuration](configuration.md#durable-internal-job-scheduler): runtime
   environment variables and defaults.

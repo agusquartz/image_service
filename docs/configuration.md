@@ -544,7 +544,7 @@ Invalid, empty, or zero values fall back to the default.
 
 ### Upload admission and body budget
 
-`IMAGE_MAX_UPLOADS_IN_FLIGHT` limits the number of uploads that can read or retain a source body concurrently. Default: `4` (valid range `1..=1024`). `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES` limits the compressed source bodies reserved across those uploads. Its default is four times the largest effective input limit across the global policy and assigned namespace profiles, with each input rounded up to 1 MiB; with the default 15 MiB input limit, it is 60 MiB. It must cover the largest configured input. Reservations are rounded up to 1 MiB per upload and the available budget is rounded down, so a very small explicitly configured budget may reject startup. Both limits are checked before the server reads the multipart body. The selected namespace/profile's maximum is then enforced incrementally against the actual chunks, regardless of `Content-Length`. When admission capacity is exhausted, the upload receives `503 Service Unavailable` (service temporarily unavailable) with `Retry-After: 1` and may be retried.
+`IMAGE_MAX_UPLOADS_IN_FLIGHT` limits concurrent upload admission. Default: `4` (valid range `1..=1024`). Synchronous image routes and async job workers reserve `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES` while retaining compressed source bodies. Its default is four times the largest effective input limit across the global policy and assigned namespace profiles, with each input rounded up to 1 MiB; with the default 15 MiB input limit, it is 60 MiB. It must cover the largest configured input. Reservations are rounded up to 1 MiB per upload and the available budget is rounded down, so a very small explicitly configured budget may reject startup. The limits are checked before reading the multipart body. The selected namespace/profile's maximum is then enforced against actual chunks, regardless of `Content-Length`. Async image-job uploads stream their source to the backend staging prefix rather than retaining the whole body in RAM; they reserve a fixed 5 MiB writer-buffer allowance per in-flight staged upload. When admission capacity is exhausted, the upload receives `503 Service Unavailable` (service temporarily unavailable) with `Retry-After: 1` and may be retried.
 
 `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` limits the entire multipart read. Default: `120`; valid range `1..=86400`. A timeout returns `408 Request Timeout` (request timed out). Upload admission remains reserved while the source is being processed, even if the client disconnects after CPU work starts; the existing `IMAGE_MAX_CONCURRENCY` continues to limit the encoder separately. The body budget covers compressed source bytes, not decoder buffers, WebP output, HTTP/proxy buffers or allocator overhead. Set container memory limits with those additional costs in mind.
 
@@ -552,11 +552,12 @@ Invalid, empty, or zero values fall back to the default.
 
 ### Durable internal job scheduler
 
-The service initializes a SQLite/WAL database for internal system jobs. The
-database is required and is not controlled by an enable/disable setting.
-Storage inventory is registered when `IMAGE_STORAGE_USAGE_ENABLED=true`;
-image policy audit and repair producers remain future work. Existing image
-HTTP operations remain synchronous.
+The service initializes a SQLite/WAL database for durable jobs. The database
+is required and is not controlled by an enable/disable setting. The explicit
+`/api/image-jobs/...` API stages an upload and queues image processing; normal
+`/api/images/...` operations remain synchronous. Storage inventory, mutation
+recovery, image verification, maintenance, and read-only policy audit handlers
+are registered when `IMAGE_STORAGE_USAGE_ENABLED=true`.
 
 `IMAGE_JOB_DB_PATH` selects the SQLite file. When unset, it uses the platform's
 local application data directory under `image-service/jobs.sqlite3`. The
@@ -569,6 +570,15 @@ the container stops.
 `IMAGE_BACKGROUND_JOB_CONCURRENCY` limits the number of internal jobs claimed
 at once. Default: `1`; valid range `1..=64`.
 
+`IMAGE_ASYNC_MAX_JOBS` bounds active staged-image jobs. Default: `1000`;
+valid range `1..=1000`. `IMAGE_ASYNC_MAX_STAGED_BYTES` bounds the total source
+bytes held by active image-processing jobs. Default: `1073741824` (1 GiB);
+valid range `1..=18446744073709551615`. Admission is recorded transactionally
+with the job after staging. A full queue returns `503 Service Unavailable`
+with `Retry-After: 1`; the just-staged object is removed. Keep the backend's
+private `__image_jobs/` prefix and `IMAGE_JOB_DB_PATH` on durable storage if
+accepted work must survive a restart.
+
 `IMAGE_BACKGROUND_IDLE_SECONDS` is the quiet period with no active API request
 before the dispatcher can claim background work. Default: `30`; valid range
 `0..=86400`. Setting `0` removes the quiet-period delay, but the dispatcher
@@ -577,10 +587,12 @@ already running is not preempted if a request arrives; the scheduler claims no
 further unit until the quiet condition is met again.
 
 `IMAGE_BACKGROUND_WINDOW_UTC` optionally restricts background work to a daily
-UTC window in `HH:MM-HH:MM` format, for example `22:00-06:00`. It is combined
-with the idle-period condition. Omit it to allow jobs whenever the service has
-been quiet long enough. Convert a customer's local maintenance window to UTC
-when configuring this value.
+UTC window in `HH:MM-HH:MM` format, for example `22:00-06:00`. System catalog
+and policy jobs require both this window (when set) and the idle period. The
+user-facing `image.processing` queue bypasses the idle gate so accepted uploads
+can complete during traffic, but still obeys the UTC window. Omit the setting
+to allow jobs whenever their other dispatch conditions are met. Convert a
+customer's local maintenance window to UTC when configuring this value.
 
 `IMAGE_JOB_RETENTION_DAYS` controls how long terminal job records and their
 event history remain in SQLite. Default: `30`; valid range `1..=3650`. Jobs
@@ -600,8 +612,10 @@ choose local versus remote execution.
 
 Storage usage reporting is opt-in to preserve existing deployments. Set
 `IMAGE_STORAGE_USAGE_ENABLED=true` to initialize a separate persistent SQLite
-catalog, register an hourly inventory job, and expose `GET /api/storage/usage`
-and `POST /api/storage/reconcile`. The reporting endpoints always require
+catalog, register the inventory, mutation-recovery, verification, maintenance,
+and audit jobs, and expose `GET /api/storage/usage`,
+`POST /api/storage/reconcile`, and the policy audit endpoints described in the
+[HTTP API](api.md#storage-policy-audits). All reporting endpoints require
 `Authorization: Bearer <IMAGE_API_KEY>`, regardless of `IMAGE_READ_AUTH`; the
 service refuses to start if reporting is enabled without an API key. Inventory
 runs only when the internal scheduler's quiet-period and optional UTC-window
@@ -614,7 +628,24 @@ catalog and do not list storage on the request path. The data covers valid
 objects with canonical image-slot WebP key paths under the current layout; the
 scan reads metadata and does not decode object contents. Changes made directly
 in LocalFS/S3 are reflected after a successful reconciliation, so consumers
-should consider snapshot age and stale state.
+should consider snapshot age and stale state. API mutations update the catalog
+promptly through a durable journal; if storage and SQLite diverge during a
+crash, startup recovery re-stats the object and converges to its actual state.
+Before the first complete inventory, service-created objects are already
+counted in an incremental catalog snapshot, but the response remains stale
+because direct storage changes have not been discovered yet. Policy audits
+require a completed full-inventory watermark.
+
+Inventory queues object checks. A check skips image decoding when size, ETag,
+and effective processing-policy fingerprint match the last result. Otherwise
+it inspects format, animation, dimensions, and output size. Repairable policy
+violations enqueue low-priority maintenance, which waits for the idle/window
+gates and uses existing memory and CPU limits. S3-compatible stores use
+conditional ETag writes; LocalFS compares metadata and writes under the
+resource lock. The replacement is journaled and checked again. Invalid or
+uninspectable inputs are recorded but are not automatically rewritten. The
+authenticated usage API exposes aggregate counts and bytes; it does not expose
+per-object verification or job progress.
 
 `IMAGE_STORAGE_CATALOG_DB_PATH` selects the catalog database. When omitted, it
 uses `storage-catalog.sqlite3` beside `IMAGE_JOB_DB_PATH`. Keep its SQLite WAL
@@ -626,6 +657,16 @@ full reconciliations. Default: `3600` seconds; valid range `60..=2678400`.
 The first scan is scheduled immediately but still waits for the scheduler's
 idle/window rules. `POST /api/storage/reconcile` can enqueue a manual scan;
 active manual requests are deduplicated.
+
+`POST /api/storage/audits` creates a durable read-only scan of the latest
+completed inventory. The job captures current effective processing defaults
+and profiles, checks WebP format, animation, dimensions, and output bytes in
+batches of ten, checkpoints progress, and waits for foreground traffic between
+batches. `GET /api/storage/audits/{audit_id}` returns progress and
+`GET /api/storage/audits/{audit_id}/findings` returns paginated violations.
+Audits do not rewrite images. A missing or stale inventory should be refreshed
+with reconciliation first. Findings and audit snapshots are retained in the
+catalog until its SQLite data is removed; keep the catalog volume persistent.
 
 ### `IMAGE_MAX_INPUT_BYTES`
 
