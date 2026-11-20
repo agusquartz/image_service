@@ -35,16 +35,16 @@ not separate processes or dedicated threads.
 
 | Queue | Example job kind | Who creates work | Purpose |
 | --- | --- | --- | --- |
-| `image.processing` | `image.process.staged` | Authenticated POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}` | Reads a durable staged source, applies the captured processing profile, conditionally publishes to the target slot, updates the usage journal when enabled, and removes staging after a terminal job result. This queue may run during foreground traffic, bounded by scheduler concurrency, upload memory admission, and the image-processing semaphore. |
-| `storage.catalog` | `storage.catalog.refresh` | Pending journal recovery on startup or after a storage error | Re-stat current object/resource state and reconcile catalog entries idempotently. |
+| `image.processing` | `image.process.staged` | POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}`, subject to `IMAGE_WRITE_AUTH` (required by default) | Priority `50`. Reads a durable staged source, applies the captured processing profile, conditionally publishes to the target slot, updates the usage journal when enabled, and removes staging after a terminal job result. This queue may run during foreground traffic, bounded by scheduler concurrency, upload memory admission, and the image-processing semaphore. |
+| `storage.catalog` | `storage.catalog.refresh` | Pending journal recovery on startup or after a storage error | Priority `10`. Re-stat current object/resource state and reconcile catalog entries idempotently. |
 | `storage.inventory` | `storage.inventory.reconcile` | Persisted hourly interval schedule, or authenticated `POST /api/storage/reconcile` | List canonical image-slot objects and publish a complete metadata snapshot; queue verification candidates. Scheduled priority is `-10`; manual priority is `20`. |
-| `storage.verify` | `storage.verify.object` | Catalog recovery, completed inventory, or a maintenance write | Skip decoding when size, ETag, and effective policy fingerprint match a prior verification; inspect changed/new images and queue repairable violations. Successful API uploads are recorded as compliant directly from the processor result. |
-| `storage.maintenance` | `storage.maintenance.image` | Verification finds a repairable policy violation | Reprocess one captured version under bounded resource limits and conditionally publish only if the object has not changed. Successful writes are journaled and verified again. |
-| `storage.audit` | `storage.policy.audit` | Authenticated `POST /api/storage/audits` | Inspect a pinned inventory against the captured policy snapshot and persist findings. This explicit report remains read-only. Priority is `-20`. |
+| `storage.verify` | `storage.verify.object` | Catalog recovery, completed inventory, or a maintenance write | Priority `-30`. Skip decoding when size, ETag, and effective policy fingerprint match a prior verification; inspect changed/new images and queue repairable violations. Successful API uploads are recorded as compliant directly from the processor result. |
+| `storage.maintenance` | `storage.maintenance.image` | Verification finds a repairable policy violation | Priority `-40`. Reprocess one captured version under bounded resource limits and conditionally publish only if the object has not changed. Successful writes are journaled and verified again. |
+| `storage.audit` | `storage.policy.audit` | API-key protected `POST /api/storage/audits` | Inspect a pinned inventory against the captured policy snapshot and persist findings. This explicit report remains read-only. Priority is `-20`. |
 
 All registered queues feed the same scheduler. `IMAGE_BACKGROUND_JOB_CONCURRENCY`
 limits the number of jobs claimed at once, regardless of queue. The scheduler
-uses priority and age to select eligible work. Image processing may run while
+selects eligible work by higher priority, then age. Image processing may run while
 requests are active; catalog, inventory, verification, maintenance, and audit
 work wait for the configured idle period. All jobs obey service readiness,
 the optional UTC window, and lease rules. Maintenance has lower priority than
@@ -57,10 +57,10 @@ worker or manually resume an interrupted job.
 ```mermaid
 flowchart LR
     HTTP["HTTP API<br/>GET, POST, PUT, DELETE<br/>direct request path"]
-    ASYNC_HTTP["POST / PUT /api/image-jobs/...<br/>stream multipart into private staging"]
+    ASYNC_HTTP["POST / PUT /api/image-jobs/...<br/>stream multipart into reserved staging prefix"]
     SCHEDULER["SQLite/WAL job catalog<br/>bounded in-process dispatcher"]
     IMAGE_QUEUE["Queue: image.processing<br/>image.process.staged<br/>runs while API traffic is active"]
-    IMAGE_STATUS["GET /api/image-jobs/{job_id}<br/>narrow authenticated status"]
+    IMAGE_STATUS["GET /api/image-jobs/{job_id}<br/>narrow write-policy status"]
     INVENTORY["Queue: storage.inventory<br/>storage.inventory.reconcile<br/>interval or POST /api/storage/reconcile"]
     CATALOG_QUEUE["Queue: storage.catalog<br/>storage.catalog.refresh<br/>journal recovery"]
     VERIFY["Queue: storage.verify<br/>storage.verify.object<br/>recovery, inventory, repair"]
@@ -103,7 +103,7 @@ flowchart LR
 `POST` and `PUT /api/image-jobs/{namespace}/{resource_id}/{slot}` are an
 explicit alternative to the synchronous image routes. The handler validates
 the target and current slot rules, streams the multipart image into the
-configured OpenDAL backend under the private `__image_jobs/` prefix, then
+configured OpenDAL backend under the service-reserved `__image_jobs/` prefix, then
 atomically records a durable `image.process.staged` job in SQLite/WAL. The
 client receives `202 Accepted` only after both the staged object and job row
 exist. If job admission fails, the staged object is removed.
@@ -121,15 +121,19 @@ to wait for the configured quiet period.
 The staging object and job database must both be on persistent storage for
 accepted work to survive restart. Startup removes orphaned staging objects
 that have no active job reference. Terminal job records are retained according
-to `IMAGE_JOB_RETENTION_DAYS`; terminal staging data is deleted.
+to `IMAGE_JOB_RETENTION_DAYS`; terminal staging data is deleted. The prefix
+does not apply separate bucket permissions; restrict access to the configured
+backend using its normal filesystem or object-storage controls.
 
 The target is serialized by a bounded set of in-process resource locks. POST
 is create-only. PUT may create or replace and supersedes an older active async
 job for the same target. Synchronous POST/PUT/DELETE operations also cancel
-pending work for that target; running work checks cancellation and a publish
-fence before writing. An async PUT leaves the current image readable until
-the new result is ready. `GET /api/image-jobs/{job_id}` requires write
-authentication and reports only image-job state and result; there is no
+pending work for that target, and resource DELETE cancels active jobs for that
+resource; running work checks cancellation and a publish fence before writing.
+An async PUT leaves the current image readable until the new result is ready.
+The image handler allows five attempts, subject to the scheduler's retry and
+lease rules. `GET /api/image-jobs/{job_id}` follows `IMAGE_WRITE_AUTH`
+(`required` by default) and reports only image-job state and result; there is no
 general job list or public cancellation endpoint. Optional `Idempotency-Key`
 allows safe retries of the same method, target, and content.
 
@@ -233,7 +237,7 @@ OpenDAL notification currently tells the service that external storage changed.
 
 | Job kind | Queue | How it is created | What it does | Current state |
 | --- | --- | --- | --- | --- |
-| `image.process.staged` | `image.processing` | Authenticated POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}` | Processes a durable staged source and publishes a WebP result; status is available from `GET /api/image-jobs/{job_id}` | Implemented |
+| `image.process.staged` | `image.processing` | POST/PUT to `/api/image-jobs/{namespace}/{resource_id}/{slot}`, subject to `IMAGE_WRITE_AUTH` (required by default) | Processes a durable staged source with up to five attempts and publishes a WebP result; status is available from `GET /api/image-jobs/{job_id}` | Implemented |
 | `storage.catalog.refresh` | `storage.catalog` | Startup recovery for pending journal rows or after storage errors | Reconciles current slot/resource state and queues verification for present images | Implemented |
 | `storage.inventory.reconcile` | `storage.inventory` | Periodic schedule or `POST /api/storage/reconcile` | Lists canonical image-slot metadata in batches of 250, promotes a complete snapshot, and queues verification candidates | Implemented |
 | `storage.verify.object` | `storage.verify` | Catalog recovery, inventory completion, or maintenance write | Skips unchanged versions; otherwise inspects and records policy compliance, queueing repairable violations. API uploads are marked compliant from the processor result. | Implemented |
@@ -346,10 +350,12 @@ terminal `failed` jobs. A dependent job is not claimable until all parents
 succeed; it becomes cancelled if a dependency fails or is cancelled.
 
 The scheduler API supports cancellation internally, but Image Service does
-not currently expose a public cancellation route. Pending/retrying work can be
-cancelled immediately by an internal caller. For running work, cancellation
-is signalled to its handler; the handler must check it and stop at a safe
-boundary. The inventory handler checks between listing entries and batches.
+not expose a public cancellation route. Synchronous image mutations may cancel
+targeted image jobs as described above. Other pending/retrying work can be
+cancelled by an internal caller. For running work, cancellation is signalled
+to its handler; the handler must check it and stop at a safe boundary. The
+inventory handler checks between listing entries and batches, and the image
+handler checks before publishing.
 
 On SIGINT/SIGTERM, the service stops claiming jobs and drains active handlers
 for up to `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`. If that deadline expires, the

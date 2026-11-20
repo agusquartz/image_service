@@ -61,8 +61,10 @@ The `worker-protocol` crate defines versioned registration, job, result, and
 `StorageRef` data types for image, video, document, and blob capabilities. The
 `job-scheduler` crate provides a durable SQLite/WAL catalog and bounded
 in-process dispatcher. When storage usage reporting is enabled, `file-core`
-registers inventory, mutation-recovery, verification, maintenance, and policy
-audit queues. A separate SQLite catalog keeps completed inventory, the
+registers `storage.catalog`, `storage.inventory`, `storage.verify`,
+`storage.maintenance`, and `storage.audit` queues. Image builds also register
+`image.processing` for the explicit asynchronous image-job API. A separate
+SQLite catalog keeps completed inventory, the
 mutation journal, verification state, and audit findings. HTTP mutations update
 usage totals promptly; periodic inventory discovers changes made directly in
 LocalFS or S3. Verification skips decoding when object validators and the

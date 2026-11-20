@@ -19,7 +19,7 @@ The service includes several defensive measures:
 - Restricted resource-ID characters.
 - Bounded image-processing concurrency.
 - Separate upload admission and compressed-body budget before multipart reads; configurable whole-body read timeout.
-- Optional async image jobs stream uploaded source data into a private backend staging prefix, enforce the configured source-size limit, and reject detected unsupported or MIME-mismatched formats during receipt.
+- Optional async image jobs stream uploaded source data into a service-reserved backend staging prefix, enforce the configured source-size limit, and reject detected unsupported or MIME-mismatched formats during receipt.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
 - Per-client read/write rate limits with a `429` response and `Retry-After`.
@@ -67,15 +67,17 @@ The intended deployment is one service instance per customer. Authentication key
 
 The presign endpoint also uses the read-auth policy. A successful response contains a temporary bearer capability: anyone holding the URL can read the image until it expires. Treat presigned URLs as secrets and keep `IMAGE_PRESIGN_TTL_SECONDS` as short as the application allows.
 
-The explicit `POST` and `PUT /api/image-jobs/...` endpoints require write
-authentication and stage unprocessed uploads under the backend's private
-`__image_jobs/` prefix. `GET /api/image-jobs/{job_id}` also requires write
-authentication because it exposes the destination and processing result. Keep
-the staging backend and SQLite job database on persistent, access-controlled
-storage. Accepted jobs can survive process restarts only when both are
-persistent; staging objects are removed after terminal completion or during
-orphan cleanup at startup. The API does not expose a general job listing or
-cancellation endpoint.
+The explicit `POST` and `PUT /api/image-jobs/...` endpoints follow
+`IMAGE_WRITE_AUTH`, which is `required` by default, and stage unprocessed
+uploads under the service-reserved `__image_jobs/` prefix. The job status route
+follows the same policy because it exposes the destination and processing
+result. The prefix does not create separate filesystem or bucket ACLs: restrict
+direct access to the configured backend with its normal permission controls.
+Keep the staging backend and SQLite job database on persistent,
+access-controlled storage. Accepted jobs can survive process restarts only
+when both are persistent; staging objects are removed after terminal
+completion or during orphan cleanup at startup. The API does not expose a
+general job listing or cancellation endpoint.
 
 Storage usage reporting is opt-in through `IMAGE_STORAGE_USAGE_ENABLED`. When
 enabled, all `/api/storage/*` usage, reconciliation, and audit endpoints always

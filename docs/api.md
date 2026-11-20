@@ -230,10 +230,11 @@ PUT  /api/image-jobs/{namespace}/{resource_id}/{slot}  # create or replace
 GET  /api/image-jobs/{job_id}                          # get status/result
 ```
 
-The request uses the same multipart `image` field, authentication, namespace
+The request uses the same multipart `image` field, configured write-auth
+policy (`IMAGE_WRITE_AUTH`, `required` by default), namespace
 profile, input limits, slot rules, and detected-format checks as synchronous
 uploads. The API streams the original into the configured storage backend's
-private `__image_jobs/` staging prefix, then persists a processing job in the
+service-reserved `__image_jobs/` staging prefix, then persists a processing job in the
 SQLite/WAL scheduler. It returns `202 Accepted` only after both staging and job
 creation succeed. The response contains `job_id`, `status_url`, and the
 destination; `Location` points to the status URL and `Retry-After: 2` suggests
@@ -249,8 +250,9 @@ result includes the final image URL and output size. A browser can preview its
 local selected file while the job is pending, then load the returned service
 URL after status becomes `succeeded`.
 
-`GET /api/image-jobs/{job_id}` requires write authentication and returns only
-image-processing job details; it is not a general scheduler inspection API.
+`GET /api/image-jobs/{job_id}` follows `IMAGE_WRITE_AUTH` (`required` by
+default) and returns only image-processing job details; it is not a general
+scheduler inspection API.
 Statuses are `queued`, `processing`, `retry_wait`, `succeeded`, `failed`,
 `cancelled`, and `superseded`. POST conflicts if the object exists or any
 active async job already owns the target slot. A new PUT supersedes an older active async job for
@@ -259,6 +261,10 @@ job from publishing after the newer one. Synchronous POST/PUT/DELETE operations
 also cancel queued work for their target. Resource DELETE cancels active image
 jobs for that resource. During an async PUT, GET continues to serve the
 previously published image until the replacement is ready.
+
+The `__image_jobs/` prefix is reserved by the service but does not establish
+separate filesystem or bucket ACLs. Restrict direct access to the configured
+storage backend using its normal permission controls.
 
 `Idempotency-Key` is optional and accepts 1 to 128 visible ASCII characters.
 Repeating the same key with the same method, destination, and content returns

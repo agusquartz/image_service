@@ -325,7 +325,7 @@ flowchart TB
     LOCAL[Local filesystem]
     S3[S3-compatible object storage]
     PROTOCOL[worker-protocol<br/>Versioned job and storage DTOs only]
-    SCHEDULER[Internal job scheduler<br/>SQLite WAL, interval schedules, leases, retries]
+    SCHEDULER[Durable job scheduler<br/>SQLite WAL, image processing and system queues]
     JOBDB[(Persistent job catalog)]
 
     subgraph FUTURE["Future extension — not implemented"]
@@ -340,13 +340,13 @@ flowchart TB
     CORE --> STORAGE
     STORAGE --> LOCAL
     STORAGE --> S3
-    CORE -->|internal system jobs| SCHEDULER --> JOBDB
+    CORE -->|async image uploads and internal jobs| SCHEDULER --> JOBDB
     CORE -. "optional Cargo feature: DTOs only" .-> PROTOCOL
     SCHEDULER -. "future worker dispatch" .-> REMOTE
     PROTOCOL -. "future transport may use these types" .-> REMOTE
 ```
 
-The solid paths show implemented components. The scheduler persists and dispatches internal jobs in-process; when enabled, storage inventory, mutation recovery, verification, maintenance, and read-only policy audit handlers run from durable jobs. Dashed paths show the planned worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
+The solid paths show implemented components. The scheduler persists and dispatches `image.processing` jobs in-process, alongside storage inventory, mutation recovery, verification, maintenance, and read-only policy audit queues when storage usage is enabled. Dashed paths show the planned worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
 
 The core rule is simple:
 

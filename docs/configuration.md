@@ -576,15 +576,19 @@ bytes held by active image-processing jobs. Default: `1073741824` (1 GiB);
 valid range `1..=18446744073709551615`. Admission is recorded transactionally
 with the job after staging. A full queue returns `503 Service Unavailable`
 with `Retry-After: 1`; the just-staged object is removed. Keep the backend's
-private `__image_jobs/` prefix and `IMAGE_JOB_DB_PATH` on durable storage if
-accepted work must survive a restart.
+service-reserved `__image_jobs/` prefix and `IMAGE_JOB_DB_PATH` on durable storage if
+accepted work must survive a restart. The prefix is reserved by the service; it
+does not create separate filesystem or bucket ACLs, so restrict direct access
+to the configured storage backend with its normal permission controls.
 
 `IMAGE_BACKGROUND_IDLE_SECONDS` is the quiet period with no active API request
-before the dispatcher can claim background work. Default: `30`; valid range
-`0..=86400`. Setting `0` removes the quiet-period delay, but the dispatcher
-still checks that no API request is active before claiming a new unit. A unit
-already running is not preempted if a request arrives; the scheduler claims no
-further unit until the quiet condition is met again.
+before the dispatcher can claim system catalog and policy work. Default: `30`;
+valid range `0..=86400`. Setting `0` removes the delay, but system jobs still
+wait until there are no active API requests. A unit already running is not
+preempted if a request arrives. The user-facing `image.processing` queue
+bypasses this idle gate so accepted image jobs can run during traffic; it
+remains bounded by the shared scheduler concurrency, upload-memory admission,
+and image-processing semaphore.
 
 `IMAGE_BACKGROUND_WINDOW_UTC` optionally restricts background work to a daily
 UTC window in `HH:MM-HH:MM` format, for example `22:00-06:00`. System catalog
