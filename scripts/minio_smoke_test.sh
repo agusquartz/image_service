@@ -98,6 +98,7 @@ docker run --detach --rm \
     --env IMAGE_STORAGE_ACCESS_KEY_ID="$access_key" \
     --env IMAGE_STORAGE_SECRET_ACCESS_KEY="$secret_key" \
     --env IMAGE_MAX_SLOTS=1 \
+    --env "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES=${IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES:-1}" \
     --env IMAGE_OUTPUT_WIDTH=1024 \
     --env IMAGE_OUTPUT_HEIGHT=1024 \
     --env 'IMAGE_PROCESSING_PROFILES={"avatar":{"max_output_bytes":25600,"output_width":32,"output_height":32},"maintenance":{"output_width":64,"output_height":64}}' \

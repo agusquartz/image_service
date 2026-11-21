@@ -132,6 +132,8 @@ start_service() {
         --env IMAGE_STORAGE_SCHEME=fs
         --env IMAGE_STORAGE_ROOT=/tmp/image-storage
         --env IMAGE_STORAGE_ATOMIC_WRITE_DIR=/tmp/image-storage/.tmp
+        # Force synchronous POST/PUT uploads through the spill-to-staging path.
+        --env "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES=${IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES:-1}"
     )
 
     case "$auth_mode" in
