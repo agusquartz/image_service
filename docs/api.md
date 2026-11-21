@@ -23,8 +23,15 @@ DELETE /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}
 DELETE /api/images/{namespace}/{resource_id}
 
+POST /api/image-jobs/{namespace}/{resource_id}/{slot}
+PUT  /api/image-jobs/{namespace}/{resource_id}/{slot}
+GET  /api/image-jobs/{job_id}
+
 GET  /api/storage/usage
 POST /api/storage/reconcile
+POST /api/storage/audits
+GET  /api/storage/audits/{audit_id}
+GET  /api/storage/audits/{audit_id}/findings
 ```
 
 Example image identifier:
@@ -57,13 +64,17 @@ With S3 storage, `products/845/02.webp` is used as the object key.
 
 ## Storage Usage Reporting
 
-Storage usage reporting is opt-in. Set `IMAGE_STORAGE_USAGE_ENABLED=true` to
-enable the inventory job and routes. The endpoints always require
+Storage usage reporting and its background catalog pipeline are opt-in. Set
+`IMAGE_STORAGE_USAGE_ENABLED=true` to enable the catalog, inventory,
+verification, maintenance, and audit jobs together with the routes. The endpoints always require
 `Authorization: Bearer <IMAGE_API_KEY>`, even when image reads are configured
 as public. Enabling the feature without an API key prevents startup.
 
-`GET /api/storage/usage` returns counts and byte totals from the latest
-completed inventory. Optional query parameters narrow the result:
+`GET /api/storage/usage` returns counts and byte totals from the current
+catalog snapshot. Service writes are counted immediately, including before
+the first full inventory finishes; `scan_status: "never"` and `stale: true`
+make clear that direct storage changes have not yet been reconciled. Optional
+query parameters narrow the result:
 
 ```text
 GET /api/storage/usage?namespace=products
@@ -74,10 +85,28 @@ GET /api/storage/usage?namespace=products&resource_id=845&slot=1
 The endpoint only reads the local SQLite catalog; it never scans LocalFS or
 S3 synchronously. The response includes scan status, the last completed scan
 time, snapshot age, and a `stale` flag. Counts cover objects with canonical
-image-slot key paths following `{namespace}/{resource_id}/{slot}.webp`; the
-scanner reads metadata and does not decode object contents. External changes to
-storage appear after a successful reconciliation, so results are an inventory
-snapshot rather than transactionally current storage accounting.
+image-slot key paths following `{namespace}/{resource_id}/{slot}.webp`. POST,
+PUT, and DELETE update catalog totals after their storage operation succeeds;
+the mutation is journaled first so startup recovery can reconcile it if the
+process exits between the storage write and catalog update. Direct external
+storage edits become visible after the next successful full reconciliation,
+so totals are prompt for service writes but are not a transactionally current
+view of arbitrary backend changes.
+
+The hourly inventory lists object metadata and schedules verification jobs.
+Verification skips image decoding when object size, ETag, and effective
+processing-policy fingerprint match the previous check. New or changed objects
+are inspected, and repairable policy violations may be reprocessed in the
+background during idle periods. Maintenance uses a conditional write so a
+concurrent newer upload is not replaced. These per-object states and job
+progress are internal; this API currently reports aggregate bytes and counts.
+
+The response reports actual service storage usage; it does not contain a
+customer subscription quota. The calling application can compare these totals
+with its own contract or tenant records. This is a reporting endpoint, not an
+atomic quota reservation: applications that must prevent concurrent uploads
+from exceeding an entitlement need to reserve capacity in their own write
+flow.
 
 `POST /api/storage/reconcile` requests an immediate reconciliation and returns
 `202 Accepted` (request queued for background processing) with a durable job ID. The job still obeys the configured idle
@@ -88,6 +117,56 @@ snapshot in batches and promotes it only after the full scan succeeds; failed
 or interrupted jobs leave the previous complete snapshot queryable. Keep both
 the job database and catalog database on persistent local storage. The default
 catalog path is `storage-catalog.sqlite3` beside `IMAGE_JOB_DB_PATH`.
+
+### Storage policy audits
+
+The same opt-in and API-key requirements apply to policy audits. Start an
+asynchronous read-only audit using the current completed inventory snapshot:
+
+```http
+POST /api/storage/audits
+Authorization: Bearer <IMAGE_API_KEY>
+Content-Type: application/json
+
+{"namespace":"products","resource_id":"845"}
+```
+
+The scope object may be empty to audit all inventoried image slots. `resource_id`
+requires `namespace`; `slot` requires both. A successful request returns
+`202 Accepted`, an audit ID, durable job ID, inventory watermark, stale flag,
+and a fingerprint for the effective policy snapshot. If no completed inventory
+exists, the request returns `409 Conflict` and asks for reconciliation first.
+
+```text
+GET /api/storage/audits/{audit_id}
+GET /api/storage/audits/{audit_id}/findings?limit=50
+GET /api/storage/audits/{audit_id}/findings?limit=50&after={next_cursor}
+```
+
+The status resource reports `queued`, `running`, `complete`, `retry_wait`,
+`failed`, or `cancelled` plus counters for inspected, compliant, violating,
+changed, and inspection-error assets. Findings are ordered by object key and
+code; `limit` defaults to 50 and is capped at 200. Pass the returned URL-safe
+opaque `next_cursor` as `after` to continue. These endpoints return
+`Cache-Control: no-store`.
+
+Audits capture the effective global and namespace-profile settings when they
+start. They inspect objects from that inventory snapshot in small batches,
+checkpoint progress in SQLite, wait for foreground traffic to become idle,
+and resume from the last recorded object after a restart or retry. They decode
+stored images without re-encoding them. Findings include non-WebP or animated
+images, dimensions above the captured output bounds, output bytes above the
+captured limit, invalid image data, and objects that changed or disappeared
+after inventory. Oversized objects that exceed the service's configured
+in-memory request ceiling are reported as `too_large_to_inspect` rather than
+read into unbounded memory. The audit never modifies or repairs an object.
+
+The inventory snapshot and object itself can change between inventory and
+inspection. ETags and size are compared when available; a missing validator
+means the audit cannot prove the object version was unchanged. The response
+exposes the inventory time and staleness so results are not mistaken for a
+transactional view of storage. Run reconciliation first when the newest
+available inventory is needed.
 
 ---
 
@@ -139,6 +218,60 @@ A successful response looks like:
 If `IMAGE_PUBLIC_BASE_URL` is configured, `url` is absolute.
 
 Repeated `POST` requests do not replace an image; use `PUT` to replace it.
+
+### Asynchronous image processing
+
+The synchronous endpoints above keep their existing behavior. To explicitly
+queue processing instead, use the separate image-job routes:
+
+```text
+POST /api/image-jobs/{namespace}/{resource_id}/{slot}  # create-only
+PUT  /api/image-jobs/{namespace}/{resource_id}/{slot}  # create or replace
+GET  /api/image-jobs/{job_id}                          # get status/result
+```
+
+The request uses the same multipart `image` field, configured write-auth
+policy (`IMAGE_WRITE_AUTH`, `required` by default), namespace
+profile, input limits, slot rules, and detected-format checks as synchronous
+uploads. The API streams the original into the configured storage backend's
+service-reserved `__image_jobs/` staging prefix, then persists a processing job in the
+SQLite/WAL scheduler. It returns `202 Accepted` only after both staging and job
+creation succeed. The response contains `job_id`, `status_url`, and the
+destination; `Location` points to the status URL and `Retry-After: 2` suggests
+when to poll next. A full queue returns `503 Service Unavailable` with
+`Retry-After: 1`.
+
+`202 Accepted` means queued, not fully decoded and published. Path, slot,
+capacity, byte-count, and any detectable unsupported-format or MIME mismatch
+checks happen while receiving the body. Full decode and image-policy
+processing happen in the worker, so malformed or undecodable content can
+later produce a `failed` job. On success, the status
+result includes the final image URL and output size. A browser can preview its
+local selected file while the job is pending, then load the returned service
+URL after status becomes `succeeded`.
+
+`GET /api/image-jobs/{job_id}` follows `IMAGE_WRITE_AUTH` (`required` by
+default) and returns only image-processing job details; it is not a general
+scheduler inspection API.
+Statuses are `queued`, `processing`, `retry_wait`, `succeeded`, `failed`,
+`cancelled`, and `superseded`. POST conflicts if the object exists or any
+active async job already owns the target slot. A new PUT supersedes an older active async job for
+the same resource; target locking and cancellation checks prevent the older
+job from publishing after the newer one. Synchronous POST/PUT/DELETE operations
+also cancel queued work for their target. Resource DELETE cancels active image
+jobs for that resource. During an async PUT, GET continues to serve the
+previously published image until the replacement is ready.
+
+The `__image_jobs/` prefix is reserved by the service but does not establish
+separate filesystem or bucket ACLs. Restrict direct access to the configured
+storage backend using its normal permission controls.
+
+`Idempotency-Key` is optional and accepts 1 to 128 visible ASCII characters.
+Repeating the same key with the same method, destination, and content returns
+the existing job; reusing it for a different request returns `409 Conflict`.
+Queue capacity is bounded by `IMAGE_ASYNC_MAX_JOBS` and
+`IMAGE_ASYNC_MAX_STAGED_BYTES`. Staged objects and SQLite job records must live
+on persistent storage if accepted work must survive container restarts.
 
 ---
 

@@ -61,37 +61,53 @@ The `worker-protocol` crate defines versioned registration, job, result, and
 `StorageRef` data types for image, video, document, and blob capabilities. The
 `job-scheduler` crate provides a durable SQLite/WAL catalog and bounded
 in-process dispatcher. When storage usage reporting is enabled, `file-core`
-registers a periodic idle-time inventory job. A separate SQLite catalog keeps
-the last completed snapshot of valid image slots and their byte sizes; a failed
-or interrupted scan does not replace that snapshot. Image policy audits,
-repairs, Unix socket connections, worker registration, remote dispatch, and
-worker failover remain future work. A no-image build can run the generic job
-catalog, but cannot register the image inventory handler.
+registers `storage.catalog`, `storage.inventory`, `storage.verify`,
+`storage.maintenance`, and `storage.audit` queues. Image builds also register
+`image.processing` for the explicit asynchronous image-job API. A separate
+SQLite catalog keeps completed inventory, the
+mutation journal, verification state, and audit findings. HTTP mutations update
+usage totals promptly; periodic inventory discovers changes made directly in
+LocalFS or S3. Verification skips decoding when object validators and the
+effective policy fingerprint are unchanged. Repairable violations are
+reprocessed in low-priority jobs with conditional publication and post-write
+verification. Unix socket connections, worker registration, remote dispatch,
+and worker failover remain future work. A no-image build can run the generic
+job catalog, but cannot register image storage handlers.
 
 ### Current Runtime and Planned Worker Boundary
 
 The running service handles HTTP requests in `file-core`, invokes
 `processor-image` in-process through the `Processor` interface, and persists
 the result through OpenDAL. Tokio's blocking-pool handoff and the image
-processing admission limit bound CPU-heavy HTTP work. A separate durable job
-scheduler is initialized at startup for internal background tasks; user-facing
-image operations remain synchronous.
+processing admission limit bound CPU-heavy synchronous work. Normal
+`/api/images/...` operations remain synchronous. The explicit
+`/api/image-jobs/...` API streams source bytes to private durable staging,
+records a processing job in SQLite/WAL, and returns a job ID; a bounded local
+dispatcher processes it and exposes a narrow job status endpoint.
 
 The optional `worker-protocol` feature compiles versioned worker DTOs. The
 durable scheduler stores recurring interval definitions and job queue, kind,
 payload, policy snapshot, dependencies, lease, retry, progress, and result state
 in SQLite/WAL. Due schedules materialize idempotent jobs; the in-memory
 dispatcher claims only a bounded number and recovers expired leases after
-restart. Background work waits for a quiet HTTP period and can also be
-restricted to a daily UTC window. With `IMAGE_STORAGE_USAGE_ENABLED=true`, the
-service adds a recurring storage inventory producer and an OpenDAL-backed
-handler. It streams object listings, stores batches in a separate SQLite
-catalog, and promotes a completed scan only after the full listing succeeds.
-Usage queries read only this catalog and never list the backend on the request
-path. External storage edits become visible after reconciliation; image policy
-audit and repair jobs are not implemented. UDS/gRPC worker registration and
-remote dispatch are also future work. Existing image requests continue through
-the in-process processor.
+restart. System background work waits for a quiet HTTP period and can also be
+restricted to a daily UTC window. Staged image-processing jobs bypass the
+quiet-period gate so accepted uploads can complete during traffic, but remain
+bounded by scheduler concurrency, upload-memory admission, and the processor
+semaphore; they still obey readiness, leases, retries, and an optional UTC
+window. With `IMAGE_STORAGE_USAGE_ENABLED=true`, the
+service journals POST/PUT/DELETE before calling OpenDAL and applies the
+resulting catalog update before a successful HTTP response. Pending journal
+entries are recovered into `storage.catalog` after restart. The recurring
+inventory streams object listings and promotes a completed scan only after the
+full listing succeeds, then queues candidates for verification. Verification
+records policy compliance and schedules repairable violations; maintenance
+reprocesses one captured image version and uses conditional writes to avoid
+replacing a newer upload. Usage queries read only the catalog and never list
+storage on the request path. Direct storage edits become visible after
+reconciliation. UDS/gRPC worker registration and remote dispatch remain future
+work. Synchronous and queued image processing both currently use the
+in-process processor.
 
 See [Background Jobs](jobs.md) for the current registered work, scheduling
 gates, persistence and recovery behavior, and guidance for adding internal
@@ -231,7 +247,7 @@ products/845/01.webp
 
 No compression logic belongs in this layer.
 
-The operation coordinator is an in-memory consistency mechanism for one service process. It serializes publication/deletion for the same resource and keeps unrelated resources independent. It does not yet persist image operations or coordinate multiple replicas. The durable job catalog currently provides generic internal job state; connecting image publication/recovery to it is future work.
+The operation coordinator is an in-memory consistency mechanism for one service process. It serializes publication/deletion for the same resource and keeps unrelated resources independent. The SQLite mutation journal records service writes for catalog recovery, but does not coordinate multiple replicas or make OpenDAL and SQLite one transaction. See [Background Jobs](jobs.md) for recovery and consistency details.
 
 ### Configuration and Shared State
 

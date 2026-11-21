@@ -7,6 +7,8 @@ mod config;
 mod error;
 mod health;
 #[cfg(feature = "images")]
+mod image_jobs;
+#[cfg(feature = "images")]
 pub(crate) mod images;
 mod observability;
 mod rate_limit;
@@ -41,16 +43,13 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .enable_all()
         .build()?;
     #[cfg(feature = "images")]
-    if let Some(catalog) = state.storage_catalog.clone() {
+    runtime
+        .block_on(image_jobs::register_jobs(&state))
+        .map_err(std::io::Error::other)?;
+    #[cfg(feature = "images")]
+    if state.storage_catalog.is_some() {
         runtime
-            .block_on(storage_usage::register_jobs(
-                &state.job_scheduler,
-                catalog,
-                state.storage_operator.clone(),
-                state.storage_inventory_interval_seconds,
-                state.activity.clone(),
-                state.background_idle_seconds,
-            ))
+            .block_on(storage_usage::register_jobs(&state))
             .map_err(std::io::Error::other)?;
     }
     let app = router::build_router(state);

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, io, path::PathBuf};
 
 /// Default maximum accepted source image size.
@@ -112,7 +112,7 @@ pub struct StorageConfig {
 /// Optional per-namespace processing overrides.
 ///
 /// Omitted fields inherit the existing global processing settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessingProfile {
     pub max_input_bytes: Option<usize>,
@@ -122,7 +122,7 @@ pub struct ProcessingProfile {
 }
 
 /// Fully resolved processing policy for one upload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ProcessingPolicy {
     pub profile_name: String,
     pub max_input_bytes: usize,
@@ -171,6 +171,12 @@ pub struct AppConfig {
 
     /// Retention for completed internal jobs and their event history.
     pub job_retention_days: u64,
+
+    /// Maximum active asynchronous image jobs.
+    pub async_image_max_jobs: usize,
+
+    /// Maximum source bytes retained by active asynchronous image jobs.
+    pub async_image_max_bytes: u64,
 
     /// Whether to expose authenticated storage usage and run inventory scans.
     pub storage_usage_enabled: bool,
@@ -414,6 +420,9 @@ impl AppConfig {
         let background_idle_seconds =
             parse_bounded_u64("IMAGE_BACKGROUND_IDLE_SECONDS", 30, 0, 86_400)?;
         let job_retention_days = parse_bounded_u64("IMAGE_JOB_RETENTION_DAYS", 30, 1, 3650)?;
+        let async_image_max_jobs = parse_bounded_usize("IMAGE_ASYNC_MAX_JOBS", 1000, 1, 1000)?;
+        let async_image_max_bytes =
+            parse_bounded_u64("IMAGE_ASYNC_MAX_STAGED_BYTES", 1_073_741_824, 1, u64::MAX)?;
         let storage_usage_enabled = parse_bool_env("IMAGE_STORAGE_USAGE_ENABLED", false)?;
         let storage_catalog_path = match env::var("IMAGE_STORAGE_CATALOG_DB_PATH") {
             Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
@@ -583,6 +592,8 @@ impl AppConfig {
             background_idle_seconds,
             background_window_utc,
             job_retention_days,
+            async_image_max_jobs,
+            async_image_max_bytes,
             storage_usage_enabled,
             storage_catalog_path,
             storage_inventory_interval_seconds,

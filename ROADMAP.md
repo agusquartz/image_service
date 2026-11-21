@@ -19,11 +19,12 @@ file-core
 ```
 
 The `worker-protocol` crate contains versioned DTOs only. The generic durable
-SQLite/WAL job catalog and in-process scheduler are implemented; system-job
-producers/handlers, worker registry, remote transport, and remote worker runtime
-remain future work. The current Tokio blocking-pool handoff for HTTP image
-processing remains synchronous in-process execution, separate from the job
-queue.
+SQLite/WAL job catalog and in-process scheduler run storage inventory,
+mutation-recovery, verification, maintenance, and policy-audit jobs when
+storage usage is enabled. Explicit `/api/image-jobs/...` endpoints also stage
+source uploads and enqueue durable image-processing jobs; the existing
+`/api/images/...` contract remains synchronous. Worker registry, remote
+transport, and remote worker runtime remain future work.
 
 The project should remain simple where possible. New abstractions should be introduced only when they solve a real deployment or application requirement.
 
@@ -41,9 +42,11 @@ HTTP resource listing          yes
 HTTP image deletion            yes
 HTTP image information         yes
 Storage usage reporting        yes (opt-in; persistent inventory and authenticated aggregate queries)
+Storage policy audit           yes (opt-in; durable read-only image checks against captured inventory and policy)
 Presigned read URLs            yes (backend capability required)
 Cache validators               yes
 Upload methods                 POST (create-only), PUT (create or replace)
+Async image processing         yes (separate durable staging/job/status API; normal routes stay synchronous)
 
 Local filesystem storage       yes
 S3 storage                     yes
@@ -128,6 +131,34 @@ failures leave the prior snapshot queryable. The API reports scan status and
 freshness because direct external changes to LocalFS or S3 become visible on
 the next successful reconciliation. This is not a Prometheus metric and does
 not add namespace or resource labels to `/metrics`. See [HTTP API](docs/api.md#storage-usage-reporting) and [configuration](docs/configuration.md#storage-usage-catalog).
+
+## Implemented: Storage Policy Audit
+
+When storage usage is enabled, authenticated callers can start a durable
+read-only audit for all indexed image slots or a namespace/resource/slot
+scope. The job pins the completed inventory watermark and effective global
+plus namespace-profile policy at creation. It decodes objects in batches of
+ten, shares the upload memory budget and image processing semaphore, waits for
+foreground quiet periods, and checkpoints each object in SQLite. Results expose
+compliant, violating, changed, and inspection-error counts; findings are
+paginated and retained in the storage catalog. The audit checks WebP format,
+animation, output dimensions and bytes, invalid content, and inventory-to-read
+changes. It never repairs or rewrites objects. See [HTTP API](docs/api.md#storage-policy-audits), [jobs](docs/jobs.md#registered-work), and [security](docs/security.md#storage-usage-reporting).
+
+## Implemented: Asynchronous Image Processing
+
+The separate `POST`/`PUT /api/image-jobs/{namespace}/{resource_id}/{slot}`
+routes stream source uploads to private backend staging, persist a bounded
+processing job in SQLite/WAL, and return `202 Accepted` with a job ID. The
+authenticated `GET /api/image-jobs/{job_id}` route reports the job state and
+result. Existing `/api/images/...` upload routes retain their synchronous
+behavior. Image jobs may run during foreground traffic under shared scheduler,
+upload-memory, and processing limits; storage inventory and policy jobs keep
+their idle gate. Startup removes unreferenced staged sources, while accepted
+work survives restarts only when both the stage backend and SQLite job database
+are persistent. See [API](docs/api.md#asynchronous-image-processing),
+[jobs](docs/jobs.md#asynchronous-image-upload-pipeline), and
+[configuration](docs/configuration.md#durable-internal-job-scheduler).
 
 ## Future Features
 
@@ -434,49 +465,17 @@ The current per-process rate limiter does not share counters across replicas and
 
 ---
 
-### Background Processing
+### Remote Worker Execution
 
-The current API processes images synchronously before returning success.
-
-The workspace now includes a durable SQLite/WAL job catalog and bounded
-in-process dispatcher for internal system tasks. It persists recurring
-interval schedules and queue/kind, payload and policy snapshots, dependencies,
-leases, retry state, progress and results. Due schedules create idempotent
-jobs. The dispatcher waits for a quiet period and may also be restricted to a
-daily UTC time window. SQLite is the source of truth; memory only holds the
-bounded set of claimed jobs. The database path must be backed by persistent
-storage in deployments.
-
-When storage usage reporting is enabled, the service registers a recurring
-inventory job that scans valid image WebP slots through OpenDAL and updates a
-persistent SQLite catalog. Authenticated aggregate queries read the latest
-completed snapshot without listing storage on the HTTP request path. Failed or
-interrupted scans do not replace the last complete snapshot. User-facing POST
-and PUT remain synchronous. Policy audit and repair jobs, `worker-protocol`
-dispatch, UDS/gRPC connections, remote worker registration, and failover remain
-future work.
-
-Future work can use this scheduler for mandatory internal jobs:
-
-```text
-scheduled inventory
-    |
-    v
-scoped audit jobs
-    |
-findings and repair jobs
-    |
-    v
-in-process handler or eligible remote worker
-    |
-    v
-checkpointed result
-```
-
-Clients do not choose or disable these system tasks. The scheduler controls
-whether work runs in a quiet period or configured UTC window, limits its
-concurrency, and gives foreground HTTP traffic priority. Async user uploads,
-staging, and `202 Accepted` responses are separate future API work.
+The durable scheduler currently runs handlers inside the Core process. The
+`worker-protocol` crate provides versioned DTOs but does not yet implement
+worker registration, transport, or remote dispatch. A future worker runtime
+could execute staged image jobs in separately deployed processor workers,
+while preserving durable job identity, leases, retries, and status reporting.
+That requires a defined storage-reference contract, worker authentication,
+lease and cancellation behavior across processes, and recovery when workers
+disconnect. These are not prerequisites for using the current in-process
+async image-job API.
 
 ---
 

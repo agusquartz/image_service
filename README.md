@@ -122,7 +122,7 @@ flowchart TB
     REMOTE -. future transport .-> OTHER_WORKERS
 ```
 
-The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. When enabled, a durable SQLite/WAL job runs storage inventory scans and maintains a queryable snapshot. Dashed paths are future work: policy audits, repairs, remote worker dispatch, worker processes, and video processing. `worker-protocol` currently provides versioned DTOs only.
+The solid path shows the current implementation: `file-core` handles HTTP requests and invokes image processing in-process. The normal image routes are synchronous; the explicit `/api/image-jobs/...` routes stage the source and enqueue durable image processing, with a narrow status endpoint. When storage usage is enabled, SQLite/WAL jobs maintain the inventory, recover mutation-journal entries, verify stored images against current policy, and reprocess repairable violations with conditional writes. Dashed paths are future work: remote worker dispatch, worker processes, and video processing. `worker-protocol` currently provides versioned DTOs only.
 
 ## Deployment Model and Production Use
 
@@ -139,6 +139,7 @@ The version currently on `main` is used in production by two companies running a
 - ETag and Last-Modified validators with conditional GET/HEAD requests.
 - Resource image listing, HEAD metadata checks, and idempotent deletion.
 - POST creates only in an unused slot; PUT creates or replaces the complete image.
+- Optional durable asynchronous image processing through `/api/image-jobs/...`; existing `/api/images/...` routes remain synchronous.
 - Independent bearer-token policies for reads and writes; both are protected by default.
 - Per-source-IP read/write rate limits with `429` responses and `Retry-After`; clients behind one NAT/proxy share the budget.
 - Structured JSON request logs, server-generated request IDs, and an optional authenticated Prometheus endpoint.
@@ -153,6 +154,8 @@ The version currently on `main` is used in production by two companies running a
 - Valid WebP inputs that already meet the configured dimensions and byte limit pass through without lossy re-encoding.
 - Decoder width, height, and allocation limits.
 - Limited concurrent image-processing jobs.
+- Optional authenticated storage usage reporting with a durable SQLite catalog; service mutations are reflected promptly and full inventory runs periodically.
+- Automatic background verification and policy-based image maintenance, with conditional writes that protect newer uploads.
 - Resource-based image organization.
 - Configurable maximum slot number for new images (5 by default; valid range 1..=255).
 - Local filesystem persistence through OpenDAL.
@@ -208,6 +211,9 @@ DELETE /api/images/{namespace}/{resource_id}
 
 GET  /api/storage/usage?namespace=products&resource_id=845&slot=1
 POST /api/storage/reconcile
+POST /api/storage/audits
+GET  /api/storage/audits/{audit_id}
+GET  /api/storage/audits/{audit_id}/findings
 ```
 
 Storage usage routes are opt-in through `IMAGE_STORAGE_USAGE_ENABLED=true` and
@@ -319,7 +325,7 @@ flowchart TB
     LOCAL[Local filesystem]
     S3[S3-compatible object storage]
     PROTOCOL[worker-protocol<br/>Versioned job and storage DTOs only]
-    SCHEDULER[Internal job scheduler<br/>SQLite WAL, interval schedules, leases, retries]
+    SCHEDULER[Durable job scheduler<br/>SQLite WAL, image processing and system queues]
     JOBDB[(Persistent job catalog)]
 
     subgraph FUTURE["Future extension — not implemented"]
@@ -334,13 +340,13 @@ flowchart TB
     CORE --> STORAGE
     STORAGE --> LOCAL
     STORAGE --> S3
-    CORE -->|internal system jobs| SCHEDULER --> JOBDB
+    CORE -->|async image uploads and internal jobs| SCHEDULER --> JOBDB
     CORE -. "optional Cargo feature: DTOs only" .-> PROTOCOL
     SCHEDULER -. "future worker dispatch" .-> REMOTE
     PROTOCOL -. "future transport may use these types" .-> REMOTE
 ```
 
-The solid paths show implemented components. The scheduler persists and dispatches internal jobs in-process; when enabled, a storage inventory handler maintains a persistent snapshot. Policy audits and repairs remain future work. Dashed paths show the planned worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
+The solid paths show implemented components. The scheduler persists and dispatches `image.processing` jobs in-process, alongside storage inventory, mutation recovery, verification, maintenance, and read-only policy audit queues when storage usage is enabled. Dashed paths show the planned worker registry, UDS/gRPC transport, and remote worker runtime. `worker-protocol` provides versioned data types only.
 
 The core rule is simple:
 
