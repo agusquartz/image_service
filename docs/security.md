@@ -19,6 +19,7 @@ The service includes several defensive measures:
 - Restricted resource-ID characters.
 - Bounded image-processing concurrency.
 - Separate upload admission and compressed-body budget before multipart reads; configurable whole-body read timeout.
+- Synchronous multipart uploads spill from a bounded receive buffer to private backend staging after `IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES`; actual bytes are counted and the absolute profile/global input limit still applies. Temporary staging is removed on request failure or cancellation.
 - Optional async image jobs stream uploaded source data into a service-reserved backend staging prefix, enforce the configured source-size limit, and reject detected unsupported or MIME-mismatched formats during receipt.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
