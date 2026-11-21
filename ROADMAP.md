@@ -47,6 +47,7 @@ Presigned read URLs            yes (backend capability required)
 Cache validators               yes
 Upload methods                 POST (create-only), PUT (create or replace)
 Async image processing         yes (separate durable staging/job/status API; normal routes stay synchronous)
+Synchronous upload staging     yes (bounded receive buffer with configurable threshold and private LocalFS/S3-compatible spill)
 
 Local filesystem storage       yes
 S3 storage                     yes

@@ -150,6 +150,14 @@ Responsibilities:
 - Set response headers.
 
 The HTTP layer should not implement image compression or storage backend operations directly.
+Synchronous multipart input is received through the Core transfer manager: it
+counts actual bytes, keeps up to `IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES` in a
+bounded buffer, and spills larger bodies into private `__image_transfer/`
+staging before processing. The absolute configured input limit remains in
+force. After receive completes, the service reserves the whole source size and
+loads it for image decoding; staging bounds request reception, not decoder
+memory. Temporary transfer objects are removed on success, failure, timeout,
+or request cancellation. Async jobs use their separate `__image_jobs/` prefix.
 
 ### Process Lifecycle
 
@@ -292,6 +300,7 @@ Upload Handler
   +----> Path validation / ImageKey
   |
   +----> Multipart extraction
+  +----> Bounded RAM buffer, then private staging above configured threshold
   |
   v
 Image Service
