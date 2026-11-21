@@ -18,6 +18,8 @@ pub const DEFAULT_IMAGE_CACHE_TTL_SECONDS: u64 = 60;
 pub const MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 pub const UPLOAD_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_UPLOADS_IN_FLIGHT: usize = 4;
+/// Maximum source bytes kept in RAM while receiving one synchronous upload.
+pub const DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS: u64 = 120;
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
@@ -152,6 +154,9 @@ pub struct AppConfig {
     /// Budget reserved for compressed upload bodies while in flight.
     pub upload_memory_budget_bytes: usize,
 
+    /// Per-upload RAM threshold before synchronous input spills to storage staging.
+    pub upload_memory_threshold_bytes: usize,
+
     pub upload_read_timeout_seconds: u64,
 
     /// Maximum time to drain active HTTP requests after SIGINT or SIGTERM.
@@ -253,6 +258,7 @@ impl AppConfig {
     /// - `IMAGE_MAX_CONCURRENCY`
     /// - `IMAGE_MAX_UPLOADS_IN_FLIGHT`
     /// - `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES`
+    /// - `IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES`
     /// - `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS`
     /// - `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`
     /// - `IMAGE_JOB_DB_PATH`
@@ -369,6 +375,12 @@ impl AppConfig {
         let upload_memory_budget_bytes = parse_bounded_usize(
             "IMAGE_UPLOAD_MEMORY_BUDGET_BYTES",
             default_upload_budget,
+            1,
+            usize::MAX,
+        )?;
+        let upload_memory_threshold_bytes = parse_bounded_usize(
+            "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES",
+            DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
             1,
             usize::MAX,
         )?;
@@ -585,6 +597,7 @@ impl AppConfig {
             max_concurrency,
             max_uploads_in_flight,
             upload_memory_budget_bytes,
+            upload_memory_threshold_bytes,
             upload_read_timeout_seconds,
             shutdown_timeout_seconds,
             job_database_path,
@@ -773,6 +786,10 @@ fn parse_bounded_usize(name: &str, default: usize, min: usize, max: usize) -> io
             )
         })?
         .unwrap_or(default);
+    validate_bounded_usize(name, value, min, max)
+}
+
+fn validate_bounded_usize(name: &str, value: usize, min: usize, max: usize) -> io::Result<usize> {
     if !(min..=max).contains(&value) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -910,6 +927,25 @@ mod tests {
         );
         assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 0, 1, 3600).is_err());
         assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 3601, 1, 3600).is_err());
+    }
+
+    #[test]
+    fn upload_memory_threshold_has_an_eight_mib_default_and_requires_positive_bytes() {
+        assert_eq!(DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES, 8 * 1024 * 1024);
+        assert_eq!(
+            validate_bounded_usize(
+                "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES",
+                DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
+                1,
+                usize::MAX,
+            )
+            .unwrap(),
+            8 * 1024 * 1024
+        );
+        assert!(
+            validate_bounded_usize("IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES", 0, 1, usize::MAX)
+                .is_err()
+        );
     }
 
     #[test]

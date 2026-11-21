@@ -7,7 +7,7 @@ use axum::{
 };
 
 use super::super::{
-    dtos::UploadResponse, model::ImageKey, multipart::read_multipart_image, service,
+    dtos::UploadResponse, model::ImageKey, multipart::receive_multipart_image, service,
 };
 
 /// Creates an image in an unused slot.
@@ -100,13 +100,22 @@ async fn upload_image(
     }
 
     // Reserve compressed-body capacity before consuming the multipart stream.
-    let admission = state.admit_upload(policy.max_input_bytes)?;
-    let incoming = tokio::time::timeout(
+    let mut admission = state.admit_transfer_upload(policy.max_input_bytes)?;
+    let received = tokio::time::timeout(
         std::time::Duration::from_secs(state.upload_read_timeout_seconds),
-        read_multipart_image(multipart, policy.max_input_bytes),
+        receive_multipart_image(
+            multipart,
+            policy.max_input_bytes,
+            state.upload_memory_threshold_bytes,
+            &state.store,
+        ),
     )
     .await
     .map_err(|_| ApiError::RequestTimeout("Upload body read timed out".to_string()))??;
+    if let Some(source_bytes) = received.staged_size() {
+        state.reserve_staged_source(&mut admission, source_bytes)?;
+    }
+    let incoming = received.into_incoming(&state.store).await?;
 
     service::upload(
         &state,

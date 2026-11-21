@@ -33,11 +33,16 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "images")]
 pub(crate) struct UploadAdmission {
     _slot: OwnedSemaphorePermit,
-    _body_budget: OwnedSemaphorePermit,
+    _body_budget: Vec<OwnedSemaphorePermit>,
+    body_budget_units: u32,
 }
 
 #[cfg(feature = "images")]
 const STAGED_UPLOAD_BUFFER_RESERVATION_BYTES: usize = 5 * 1024 * 1024;
+
+#[cfg(feature = "images")]
+const UPLOAD_PROCESSING_BUSY_MESSAGE: &str =
+    "Upload processing capacity is temporarily busy; retry later.";
 
 #[cfg(feature = "images")]
 pub(crate) struct BackgroundReadAdmission {
@@ -104,6 +109,8 @@ pub struct AppState {
     upload_slots: Arc<Semaphore>,
     #[cfg(feature = "images")]
     upload_body_budget: Arc<Semaphore>,
+    #[cfg(feature = "images")]
+    pub upload_memory_threshold_bytes: usize,
     #[cfg(feature = "images")]
     async_resource_locks: Arc<Vec<Mutex<()>>>,
     #[cfg(feature = "images")]
@@ -210,6 +217,8 @@ impl AppState {
                 config.upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES,
             )),
             #[cfg(feature = "images")]
+            upload_memory_threshold_bytes: config.upload_memory_threshold_bytes,
+            #[cfg(feature = "images")]
             async_resource_locks: Arc::new((0..256).map(|_| Mutex::new(())).collect()),
             #[cfg(feature = "images")]
             upload_read_timeout_seconds: config.upload_read_timeout_seconds,
@@ -278,6 +287,29 @@ impl AppState {
     }
 
     #[cfg(feature = "images")]
+    pub(crate) fn admit_transfer_upload(
+        &self,
+        max_input_bytes: usize,
+    ) -> Result<UploadAdmission, ApiError> {
+        reserve_upload(
+            self.upload_slots.clone(),
+            self.upload_body_budget.clone(),
+            max_input_bytes.min(self.upload_memory_threshold_bytes),
+        )
+    }
+
+    /// Extends the receive-buffer reservation to cover the full staged source
+    /// before loading it for processing.
+    #[cfg(feature = "images")]
+    pub(crate) fn reserve_staged_source(
+        &self,
+        admission: &mut UploadAdmission,
+        source_bytes: usize,
+    ) -> Result<(), ApiError> {
+        extend_upload_reservation(self.upload_body_budget.clone(), admission, source_bytes)
+    }
+
+    #[cfg(feature = "images")]
     pub(crate) fn admit_staging_upload(&self) -> Result<UploadAdmission, ApiError> {
         reserve_upload(
             self.upload_slots.clone(),
@@ -323,16 +355,37 @@ fn reserve_upload(
 ) -> Result<UploadAdmission, ApiError> {
     let slot = upload_slots
         .try_acquire_owned()
-        .map_err(|_| ApiError::ServiceUnavailable("Upload capacity exhausted".to_string()))?;
+        .map_err(|_| ApiError::ServiceUnavailable(UPLOAD_PROCESSING_BUSY_MESSAGE.to_string()))?;
     let units = u32::try_from(max_input_bytes.div_ceil(UPLOAD_BUDGET_UNIT_BYTES))
         .map_err(|_| ApiError::Internal("Upload input limit exceeds budget units".into()))?;
     let body_budget = upload_body_budget
         .try_acquire_many_owned(units)
-        .map_err(|_| ApiError::ServiceUnavailable("Upload memory budget exhausted".into()))?;
+        .map_err(|_| ApiError::ServiceUnavailable(UPLOAD_PROCESSING_BUSY_MESSAGE.to_string()))?;
     Ok(UploadAdmission {
         _slot: slot,
-        _body_budget: body_budget,
+        _body_budget: vec![body_budget],
+        body_budget_units: units,
     })
+}
+
+#[cfg(feature = "images")]
+fn extend_upload_reservation(
+    upload_body_budget: Arc<Semaphore>,
+    admission: &mut UploadAdmission,
+    source_bytes: usize,
+) -> Result<(), ApiError> {
+    let units = u32::try_from(source_bytes.div_ceil(UPLOAD_BUDGET_UNIT_BYTES))
+        .map_err(|_| ApiError::Internal("Upload input size exceeds budget units".into()))?;
+    let additional_units = units.saturating_sub(admission.body_budget_units);
+    if additional_units == 0 {
+        return Ok(());
+    }
+    let permit = upload_body_budget
+        .try_acquire_many_owned(additional_units)
+        .map_err(|_| ApiError::ServiceUnavailable(UPLOAD_PROCESSING_BUSY_MESSAGE.to_string()))?;
+    admission._body_budget.push(permit);
+    admission.body_budget_units = units;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -378,5 +431,29 @@ mod tests {
         ));
         drop(first);
         assert!(reserve_upload(slots, budget, UPLOAD_BUDGET_UNIT_BYTES + 1).is_ok());
+    }
+
+    #[test]
+    fn staged_source_extends_reservation_before_processing_or_fails_fast() {
+        let slots = Arc::new(Semaphore::new(2));
+        let budget = Arc::new(Semaphore::new(2));
+        let mut upload = reserve_upload(slots.clone(), budget.clone(), 1).unwrap();
+        assert_eq!(budget.available_permits(), 1);
+        extend_upload_reservation(budget.clone(), &mut upload, UPLOAD_BUDGET_UNIT_BYTES + 1)
+            .unwrap();
+        assert_eq!(budget.available_permits(), 0);
+
+        drop(upload);
+        assert_eq!(budget.available_permits(), 2);
+
+        let mut upload = reserve_upload(slots.clone(), budget.clone(), 1).unwrap();
+        let other = reserve_upload(slots, budget.clone(), UPLOAD_BUDGET_UNIT_BYTES).unwrap();
+        assert!(matches!(
+            extend_upload_reservation(budget.clone(), &mut upload, UPLOAD_BUDGET_UNIT_BYTES + 1),
+            Err(ApiError::ServiceUnavailable(message)) if message == UPLOAD_PROCESSING_BUSY_MESSAGE
+        ));
+        assert_eq!(budget.available_permits(), 0);
+        drop((upload, other));
+        assert_eq!(budget.available_permits(), 2);
     }
 }

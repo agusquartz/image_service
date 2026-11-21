@@ -403,6 +403,39 @@ impl ImageStore {
             .map_err(|error| ApiError::Storage(error.to_string()))
     }
 
+    pub async fn open_transfer_writer(
+        &self,
+        staging_id: &str,
+    ) -> Result<opendal::Writer, ApiError> {
+        self.operator
+            .writer(&transfer_staging_object_key(staging_id))
+            .await
+            .map_err(|error| ApiError::Storage(error.to_string()))
+    }
+
+    pub async fn read_transfer_staged(&self, staging_id: &str) -> Result<Bytes, ApiError> {
+        match self
+            .operator
+            .read(&transfer_staging_object_key(staging_id))
+            .await
+        {
+            Ok(buffer) => Ok(buffer.to_bytes()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Err(ApiError::NotFound("Staged upload not found".to_string()))
+            }
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
+    pub async fn delete_transfer_staged(&self, staging_id: &str) -> Result<(), ApiError> {
+        let key = transfer_staging_object_key(staging_id);
+        match self.operator.delete(&key).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
     pub async fn read_staged(&self, staging_id: &str) -> Result<Vec<u8>, ApiError> {
         self.read_object(&staging_object_key(staging_id)).await
     }
@@ -596,6 +629,10 @@ fn staging_object_key(staging_id: &str) -> String {
     format!("__image_jobs/{staging_id}/original")
 }
 
+fn transfer_staging_object_key(staging_id: &str) -> String {
+    format!("__image_transfer/{staging_id}/source")
+}
+
 fn stored_metadata_from(metadata: opendal::Metadata) -> StoredMetadata {
     StoredMetadata {
         content_length: metadata.content_length(),
@@ -681,6 +718,21 @@ mod tests {
         let actual = store.read(&key).await.expect("Image read should succeed");
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn transfer_staging_round_trips_and_deletes_independently_of_async_job_staging() {
+        let (_temp_dir, store) = test_store();
+        let id = uuid::Uuid::new_v4().to_string();
+        let data = Bytes::from_static(b"complete staged source");
+        let mut writer = store.open_transfer_writer(&id).await.unwrap();
+        writer.write(data.clone()).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(store.read_transfer_staged(&id).await.unwrap(), data);
+        assert!(store.list_staged_ids().await.unwrap().is_empty());
+        store.delete_transfer_staged(&id).await.unwrap();
+        assert!(store.read_transfer_staged(&id).await.is_err());
     }
 
     #[tokio::test]
