@@ -1,6 +1,11 @@
 #[cfg(feature = "images")]
 use crate::image_jobs::{create_image_job, get_image_job_status, replace_image_job};
 #[cfg(feature = "images")]
+use crate::resumable_uploads::{
+    create_post_session, create_put_session, delete_session, head_session, patch_session,
+    tus_options,
+};
+#[cfg(feature = "images")]
 use crate::storage_usage::{
     get_policy_audit, get_policy_audit_findings, get_usage, request_reconciliation,
     start_policy_audit,
@@ -26,6 +31,7 @@ use axum::routing::post;
 use axum::{
     Router,
     extract::{Request, State},
+    http::{HeaderName, HeaderValue, Method, header},
     middleware,
     middleware::Next,
     response::Response,
@@ -53,6 +59,8 @@ use axum::{
 /// POST /api/image-jobs/{namespace}/{resource_id}/{slot} (async create)
 /// PUT  /api/image-jobs/{namespace}/{resource_id}/{slot} (async create or replace)
 /// GET  /api/image-jobs/{job_id}
+/// POST/PUT /api/image-uploads/{namespace}/{resource_id}/{slot}
+/// HEAD/PATCH/DELETE /api/image-uploads/{upload_id}
 /// ```
 pub fn build_router(state: AppState) -> Router {
     let metrics_enabled = state.metrics_enabled;
@@ -91,13 +99,25 @@ pub fn build_router(state: AppState) -> Router {
                 "/api/image-jobs/{namespace}/{resource_id}/{slot}",
                 post(create_image_job).put(replace_image_job),
             )
-            .route("/api/image-jobs/{job_id}", get(get_image_job_status))
-            // Multipart parsing is still constrained by Axum's body limit.
-            //
-            // The limit is intentionally slightly larger than the maximum
-            // source image size because multipart requests include
-            // additional metadata and boundary bytes.
-            .layer(DefaultBodyLimit::max(max_request_bytes));
+            .route("/api/image-jobs/{job_id}", get(get_image_job_status));
+        if state.resumable_uploads_enabled {
+            router = router
+                .route("/api/image-uploads", axum::routing::options(tus_options))
+                .route(
+                    "/api/image-uploads/{namespace}/{resource_id}/{slot}",
+                    post(create_post_session).put(create_put_session),
+                )
+                .route(
+                    "/api/image-uploads/{upload_id}",
+                    axum::routing::head(head_session)
+                        .patch(patch_session)
+                        .delete(delete_session)
+                        .options(tus_options),
+                );
+        }
+        // Multipart and resumable PATCH bodies share a strict outer bound.
+        // The extra framing allowance is needed by multipart POST/PUT.
+        router = router.layer(DefaultBodyLimit::max(max_request_bytes));
         if state.storage_usage_enabled {
             router = router
                 .route("/api/storage/usage", get(get_usage))
@@ -116,6 +136,7 @@ pub fn build_router(state: AppState) -> Router {
     }
 
     router
+        .layer(middleware::from_fn(tus_response_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_foreground_activity,
@@ -125,6 +146,22 @@ pub fn build_router(state: AppState) -> Router {
             observe_request,
         ))
         .with_state(state)
+}
+
+async fn tus_response_headers(request: Request, next: Next) -> Response {
+    let is_tus_request = request.uri().path().starts_with("/api/image-uploads")
+        && request.method() != Method::OPTIONS;
+    let mut response = next.run(request).await;
+    if is_tus_request {
+        response.headers_mut().insert(
+            HeaderName::from_static("tus-resumable"),
+            HeaderValue::from_static("1.0.0"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 async fn track_foreground_activity(

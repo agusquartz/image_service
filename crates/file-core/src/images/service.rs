@@ -3,11 +3,7 @@ use crate::{
     state::{AppState, UploadAdmission},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    io::Cursor,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, io::Cursor, time::Duration};
 
 use super::{
     dtos::{ImageInfoResponse, ImageListResponse, ImageSummary, PresignResponse, UploadResponse},
@@ -15,12 +11,6 @@ use super::{
     reduction::reduce_to_webp,
     store::{ImageOperationToken, StoredMetadata},
 };
-
-pub(crate) struct ImageDelivery {
-    pub bytes: Vec<u8>,
-    pub etag: String,
-    pub last_modified: Option<SystemTime>,
-}
 
 /// Processes and stores an uploaded image.
 ///
@@ -38,13 +28,12 @@ pub(crate) async fn upload(
 ) -> Result<(UploadResponse, bool), ApiError> {
     let policy = state.processing_policy_for(&key.namespace);
     let webp = reduce_to_webp(
+        state,
         state.image_processor.clone(),
         state.image_jobs.clone(),
         incoming,
         admission,
-        policy.max_output_bytes,
-        policy.output_width,
-        policy.output_height,
+        &policy,
     )
     .await?;
     let target_lock = state.async_resource_lock(&key.namespace, &key.resource_id);
@@ -114,21 +103,15 @@ pub(crate) async fn upload(
     ))
 }
 
-/// Retrieves a stored image.
-///
-/// Validation has already occurred when constructing [`ImageKey`].
-pub(crate) async fn fetch(state: &AppState, key: &ImageKey) -> Result<ImageDelivery, ApiError> {
-    let (metadata, bytes) = state.store.read_snapshot(key).await?;
-    let etag = metadata
-        .etag
-        .map(normalize_etag)
-        .unwrap_or_else(|| content_etag(&bytes));
-
-    Ok(ImageDelivery {
-        bytes,
-        etag,
-        last_modified: metadata.last_modified,
-    })
+/// Opens a version-consistent storage reader for streaming the image response.
+pub(crate) async fn open_download(
+    state: &AppState,
+    key: &ImageKey,
+) -> Result<(super::store::StoredMetadata, opendal::Reader), ApiError> {
+    state
+        .store
+        .open_image_reader(key, state.download_stream_chunk_bytes())
+        .await
 }
 
 pub(crate) async fn delete(state: &AppState, key: &ImageKey) -> Result<(), ApiError> {

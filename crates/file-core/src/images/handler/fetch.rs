@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::Response,
 };
+use futures_util::{StreamExt, TryStreamExt};
 use std::time::SystemTime;
 
 use super::super::{model::ImageKey, service};
@@ -36,9 +37,8 @@ pub(crate) async fn fetch_image(
 
     let key = ImageKey::new(namespace, resource_id, slot)?;
 
-    // A matching storage validator can answer conditional requests before
-    // reading the image body, after the store confirms the same version.
-    // Without a reliable validator, fetch computes a content ETag instead.
+    // A matching storage validator can answer conditional requests without
+    // opening a response body.
     if headers.contains_key(header::IF_NONE_MATCH)
         || headers.contains_key(header::IF_MODIFIED_SINCE)
     {
@@ -47,38 +47,127 @@ pub(crate) async fn fetch_image(
         if is_not_modified(&headers, etag.as_deref(), metadata.last_modified)
             && service::is_current_snapshot(&state, &key, &metadata).await?
         {
-            return image_response(&state, None, etag.as_deref(), metadata.last_modified);
+            return image_response(
+                &state,
+                Body::empty(),
+                StatusCode::NOT_MODIFIED,
+                etag.as_deref(),
+                metadata.last_modified,
+            );
         }
     }
 
-    let image = service::fetch(&state, &key).await?;
-    let not_modified = is_not_modified(&headers, Some(&image.etag), image.last_modified);
+    let (metadata, reader) = service::open_download(&state, &key).await?;
+    let etag = metadata.etag.clone().map(service::normalize_etag);
+    let length = metadata.content_length;
+    if is_not_modified(&headers, etag.as_deref(), metadata.last_modified) {
+        return image_response(
+            &state,
+            Body::empty(),
+            StatusCode::NOT_MODIFIED,
+            etag.as_deref(),
+            metadata.last_modified,
+        );
+    }
 
-    image_response(
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|_| if_range_matches(&headers, etag.as_deref(), metadata.last_modified))
+        .and_then(|value| parse_single_byte_range(value, length));
+
+    let range = match range {
+        Some(ParsedRange::Unsatisfiable) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{length}"))
+                    .map_err(|error| ApiError::Internal(error.to_string()))?,
+            );
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+            set_cache_headers(
+                &state,
+                response.headers_mut(),
+                etag.as_deref(),
+                metadata.last_modified,
+            )?;
+            return Ok(response);
+        }
+        range => range,
+    };
+
+    let (status, start, end, content_range) = match range {
+        Some(ParsedRange::Satisfiable { start, end }) => {
+            let end_exclusive = end
+                .checked_add(1)
+                .ok_or_else(|| ApiError::BadRequest("Requested byte range is too large".into()))?;
+            (
+                StatusCode::PARTIAL_CONTENT,
+                start,
+                end_exclusive,
+                Some(format!("bytes {start}-{end}/{length}")),
+            )
+        }
+        None => (StatusCode::OK, 0, length, None),
+        Some(ParsedRange::Unsatisfiable) => unreachable!("handled above"),
+    };
+
+    let content_length = end.saturating_sub(start);
+    let permit = state.try_admit_image_download()?;
+    let stream = reader
+        .into_stream(start..end)
+        .await
+        .map_err(|error| ApiError::Storage(error.to_string()))?
+        .map_ok(|buffer| buffer.to_bytes())
+        .map_err(std::io::Error::other)
+        .map(move |item| {
+            let _permit = &permit;
+            item
+        });
+    let mut response = image_response(
         &state,
-        (!not_modified).then_some(image.bytes),
-        Some(&image.etag),
-        image.last_modified,
-    )
+        Body::from_stream(stream),
+        status,
+        etag.as_deref(),
+        metadata.last_modified,
+    )?;
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .map_err(|error| ApiError::Internal(error.to_string()))?,
+    );
+    if let Some(content_range) = content_range {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range)
+                .map_err(|error| ApiError::Internal(error.to_string()))?,
+        );
+    }
+    Ok(response)
 }
 
 fn image_response(
     state: &AppState,
-    body: Option<Vec<u8>>,
+    body: Body,
+    status: StatusCode,
     etag: Option<&str>,
     last_modified: Option<SystemTime>,
 ) -> Result<Response, ApiError> {
-    let status = if body.is_some() {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_MODIFIED
-    };
-    let mut response = Response::new(body.map_or_else(Body::empty, Body::from));
+    let mut response = Response::new(body);
     *response.status_mut() = status;
 
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
     // Prevent browsers from attempting to reinterpret the returned
     // resource as another content type.
@@ -111,6 +200,9 @@ pub(crate) async fn head_image(
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if !not_modified {
         let content_length = HeaderValue::from_str(&metadata.content_length.to_string())
             .map_err(|error| ApiError::Internal(error.to_string()))?;
@@ -125,6 +217,67 @@ pub(crate) async fn head_image(
         metadata.last_modified,
     )?;
     Ok(response)
+}
+
+enum ParsedRange {
+    Unsatisfiable,
+    Satisfiable { start: u64, end: u64 },
+}
+
+/// Returns a parsed single byte range. Unsupported or malformed range syntax
+/// is ignored as required for a server that does not support that range set.
+fn parse_single_byte_range(value: &str, length: u64) -> Option<ParsedRange> {
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 || length == 0 {
+            return Some(ParsedRange::Unsatisfiable);
+        }
+        let start = length.saturating_sub(suffix);
+        return Some(ParsedRange::Satisfiable {
+            start,
+            end: length - 1,
+        });
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= length {
+        return Some(ParsedRange::Unsatisfiable);
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        let end = end.parse::<u64>().ok()?;
+        if end < start {
+            return Some(ParsedRange::Unsatisfiable);
+        }
+        end.min(length - 1)
+    };
+    Some(ParsedRange::Satisfiable { start, end })
+}
+
+fn if_range_matches(
+    headers: &HeaderMap,
+    etag: Option<&str>,
+    last_modified: Option<SystemTime>,
+) -> bool {
+    let Some(value) = headers.get(header::IF_RANGE) else {
+        return true;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    if value.starts_with('"') {
+        return etag.is_some_and(|etag| !etag.starts_with("W/") && value == etag);
+    }
+    let (Some(last_modified), Ok(date)) = (last_modified, httpdate::parse_http_date(value)) else {
+        return false;
+    };
+    httpdate::parse_http_date(&httpdate::fmt_http_date(last_modified))
+        .is_ok_and(|modified| modified <= date)
 }
 
 fn is_not_modified(

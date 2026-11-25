@@ -26,6 +26,10 @@ pub enum ApiError {
 
     Conflict(String),
 
+    PreconditionFailed(String),
+
+    ChecksumMismatch,
+
     NotFound(String),
 
     UnsupportedMediaType(String),
@@ -74,6 +78,13 @@ impl IntoResponse for ApiError {
             }
 
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
+
+            Self::PreconditionFailed(message) => (StatusCode::PRECONDITION_FAILED, message),
+
+            Self::ChecksumMismatch => (
+                StatusCode::from_u16(460).expect("460 is a valid HTTP status code"),
+                "Upload checksum mismatch".to_string(),
+            ),
 
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
 

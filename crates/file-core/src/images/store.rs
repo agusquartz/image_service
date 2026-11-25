@@ -293,6 +293,171 @@ impl ImageStore {
         ))
     }
 
+    /// Opens a reader pinned to the same object version represented by metadata.
+    ///
+    /// Object stores use If-Match when available. LocalFS opens the file while
+    /// holding the in-process resource lock; its atomic replacement keeps that
+    /// open handle on the previous inode after the lock is released.
+    pub async fn open_image_reader(
+        &self,
+        key: &ImageKey,
+        chunk_bytes: usize,
+    ) -> Result<(StoredMetadata, opendal::Reader), ApiError> {
+        let object_key = image_object_key(key);
+        let supports_if_match = self.operator.info().full_capability().read_with_if_match;
+
+        for _ in 0..3 {
+            let metadata = self.stat(key).await?;
+            if supports_if_match && let Some(etag) = metadata.etag.as_deref() {
+                match self
+                    .operator
+                    .reader_with(&object_key)
+                    .if_match(etag)
+                    .chunk(chunk_bytes)
+                    .await
+                {
+                    Ok(reader) => return Ok((metadata, reader)),
+                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        return Err(ApiError::NotFound("Image not found".to_string()));
+                    }
+                    Err(error) => return Err(ApiError::Storage(error.to_string())),
+                }
+            }
+
+            let resource_lock = self.operation_lock_for_resource(&key.namespace, &key.resource_id);
+            let _guard = resource_lock.lock_owned().await;
+            let current = self.stat(key).await?;
+            if current.etag != metadata.etag
+                || current.content_length != metadata.content_length
+                || current.last_modified != metadata.last_modified
+            {
+                continue;
+            }
+            let reader = self
+                .operator
+                .reader_with(&object_key)
+                .chunk(chunk_bytes)
+                .await
+                .map_err(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        ApiError::NotFound("Image not found".to_string())
+                    } else {
+                        ApiError::Storage(error.to_string())
+                    }
+                })?;
+            return Ok((current, reader));
+        }
+
+        Err(ApiError::ServiceUnavailable(
+            "Image changed repeatedly while opening a download; retry the request".to_string(),
+        ))
+    }
+
+    /// Opens durable staging for one immutable Tus PATCH chunk.
+    pub async fn open_resumable_chunk_writer(
+        &self,
+        session_id: &str,
+        chunk_id: &str,
+    ) -> Result<opendal::Writer, ApiError> {
+        self.operator
+            .writer(&resumable_chunk_key(session_id, chunk_id))
+            .await
+            .map_err(|error| ApiError::Storage(error.to_string()))
+    }
+
+    pub async fn read_resumable_chunk(
+        &self,
+        session_id: &str,
+        chunk_id: &str,
+    ) -> Result<Bytes, ApiError> {
+        self.operator
+            .read(&resumable_chunk_key(session_id, chunk_id))
+            .await
+            .map(|buffer| buffer.to_bytes())
+            .map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    ApiError::ServiceUnavailable(
+                        "A confirmed upload chunk is missing from durable staging".to_string(),
+                    )
+                } else {
+                    ApiError::Storage(error.to_string())
+                }
+            })
+    }
+
+    pub async fn delete_resumable_chunk(
+        &self,
+        session_id: &str,
+        chunk_id: &str,
+    ) -> Result<(), ApiError> {
+        match self
+            .operator
+            .delete(&resumable_chunk_key(session_id, chunk_id))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ApiError::Storage(error.to_string())),
+        }
+    }
+
+    pub async fn delete_resumable_upload_staging(&self, session_id: &str) -> Result<(), ApiError> {
+        let prefix = resumable_session_prefix(session_id);
+        let mut lister = match self.operator.lister_with(&prefix).recursive(true).await {
+            Ok(lister) => lister,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ApiError::Storage(error.to_string())),
+        };
+        while let Some(entry) = lister.next().await {
+            let entry = entry.map_err(|error| ApiError::Storage(error.to_string()))?;
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            self.operator
+                .delete(entry.path())
+                .await
+                .map_err(|error| ApiError::Storage(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_resumable_staging_keys(&self) -> Result<Vec<String>, ApiError> {
+        let mut lister = match self
+            .operator
+            .lister_with("__image_transfer/resumable/")
+            .recursive(true)
+            .await
+        {
+            Ok(lister) => lister,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ApiError::Storage(error.to_string())),
+        };
+        let mut keys = Vec::new();
+        while let Some(entry) = lister.next().await {
+            let entry = entry.map_err(|error| ApiError::Storage(error.to_string()))?;
+            if entry.metadata().mode() == EntryMode::FILE {
+                keys.push(entry.path().to_string());
+            }
+        }
+        Ok(keys)
+    }
+
+    pub async fn delete_resumable_staging_key(&self, key: &str) -> Result<(), ApiError> {
+        if !key.starts_with("__image_transfer/resumable/") {
+            return Err(ApiError::Internal(
+                "Refusing to delete a key outside resumable staging".into(),
+            ));
+        }
+        self.operator.delete(key).await.map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                ApiError::NotFound("Staged chunk not found".into())
+            } else {
+                ApiError::Storage(error.to_string())
+            }
+        })
+    }
+
     /// Confirms that metadata used for a conditional response still identifies
     /// the current object. S3-compatible stores verify the ETag with a one-byte
     /// conditional range read; LocalFS checks under the resource operation lock.
@@ -631,6 +796,14 @@ fn staging_object_key(staging_id: &str) -> String {
 
 fn transfer_staging_object_key(staging_id: &str) -> String {
     format!("__image_transfer/{staging_id}/source")
+}
+
+fn resumable_session_prefix(session_id: &str) -> String {
+    format!("__image_transfer/resumable/{session_id}/")
+}
+
+fn resumable_chunk_key(session_id: &str, chunk_id: &str) -> String {
+    format!("{}chunks/{chunk_id}", resumable_session_prefix(session_id))
 }
 
 fn stored_metadata_from(metadata: opendal::Metadata) -> StoredMetadata {
