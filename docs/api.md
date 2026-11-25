@@ -26,6 +26,12 @@ DELETE /api/images/{namespace}/{resource_id}
 POST /api/image-jobs/{namespace}/{resource_id}/{slot}
 PUT  /api/image-jobs/{namespace}/{resource_id}/{slot}
 GET  /api/image-jobs/{job_id}
+POST /api/image-uploads/{namespace}/{resource_id}/{slot} (Tus session, create only)
+PUT  /api/image-uploads/{namespace}/{resource_id}/{slot} (Tus session, create or replace)
+HEAD /api/image-uploads/{upload_id}
+PATCH /api/image-uploads/{upload_id}
+DELETE /api/image-uploads/{upload_id}
+OPTIONS /api/image-uploads
 
 GET  /api/storage/usage
 POST /api/storage/reconcile
@@ -47,6 +53,8 @@ The corresponding API URL is:
 ```text
 /api/images/products/845/2
 ```
+
+Image GET supports a single HTTP byte range and conditional `If-Range`; see [Byte-range downloads](#byte-range-downloads).
 
 The corresponding backend-independent storage key is:
 
@@ -197,7 +205,114 @@ The source byte limit is counted from received multipart chunks, including when 
 
 For a slot already known to exist, `POST` checks for the conflict before reading and processing the multipart image. A final conditional storage write still protects against two concurrent create requests. Operations on one resource are coordinated within this service process: successful uploads publish in storage order, and a later successful `PUT` replaces the prior value. A slot `DELETE` invalidates uploads that began for that slot before the delete; a resource `DELETE` invalidates uploads that began for any slot in that resource. Those superseded uploads return `409 Conflict` and cannot recreate the deleted image after the delete response. Requests that begin after the delete can create or replace images normally. Coordination is in-memory and per process; it is not a durable job log or cross-replica lock.
 
-There is no `PATCH` upload method because uploads contain the complete image file; this API has no partial image representation to patch.
+The synchronous image endpoint still accepts complete-file `POST` and `PUT` multipart uploads; it does not patch an existing image representation. A **session** is a temporary, server-recorded upload attempt: it has an ID, a destination, a declared total length, an expiry, and a confirmed byte offset. “Optional” has two meanings here: an operator must enable this API with `IMAGE_RESUMABLE_UPLOADS_ENABLED=true` (it is disabled by default), and each client chooses to create a session instead of using the existing one-request upload. Existing clients and endpoints keep their current behavior. The session API follows Tus 1.0 and uses `PATCH` only to append confirmed upload bytes; it does not partially edit an already stored image.
+
+### Resumable uploads (Tus 1.0)
+
+Create a session with a known total length. Use `POST` for create-only semantics or `PUT` for create-or-replace semantics:
+
+`OPTIONS /api/image-uploads` advertises the supported Tus version, extensions, and checksum algorithm.
+
+```http
+POST /api/image-uploads/products/845/1
+Tus-Resumable: 1.0.0
+Upload-Length: 120000
+Authorization: Bearer <api-key>
+```
+
+The service returns `201 Created`, a `Location: /api/image-uploads/{upload_id}`, `Upload-Offset: 0`, `Upload-Length`, and `Upload-Expires`. `HEAD` on that location reports the confirmed offset and total length. Send each chunk using `PATCH /api/image-uploads/{upload_id}`, `Tus-Resumable: 1.0.0`, `Upload-Offset: <confirmed offset>`, and `Content-Type: application/offset+octet-stream`.
+
+#### Two-chunk upload example
+
+Suppose the client is uploading a 10-byte file whose bytes spell `abcdefghij`. The client keeps the session URL and the original file. The request body of each `PATCH` is the raw next part of that file:
+
+```http
+POST /api/image-uploads/products/845/1
+Tus-Resumable: 1.0.0
+Upload-Length: 10
+Authorization: Bearer <api-key>
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /api/image-uploads/7c6f...
+Upload-Offset: 0
+Upload-Length: 10
+```
+
+First chunk: bytes at zero-based positions `0` through `4`, which are `abcde`:
+
+```http
+PATCH /api/image-uploads/7c6f...
+Tus-Resumable: 1.0.0
+Upload-Offset: 0
+Content-Type: application/offset+octet-stream
+
+abcde
+```
+
+```http
+HTTP/1.1 204 No Content
+Upload-Offset: 5
+```
+
+Second chunk: bytes at positions `5` through `9`, which are `fghij`:
+
+```http
+PATCH /api/image-uploads/7c6f...
+Tus-Resumable: 1.0.0
+Upload-Offset: 5
+Content-Type: application/offset+octet-stream
+
+fghij
+```
+
+```http
+HTTP/1.1 204 No Content
+Upload-Offset: 10
+```
+
+When the offset reaches the declared length, the service validates and processes the assembled source, then stores the WebP using the normal image rules. The final PATCH waits for that work and returns `204` after the image is stored; it does not enqueue an `image-job` or return `202 Accepted`. Use `/api/image-jobs/...` when processing itself should happen asynchronously. If a connection drops before a PATCH is confirmed, the client sends `HEAD` to the session URL. For example, `Upload-Offset: 5` means the first five bytes were confirmed, so it resends starting at byte position `5`; it must not resend from byte `0`. A PATCH with a stale offset gets `409 Conflict` and does not append data. This same client pattern can guide future large-file processors such as video, but this API currently processes images only.
+
+`Upload-Checksum: sha256 <base64-digest>` is optional; when supplied, only Tus `sha256` is accepted and a mismatch returns Tus checksum status `460 Checksum Mismatch`. A confirmed chunk returns `204 No Content` with the new `Upload-Offset`; `Upload-Status` reports `uploading`, `ready`, `finalizing`, or `completed`. An incorrect offset returns `409 Conflict` without changing the session. A disconnected or incomplete PATCH does not advance the offset. PATCH body frames stream into a private OpenDAL staging object while the server counts bytes and computes SHA-256; `IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES` (8 MiB by default) caps each PATCH. The server closes the staged object before committing its offset and checksum manifest in SQLite, so an offset is acknowledged only after the chunk is durable in the configured backend and its manifest transaction succeeds. Session status, expiry, offset, and chunk checksums/lengths live in the SQLite database; the chunk bytes do not. Persist both that database and the configured storage backend, including SQLite WAL files, to retain resumability across restarts. Staging objects are removed on session deletion/expiry and orphaned objects are cleaned at startup.
+
+The final chunk triggers the existing image validation, optimization, and storage path; finalization verifies each staged chunk's length and checksum, then reconstructs the bounded source image for the current processor, which accepts the complete source in memory. A successful final PATCH waits for processing and storage and returns `204`; this is not the asynchronous `/api/image-jobs` flow. If processing fails after all bytes were confirmed, `HEAD` reports the offset and status; an empty `PATCH` at the final offset retries finalization, or `DELETE` discards the session. Sessions require `Upload-Length`, reject lengths above the namespace input limit with `413 Payload Too Large`, and expire according to `IMAGE_RESUMABLE_UPLOAD_TTL_SECONDS` (24 hours by default). Expired sessions are removed when new sessions are created or the expired session is accessed. Resumable transport bounds and persists network chunks, but image decode/processing still requires the complete compressed source in memory.
+
+### Byte-range downloads
+
+Image `GET` and `HEAD` responses advertise `Accept-Ranges: bytes`. A supported single `Range: bytes=start-end`, open-ended, or suffix range returns `206 Partial Content` with `Content-Range`, `Content-Length`, and available cache validators. An unsatisfiable range returns `416 Range Not Satisfiable` and `Content-Range: bytes */<length>`. Multiple or malformed ranges are ignored and return the full representation. `If-Range` returns a partial body only when its strong ETag or date still matches; otherwise the server returns the full current representation with `200 OK`. The handler obtains metadata first, then streams the complete body or asks OpenDAL to read only the selected interval; it does not load the complete object and slice it in memory. When available, ETag pins the storage read to the metadata version. LocalFS opens the file under the resource lock after rechecking metadata, then streams from that open handle. Backends without ETag do not incur a full-object hash on GET, so ETag can be absent and Last-Modified is used when available.
+
+#### Download and resume example
+
+For a 10-byte representation, the client can request the first five bytes:
+
+```http
+GET /api/images/products/845/1
+Range: bytes=0-4
+Authorization: Bearer <api-key>
+```
+
+```http
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-4/10
+Content-Length: 5
+ETag: "version-abc"
+
+abcde
+```
+
+To continue from byte `5`, the client asks for the rest and sends the ETag from the first response in `If-Range`:
+
+```http
+GET /api/images/products/845/1
+Range: bytes=5-
+If-Range: "version-abc"
+Authorization: Bearer <api-key>
+```
+
+If the ETag still matches, the server returns `206 Partial Content` with `Content-Range: bytes 5-9/10` and the remaining bytes. If the object changed, the server returns `200 OK` with the complete current image instead; the client must discard the partial data it already collected and use the new full response. The ETag check prevents joining bytes from two different versions. A future video endpoint could use the same HTTP pattern for resuming large downloads, with video-specific byte and duration policies.
+
+`Range` is a request for a slice, not a server-side size limit: a client can omit it or make repeated requests for the rest of the object. Image uploads are constrained by the effective `IMAGE_MAX_OUTPUT_BYTES` policy when the image is written, but GET does not re-apply that policy to older objects or objects changed outside this API. Streaming bounds application-side buffering; it does not cap total bytes sent, network egress, or transfer duration. `IMAGE_MAX_DOWNLOADS_IN_FLIGHT` (64 by default) bounds simultaneous GET streams per process, and `IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES` (256 KiB by default) controls the read chunk target. Storage/proxy timeouts and container/network egress policies remain deployment controls.
 
 The service validates the route parameters, reads the multipart image, verifies the source format, processes the image, and stores the resulting WebP in the requested slot.
 Upload admission reserves an upload slot and the configured receive-memory threshold before reading multipart data. A staged image extends that reservation to cover its complete source before it is loaded for decoding; if the additional budget is unavailable, the request returns `503 Service Unavailable` with `Retry-After: 1` and the temporary source is removed. When upload slots or the initial memory budget are unavailable, `POST` and `PUT` also return `503 Service Unavailable` with `Retry-After: 1`; the JSON error is `Upload processing capacity is temporarily busy; retry later.` This indicates temporary server capacity pressure, not that the image exceeded `IMAGE_MAX_INPUT_BYTES`; an image over that configured input limit returns `413 Payload Too Large`. A multipart read that exceeds `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` returns `408 Request Timeout`.
