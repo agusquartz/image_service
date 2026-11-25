@@ -217,17 +217,18 @@ should not be introduced unless OpenDAL cannot provide a required capability.
 
 ### Processing Policy Beyond Global Output Settings
 
-Global input/output byte limits and target output dimensions are now runtime-configurable. If the byte limit cannot be met at the target dimensions, output dimensions are reduced while preserving the target aspect ratio. Remaining compile-time policies that could become configurable include decoder allocation, accepted source dimensions, supported formats, and processing concurrency policy.
+Global input/output byte limits, target output dimensions, decoder dimension/allocation limits, and weighted processing-memory admission are runtime-configurable. Their defaults preserve the previous safeguards: 12,000 pixels, 256 MiB per decoder allocation, and a 1,056 MiB processing budget for two concurrent 1024×1024 operations. If the byte limit cannot be met at the target dimensions, output dimensions are reduced while preserving the target aspect ratio. Supported image formats remain compile-time selected.
 
 For example:
 
 ```dotenv
-IMAGE_MAX_DECODE_MEMORY_MB=256
-IMAGE_MAX_SOURCE_DIMENSION=12000
+IMAGE_MAX_DECODE_ALLOCATION_BYTES=268435456
+IMAGE_MAX_DECODE_DIMENSION=12000
+IMAGE_PROCESSING_MEMORY_BUDGET_BYTES=1107296256
 IMAGE_SUPPORTED_FORMATS=jpeg,png,webp,gif,bmp,tiff
 ```
 
-This would allow the same binary to run under different image policies without recompilation.
+This lets the same binary run under different dimension and memory policies without recompilation. Raise the limits only with a matching processing-memory budget and enough host/container headroom.
 
 ---
 
@@ -365,9 +366,9 @@ Possible implementations include:
 
 ### Cache Configuration
 
-Image GET and HEAD support ETag, Last-Modified when available, and conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`. Cache responses default to 60 seconds, public when `IMAGE_READ_AUTH=none` and private when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
+Image GET and HEAD support ETag/Last-Modified when storage provides them, conditional requests (`If-None-Match`, `If-Modified-Since`) that can return `304 Not Modified`, and single byte ranges with `If-Range`. Valid ranges return `206 Partial Content`; unsatisfiable ranges return `416 Range Not Satisfiable`; unsupported/malformed range sets fall back to `200 OK`. GET streams from an OpenDAL reader in bounded chunks and asks storage for only the requested interval. It does not collect the full object in a `Vec`. `IMAGE_MAX_DOWNLOADS_IN_FLIGHT` (default 64) bounds simultaneous response streams per instance; `IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES` (default 256 KiB) sets the chunk target. Storage ETags conditionally pin reads when supported. LocalFS opens under the resource lock after rechecking metadata, and the file handle remains tied to that file across atomic replacement. Backends without ETag do not hash the complete body just to produce a validator; ETag can be absent and Last-Modified is returned when available. Cache responses default to 60 seconds, public when `IMAGE_READ_AUTH=none` and private when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` disables storage with `no-store`; `IMAGE_CACHE_CONTROL` overrides the full policy. `immutable` remains inappropriate for mutable slot URLs.
 
-GET confirms storage-provided validators before reading the full image body, so a matching conditional request can return `304 Not Modified` after a conditional one-byte range read on S3-compatible storage or a locked metadata check on LocalFS. Full responses use a consistent metadata/body snapshot: LocalFS reads coordinate with in-process writes, and S3-compatible backends use conditional `If-Match` reads when supported. If storage has no ETag, the SHA-256 fallback still requires reading the body before it can be compared.
+GET checks conditional validators from metadata before opening a response body, so a matching request can return `304 Not Modified` without transferring the object. Full and range responses use a consistent metadata/body snapshot: LocalFS reads coordinate with in-process writes, and S3-compatible backends use conditional `If-Match` reads when supported. If storage has no ETag, GET does not calculate a SHA-256 fallback because doing so would read the complete body and defeat streaming.
 
 Example:
 
@@ -375,11 +376,13 @@ Example:
 IMAGE_CACHE_TTL_SECONDS=60
 ```
 
+Optional Tus 1.0 upload sessions are implemented behind `IMAGE_RESUMABLE_UPLOADS_ENABLED` (default `false`). Sessions use explicit `Upload-Length`, confirmed offsets, optional SHA-256 chunk checksums, a configurable expiry and per-PATCH byte cap. SQLite persists session status, offset, expiry, and chunk length/checksum manifest; chunk bytes live in durable OpenDAL staging objects. Startup recovery resets interrupted finalization and removes orphan staging objects. Finalization verifies and reconstructs the bounded source for the current image processor, then uses the existing synchronous validation/processing path. Existing multipart POST/PUT endpoints remain unchanged. GET streams full bodies or backend ranges with bounded chunks and configurable concurrent-download admission.
+
 Future cache work may include:
 
 - CDN-aware cache headers.
 - **Versioned URLs for immutable caching (optional):** add a URL keyed by the SHA-256 digest of the final stored WebP and preserve the existing mutable slot URL for compatibility. Return the versioned URL additively from uploads so storefronts can store and use it. Apply a long lifetime such as `public, max-age=31536000, immutable` only to versioned URLs; keep a short TTL on the mutable URL. Before implementation, define retention and deletion for old versions, including storage lifecycle/cost and how resource deletion affects cached copies. Do not use an object-store ETag as the content hash unless the backend guarantees that meaning.
-- Optional `IMAGE_STREAM_GET` responses for deployments with larger image limits or high concurrent download volume.
+- A separate download egress/time budget or absolute stored-object ceiling for deployments that expose large media. Streaming bounds application-side buffering, but does not bound bytes sent or transfer duration; the current concurrent-stream limit is per instance.
 
 ---
 

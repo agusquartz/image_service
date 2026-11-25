@@ -152,7 +152,7 @@ The version currently on `main` is used in production by two companies running a
 - Optional named WebP processing profiles assigned by namespace; profiles override only explicitly configured input/output limits or dimensions and inherit the existing global settings for the rest.
 - Lossy WebP quality search from the same resampled pixels to meet the maximum output byte limit.
 - Valid WebP inputs that already meet the configured dimensions and byte limit pass through without lossy re-encoding.
-- Decoder width, height, and allocation limits.
+- Configurable decoder width, height, and allocation defaults with weighted processing-memory admission.
 - Limited concurrent image-processing jobs.
 - Optional authenticated storage usage reporting with a durable SQLite catalog; service mutations are reflected promptly and full inventory runs periodically.
 - Automatic background verification and policy-based image maintenance, with conditional writes that protect newer uploads.
@@ -363,10 +363,18 @@ IMAGE_BIND
 IMAGE_STORAGE_SCHEME
 IMAGE_STORAGE_*
 IMAGE_MAX_CONCURRENCY
+IMAGE_MAX_DECODE_DIMENSION
+IMAGE_MAX_DECODE_ALLOCATION_BYTES
+IMAGE_PROCESSING_MEMORY_BUDGET_BYTES
 IMAGE_MAX_UPLOADS_IN_FLIGHT
 IMAGE_UPLOAD_MEMORY_BUDGET_BYTES
 IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES
 IMAGE_UPLOAD_READ_TIMEOUT_SECONDS
+IMAGE_RESUMABLE_UPLOADS_ENABLED
+IMAGE_RESUMABLE_UPLOAD_TTL_SECONDS
+IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES
+IMAGE_MAX_DOWNLOADS_IN_FLIGHT
+IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES
 IMAGE_SHUTDOWN_TIMEOUT_SECONDS
 IMAGE_JOB_DB_PATH
 IMAGE_BACKGROUND_JOB_CONCURRENCY
@@ -394,9 +402,11 @@ IMAGE_CACHE_CONTROL
 IMAGE_PUBLIC_BASE_URL
 ```
 
-Input/output byte limits, target output dimensions, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder allocation and source-dimension safeguards remain compile-time limits. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
+Input/output byte limits, target output dimensions, decoder safety limits, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder dimension and allocation defaults are 12,000 px and 256 MiB; the weighted processing memory budget defaults to 1,056 MiB for two concurrent 1024×1024 operations. These are configurable safeguards, not automatic measurements of host RAM; increasing dimensions, allocation limits, or concurrency requires planning for additional hardware use. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
 
 Processing profiles are optional. With no profile assigned, the current global environment settings remain in effect. A profile can override the input byte limit, WebP output byte limit, and/or target dimensions for selected namespaces; omitted profile fields inherit the corresponding global value, which itself falls back to the built-in default. See [Configuration](docs/configuration.md) for the JSON environment variable format.
+
+Opt-in Tus resumable upload sessions and HTTP byte-range downloads are documented in the [API guide](docs/api.md). Tus is disabled by default; its SQLite database stores session state, offsets and checksums while confirmed chunks live in durable OpenDAL staging. GET streams bounded chunks from storage, and supported `Range` requests read only the requested byte interval. Stream concurrency and chunk size are configurable per instance.
 
 Application logs are structured JSON written to stdout. The `level` field uses Rust tracing levels (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`); `RUST_LOG` controls filtering and defaults to `info`. The service does not write or rotate log files: configure retention in Docker or the deployment platform's log collector. See [Configuration](docs/configuration.md#rust_log) for details.
 

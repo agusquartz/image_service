@@ -13,14 +13,15 @@ The service includes several defensive measures:
 - Configurable WebP byte and target-dimension limits (`IMAGE_MAX_OUTPUT_BYTES`, `IMAGE_OUTPUT_WIDTH`, and `IMAGE_OUTPUT_HEIGHT`).
 - Optional namespace-specific input/output byte and output-dimension limits through validated processing profiles; unspecified profile fields inherit global limits.
 - MIME-to-format verification.
-- Maximum decode dimensions.
-- Decoder memory-allocation limits.
+- Configurable maximum decode dimension and per-image decoder allocation limits, with defaults of 12,000 pixels and 256 MiB.
+- A configurable weighted processing-memory admission budget; operators must tune it with decode/output dimensions and concurrency for the container's memory limit.
 - Restricted namespace characters.
 - Restricted resource-ID characters.
 - Bounded image-processing concurrency.
 - Separate upload admission and compressed-body budget before multipart reads; configurable whole-body read timeout.
 - Synchronous multipart uploads spill from a bounded receive buffer to private backend staging after `IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES`; actual bytes are counted and the absolute profile/global input limit still applies. Temporary staging is removed on request failure or cancellation.
 - Optional async image jobs stream uploaded source data into a service-reserved backend staging prefix, enforce the configured source-size limit, and reject detected unsupported or MIME-mismatched formats during receipt.
+- Tus upload sessions are disabled by default. When enabled, read/write authentication applies to session creation, chunk writes, status, and cancellation. Session IDs are random UUIDs and sessions expire; SQLite stores session metadata, offsets, status, and chunk checksums, while confirmed bytes are held in the private `__image_transfer/resumable/` staging prefix in the configured storage backend. Protect and persist both locations. The service cleans expired session data and startup orphan objects, but storage access should still be restricted to the service.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
 - Per-client read/write rate limits with a `429` response and `Retry-After`.
@@ -119,7 +120,7 @@ Uploaded files are constrained by several independent checks:
 - Detected image format.
 - Declared MIME validation.
 - Decoder width and height limits.
-- Decoder allocation limit.
+- Configured decoder allocation and weighted processing-memory budget.
 - Bounded concurrent image-processing jobs.
 
 The real image format is detected from file bytes rather than trusting the filename alone.

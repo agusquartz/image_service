@@ -16,6 +16,10 @@ pub struct ProcessingRequest {
     pub max_output_bytes: usize,
     pub output_width: u32,
     pub output_height: u32,
+    /// Maximum decoded source dimension allowed by the service policy.
+    pub max_decode_dimension: u32,
+    /// Maximum allocation allowed to the image decoder.
+    pub max_decode_allocation_bytes: u64,
     pub queue_wait_us: u64,
 }
 

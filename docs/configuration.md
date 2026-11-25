@@ -2,7 +2,7 @@
 
 # Configuration
 
-Image Service combines runtime environment configuration with a small set of compile-time safety limits. Upload byte limits, output dimensions, and resize behavior are configurable through environment variables.
+Image Service combines runtime environment configuration with safety limits that have configurable defaults. Upload byte limits, output dimensions, decoder dimensions, decoder allocation, and processing-memory admission can be configured through environment variables. These settings have a direct hardware cost: the compressed file size does not predict the decoded pixel buffer or temporary resize/encode buffers, and concurrent processing multiplies that working memory. The service does not detect available host RAM and choose values automatically; the operator should size these settings for the machine and container limits.
 
 Storage is provided through OpenDAL. The currently compiled storage backends are:
 
@@ -159,7 +159,7 @@ The source is center-cropped to the target aspect ratio and resampled to the con
 
 WebP quality can be reduced all the way to `0`. The service reduces dimensions only when needed to fit the byte limit, and returns `422` only if the configured limit is too small even for a 1×1 WebP image.
 
-The default processing limits are:
+The default processing settings and current decoder safety limits are:
 
 ```text
 Maximum source image:         15 MiB
@@ -167,9 +167,10 @@ Maximum output image:        100 KiB
 Target output dimensions:    1024 × 1024 px
 Maximum decoder dimension:   12,000 px
 Maximum decoder allocation:  256 MiB
+Processing memory budget:   1,056 MiB
 ```
 
-Input and output byte limits, target output dimensions, and the global slot maximum are runtime-configurable. Decoder dimension and allocation limits remain compile-time safety bounds.
+Input/output byte limits, target output dimensions, decoder dimensions/allocation, and the global slot maximum are runtime-configurable. The dimension and allocation values above are defaults, not universal ceilings. Set them higher when the host has adequate resources, and raise `IMAGE_PROCESSING_MEMORY_BUDGET_BYTES` to admit the larger estimated working set. This budget is enforced separately from `IMAGE_MAX_CONCURRENCY`, so increasing CPU concurrency alone does not raise the memory budget. `IMAGE_MAX_OUTPUT_BYTES` limits the encoded WebP object, not the temporary RAM needed to decode, crop, resize, and encode it. Values set above the defaults can require substantially more RAM and CPU even when the final WebP is small. The memory budget uses a conservative estimate, not real-time RSS measurement; leave additional container/host headroom for the allocator, HTTP, storage, and other application memory.
 
 ### Per-namespace processing profiles
 
@@ -182,7 +183,7 @@ IMAGE_PROCESSING_PROFILES='{"product":{"max_input_bytes":18874368,"max_output_by
 IMAGE_NAMESPACE_PROFILES='{"products":"product","users":"avatar"}'
 ```
 
-The first object maps profile names to partial processing policies. The second maps a validated namespace to a profile name. For any field the precedence is: profile value, then the matching global environment setting, then the built-in default. For example, an unset input limit defaults to 15 MiB; setting `IMAGE_MAX_INPUT_BYTES=17825792` makes the global value 17 MiB; a profile with `max_input_bytes: 18874368` raises only its assigned namespaces to 18 MiB. A profile without `max_input_bytes` inherits the global value. The HTTP body limit accounts for the largest input limit assigned to any namespace plus multipart overhead; the selected namespace's source-image limit is checked separately. Namespaces without an assignment keep the global policy and report `"profile": "default"` in image information. Profile names use lowercase letters, digits, `-`, and `_`; `default` is reserved. Profile width and height must be set together and each must be `1..=12000`; input and output byte limits must be positive. Invalid JSON, unknown profile fields, invalid identifiers, or references to undefined profiles reject startup. Changing a profile affects future uploads; stored images are not automatically reprocessed.
+The first object maps profile names to partial processing policies. The second maps a validated namespace to a profile name. For any field the precedence is: profile value, then the matching global environment setting, then the built-in default. For example, an unset input limit defaults to 15 MiB; setting `IMAGE_MAX_INPUT_BYTES=17825792` makes the global value 17 MiB; a profile with `max_input_bytes: 18874368` raises only its assigned namespaces to 18 MiB. A profile without `max_input_bytes` inherits the global value. The HTTP body limit accounts for the largest input limit assigned to any namespace plus multipart overhead; the selected namespace's source-image limit is checked separately. Namespaces without an assignment keep the global policy and report `"profile": "default"` in image information. Profile names use lowercase letters, digits, `-`, and `_`; `default` is reserved. Profile width and height must be set together and each must be `1..=IMAGE_MAX_DECODE_DIMENSION`; input and output byte limits must be positive. Invalid JSON, unknown profile fields, invalid identifiers, or references to undefined profiles reject startup. Changing a profile affects future uploads; stored images are not automatically reprocessed.
 
 Profiles are namespace-specific processing rules only. They do not set authentication, allowed input formats, output format, maximum slots, storage backend/prefix, quota, or retention. Those settings currently remain instance-wide (where implemented); per-namespace variants for them are future work.
 
@@ -248,7 +249,9 @@ The current endpoint exports HTTP request totals by method/status class, an HTTP
 
 Image GET and HEAD responses use a 60-second cache lifetime by default. Public reads (`IMAGE_READ_AUTH=none`) get `Cache-Control: public, max-age=60`; private reads use `private, max-age=60` so shared caches cannot expose authenticated images. Set `IMAGE_CACHE_TTL_SECONDS` to change the lifetime; `0` emits `Cache-Control: no-store`. `IMAGE_CACHE_CONTROL` overrides the complete header, so do not set it to `public` for protected images unless a shared-cache design explicitly accounts for authorization. A fresh cached response may remain visible for the configured TTL after a PUT. ETag and Last-Modified let a cache validate after the response becomes stale; they do not invalidate a still-fresh response. Avoid `immutable` while a slot can be overwritten at the same URL.
 
-The current GET implementation buffers the stored WebP before responding. With the default 100 KiB output limit, that is usually simpler than streaming. If deployments raise the output limit substantially or expect many concurrent large downloads, consider an optional `IMAGE_STREAM_GET` setting, disabled by default, backed by OpenDAL's reader stream and Axum's streaming response body. This setting is a future recommendation, not implemented yet. Streaming can bound per-request buffering, but memory still depends on stream buffers and concurrent requests; errors that occur after response headers are sent also terminate the response rather than becoming a normal JSON error.
+Image GET responses stream from an OpenDAL reader through bounded chunks; the handler does not collect the complete object in a `Vec`. A supported `Range` request is decided from metadata before opening the body and asks the backend for only that byte interval. `IMAGE_MAX_DOWNLOADS_IN_FLIGHT` limits active response streams per process (default `64`, valid range `1..=100000`); saturation returns `503 Service Unavailable` with `Retry-After: 1`. `IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES` sets the reader chunk target (default `262144`, 256 KiB; valid range `1..=16777216`). These limits bound application-side read buffering and concurrent streams, not total egress or transfer duration. Once response headers have been sent, a storage/network stream failure terminates the body instead of becoming a normal JSON error.
+
+When the storage backend supplies an ETag, the reader is opened conditionally against the metadata version. LocalFS instead opens the file under the resource lock after confirming metadata; the open file handle remains tied to that file if a later atomic replacement occurs. Backends without an ETag do not trigger a full-body hash just to construct a GET validator, because that would defeat streaming. ETag is therefore optional; Last-Modified is returned when available.
 
 For a storefront or other public image catalog, the 60-second public default lets shared caches and CDNs reuse popular images during traffic spikes. A replacement at the same URL can remain stale for up to that minute. For private ERP images, the default is `private` and only user-agent caches may reuse them; use `no-store` for sensitive content. A versioned URL avoids that freshness tradeoff by changing the URL whenever the image is replaced, so each URL continues to identify the same bytes.
 
@@ -551,6 +554,8 @@ Synchronous uploads reserve the smaller of their effective input limit and the m
 
 `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS` limits the entire multipart read. Default: `120`; valid range `1..=86400`. A timeout returns `408 Request Timeout` (request timed out). Partial synchronous staging is scheduled for deletion when a request fails, times out, or is cancelled. Upload admission remains reserved while the source is being processed, even if the client disconnects after CPU work starts; the existing `IMAGE_MAX_CONCURRENCY` continues to limit the encoder separately. The body budget covers compressed source bytes, not decoder buffers, WebP output, an individual HTTP body frame, HTTP/proxy buffers or allocator overhead. Staging bounds the service's retained receive buffer; it does not make image decoding itself streaming. Set container memory limits with those additional costs in mind.
 
+`IMAGE_RESUMABLE_UPLOADS_ENABLED` enables the optional Tus 1.0 API at `/api/image-uploads`. Default: `false`, preserving the current API surface. `IMAGE_RESUMABLE_UPLOAD_TTL_SECONDS` controls the lifetime of sessions; default `86400` seconds (24 hours), valid range `60..=2678400`. `IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES` bounds each PATCH body; default `8388608` (8 MiB), valid range `1..=18446744073709551615`. A session requires a known `Upload-Length`, checked against the effective namespace input limit at creation. SQLite stores session status, declared length, confirmed offset, expiry, and chunk checksum/length manifest. Confirmed chunk bytes are separate durable OpenDAL staging objects under the reserved `__image_transfer/resumable/` prefix. Persist both the SQLite database and the configured storage backend to retain sessions across restarts. See the [API guide](api.md#resumable-uploads-tus-10) for the request contract.
+
 `IMAGE_SHUTDOWN_TIMEOUT_SECONDS` sets the maximum HTTP drain period after SIGINT or SIGTERM. Default: `25`; valid range `1..=3600`. The service stops accepting new connections and waits for active requests until they finish or the deadline expires, then drains the background dispatcher for up to the same timeout. Set the container/orchestrator stop grace period longer than both periods; for example, use `stop_grace_period: 60s` with the default. A job that exceeds the deadline keeps its lease in SQLite; after the lease expires, it can be retried. Tokio blocking image tasks cannot be forcibly cancelled once running; the process exit terminates any remaining work.
 
 ### Durable internal job scheduler
@@ -689,9 +694,23 @@ Default: `102400` bytes (100 KiB).
 
 ### `IMAGE_OUTPUT_WIDTH` and `IMAGE_OUTPUT_HEIGHT`
 
-Exact output width and height in pixels. The service center-crops the input to match this aspect ratio and resamples once to these dimensions without distortion. Each value must be between `1` and `12000`, the decoder's compile-time safety bound.
+Exact output width and height in pixels. The service center-crops the input to match this aspect ratio and resamples once to these dimensions without distortion. Each value must be between `1` and `IMAGE_MAX_DECODE_DIMENSION`; profiles follow the same bound.
 
 Defaults: `1024` pixels for both width and height.
+
+### `IMAGE_MAX_DECODE_DIMENSION`
+
+Maximum width or height accepted by the image decoder and maximum configured output side. Must be a positive `u32`; there is no fixed 12,000-pixel ceiling. Raising this value can increase decode, resize, and encode memory sharply. Default: `12000` pixels.
+
+### `IMAGE_MAX_DECODE_ALLOCATION_BYTES`
+
+Per-image allocation limit passed to the image decoder. This is a decoder guard, not a cap on the whole process RSS or all temporary processing buffers. Default: `268435456` bytes (256 MiB).
+
+### `IMAGE_PROCESSING_MEMORY_BUDGET_BYTES`
+
+Shared weighted admission budget for concurrent image processing, separate from the compressed upload-body budget and `IMAGE_MAX_CONCURRENCY`. Each operation reserves an estimate of `2 × IMAGE_MAX_DECODE_ALLOCATION_BYTES + 16 × output_width × output_height` bytes, rounded up to 1 MiB units; work waits for enough budget before entering the blocking processor. Startup rejects a budget that cannot fit one operation under the largest configured global/profile target. The estimate is a scheduling safeguard, not a promise that actual RSS will remain below this number.
+
+Default: `1107296256` bytes (1,056 MiB), which permits two operations with the default 256 MiB decoder allocation and 1024×1024 target. If you increase the decoder limit or target dimensions, increase this budget too. Raising `IMAGE_MAX_CONCURRENCY` alone does not expand it.
 
 ### `IMAGE_PROCESSING_PROFILES` and `IMAGE_NAMESPACE_PROFILES`
 

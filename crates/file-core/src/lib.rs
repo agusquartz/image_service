@@ -12,6 +12,8 @@ mod image_jobs;
 pub(crate) mod images;
 mod observability;
 mod rate_limit;
+#[cfg(feature = "images")]
+mod resumable_uploads;
 mod router;
 mod server;
 mod state;
@@ -46,6 +48,10 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime
         .block_on(image_jobs::register_jobs(&state))
         .map_err(std::io::Error::other)?;
+    #[cfg(feature = "images")]
+    runtime
+        .block_on(resumable_uploads::recover_staging(&state))
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
     #[cfg(feature = "images")]
     if state.storage_catalog.is_some() {
         runtime

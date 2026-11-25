@@ -10,6 +10,13 @@ pub const DEFAULT_MAX_SOURCE_BYTES: usize = 15 * 1024 * 1024;
 ///
 /// Every successfully processed image must fit within this limit.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 100 * 1024;
+pub const DEFAULT_MAX_DECODE_DIMENSION: u32 = 12_000;
+pub const DEFAULT_MAX_DECODE_ALLOCATION_BYTES: u64 = 256 * 1024 * 1024;
+const ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL: u64 = 16;
+const DEFAULT_MAX_CONCURRENCY: usize = 2;
+const DEFAULT_PROCESSING_MEMORY_BUDGET_BYTES: u64 = (2 * DEFAULT_MAX_DECODE_ALLOCATION_BYTES
+    + 1024 * 1024 * ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL)
+    * DEFAULT_MAX_CONCURRENCY as u64;
 
 /// Default freshness lifetime for image responses, in seconds.
 pub const DEFAULT_IMAGE_CACHE_TTL_SECONDS: u64 = 60;
@@ -20,6 +27,8 @@ pub const UPLOAD_BUDGET_UNIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_UPLOADS_IN_FLIGHT: usize = 4;
 /// Maximum source bytes kept in RAM while receiving one synchronous upload.
 pub const DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_DOWNLOADS_IN_FLIGHT: usize = 64;
+pub const DEFAULT_DOWNLOAD_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 pub const DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS: u64 = 120;
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 
@@ -31,12 +40,6 @@ pub const DEFAULT_MAX_SLOTS: u8 = 5;
 
 /// Slot path parameters and storage keys use an unsigned 8-bit slot number.
 pub const MAX_SLOT_NUMBER: u8 = u8::MAX;
-
-/// Maximum accepted width or height during image decoding.
-///
-/// This helps protect the service from extremely large or maliciously
-/// crafted images.
-pub const MAX_IMAGE_DIMENSION: u32 = 12_000;
 
 /// Maximum source image dimensions accepted for converted output.
 pub const DEFAULT_OUTPUT_WIDTH: u32 = 1024;
@@ -148,6 +151,15 @@ pub struct AppConfig {
     /// to execute concurrently.
     pub max_concurrency: usize,
 
+    /// Maximum decoded source width or height and configured output dimension.
+    pub max_decode_dimension: u32,
+
+    /// Decoder's per-image allocation guard.
+    pub max_decode_allocation_bytes: u64,
+
+    /// Shared weighted budget for estimated image-processing working memory.
+    pub processing_memory_budget_bytes: u64,
+
     /// Requests admitted to read or process an uploaded image at once.
     pub max_uploads_in_flight: usize,
 
@@ -158,6 +170,21 @@ pub struct AppConfig {
     pub upload_memory_threshold_bytes: usize,
 
     pub upload_read_timeout_seconds: u64,
+
+    /// Whether clients may create opt-in Tus resumable upload sessions.
+    pub resumable_uploads_enabled: bool,
+
+    /// Lifetime for incomplete resumable upload sessions.
+    pub resumable_upload_ttl_seconds: u64,
+
+    /// Maximum body size accepted for one resumable upload chunk.
+    pub resumable_upload_max_chunk_bytes: usize,
+
+    /// Maximum active streamed image responses.
+    pub max_downloads_in_flight: usize,
+
+    /// Maximum target chunk size used by streamed image responses.
+    pub download_stream_chunk_bytes: usize,
 
     /// Maximum time to drain active HTTP requests after SIGINT or SIGTERM.
     pub shutdown_timeout_seconds: u64,
@@ -256,10 +283,16 @@ impl AppConfig {
     /// - `IMAGE_STORAGE_SCHEME`
     /// - `IMAGE_STORAGE_*` backend-specific options
     /// - `IMAGE_MAX_CONCURRENCY`
+    /// - `IMAGE_MAX_DECODE_DIMENSION`
+    /// - `IMAGE_MAX_DECODE_ALLOCATION_BYTES`
+    /// - `IMAGE_PROCESSING_MEMORY_BUDGET_BYTES`
     /// - `IMAGE_MAX_UPLOADS_IN_FLIGHT`
     /// - `IMAGE_UPLOAD_MEMORY_BUDGET_BYTES`
     /// - `IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES`
     /// - `IMAGE_UPLOAD_READ_TIMEOUT_SECONDS`
+    /// - `IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES`
+    /// - `IMAGE_MAX_DOWNLOADS_IN_FLIGHT`
+    /// - `IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES`
     /// - `IMAGE_SHUTDOWN_TIMEOUT_SECONDS`
     /// - `IMAGE_JOB_DB_PATH`
     /// - `IMAGE_BACKGROUND_JOB_CONCURRENCY`
@@ -327,7 +360,26 @@ impl AppConfig {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(2);
+            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
+
+        let max_decode_dimension = parse_bounded_u32(
+            "IMAGE_MAX_DECODE_DIMENSION",
+            DEFAULT_MAX_DECODE_DIMENSION,
+            1,
+            u32::MAX,
+        )?;
+        let max_decode_allocation_bytes = parse_bounded_u64(
+            "IMAGE_MAX_DECODE_ALLOCATION_BYTES",
+            DEFAULT_MAX_DECODE_ALLOCATION_BYTES,
+            1,
+            u64::MAX,
+        )?;
+        let processing_memory_budget_bytes = parse_bounded_u64(
+            "IMAGE_PROCESSING_MEMORY_BUDGET_BYTES",
+            DEFAULT_PROCESSING_MEMORY_BUDGET_BYTES,
+            1,
+            u64::MAX,
+        )?;
 
         let max_source_bytes = parse_bounded_usize(
             "IMAGE_MAX_INPUT_BYTES",
@@ -345,20 +397,54 @@ impl AppConfig {
             "IMAGE_OUTPUT_WIDTH",
             DEFAULT_OUTPUT_WIDTH,
             1,
-            MAX_IMAGE_DIMENSION,
+            max_decode_dimension,
         )?;
         let output_height = parse_bounded_u32(
             "IMAGE_OUTPUT_HEIGHT",
             DEFAULT_OUTPUT_HEIGHT,
             1,
-            MAX_IMAGE_DIMENSION,
+            max_decode_dimension,
         )?;
 
         let processing_profiles =
             parse_json_env::<HashMap<String, ProcessingProfile>>("IMAGE_PROCESSING_PROFILES")?;
         let namespace_profiles =
             parse_json_env::<HashMap<String, String>>("IMAGE_NAMESPACE_PROFILES")?;
-        validate_processing_profiles(&processing_profiles, &namespace_profiles)?;
+        validate_processing_profiles(
+            &processing_profiles,
+            &namespace_profiles,
+            max_decode_dimension,
+        )?;
+        let max_profile_width = processing_profiles
+            .values()
+            .filter_map(|profile| profile.output_width)
+            .max()
+            .unwrap_or(output_width)
+            .max(output_width);
+        let max_profile_height = processing_profiles
+            .values()
+            .filter_map(|profile| profile.output_height)
+            .max()
+            .unwrap_or(output_height)
+            .max(output_height);
+        let minimum_processing_budget = estimate_processing_memory_bytes(
+            max_decode_allocation_bytes,
+            max_profile_width,
+            max_profile_height,
+        )?;
+        let processing_budget_units =
+            processing_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES as u64;
+        let minimum_processing_units =
+            minimum_processing_budget.div_ceil(UPLOAD_BUDGET_UNIT_BYTES as u64);
+        if processing_budget_units < minimum_processing_units
+            || processing_budget_units > tokio::sync::Semaphore::MAX_PERMITS as u64
+            || max_decode_allocation_bytes > usize::MAX as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IMAGE_PROCESSING_MEMORY_BUDGET_BYTES must fit at least one configured processing operation and the Tokio semaphore; increase it or lower decode/output limits",
+            ));
+        }
         let largest_input =
             max_configured_input_bytes(max_source_bytes, &processing_profiles, &namespace_profiles);
         let max_uploads_in_flight = parse_bounded_usize(
@@ -401,6 +487,31 @@ impl AppConfig {
             DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS,
             1,
             86_400,
+        )?;
+        let resumable_uploads_enabled = parse_bool_env("IMAGE_RESUMABLE_UPLOADS_ENABLED", false)?;
+        let resumable_upload_ttl_seconds = parse_bounded_u64(
+            "IMAGE_RESUMABLE_UPLOAD_TTL_SECONDS",
+            86_400,
+            60,
+            31 * 24 * 60 * 60,
+        )?;
+        let resumable_upload_max_chunk_bytes = parse_bounded_usize(
+            "IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES",
+            DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
+            1,
+            usize::MAX,
+        )?;
+        let max_downloads_in_flight = parse_bounded_usize(
+            "IMAGE_MAX_DOWNLOADS_IN_FLIGHT",
+            DEFAULT_MAX_DOWNLOADS_IN_FLIGHT,
+            1,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )?;
+        let download_stream_chunk_bytes = parse_bounded_usize(
+            "IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES",
+            DEFAULT_DOWNLOAD_STREAM_CHUNK_BYTES,
+            1,
+            16 * 1024 * 1024,
         )?;
         let shutdown_timeout_seconds = parse_bounded_u64(
             "IMAGE_SHUTDOWN_TIMEOUT_SECONDS",
@@ -595,10 +706,18 @@ impl AppConfig {
             bind_address,
             storage,
             max_concurrency,
+            max_decode_dimension,
+            max_decode_allocation_bytes,
+            processing_memory_budget_bytes,
             max_uploads_in_flight,
             upload_memory_budget_bytes,
             upload_memory_threshold_bytes,
             upload_read_timeout_seconds,
+            resumable_uploads_enabled,
+            resumable_upload_ttl_seconds,
+            resumable_upload_max_chunk_bytes,
+            max_downloads_in_flight,
+            download_stream_chunk_bytes,
             shutdown_timeout_seconds,
             job_database_path,
             background_job_concurrency,
@@ -648,9 +767,35 @@ where
     })
 }
 
+pub(crate) fn estimate_processing_memory_bytes(
+    max_decode_allocation_bytes: u64,
+    output_width: u32,
+    output_height: u32,
+) -> io::Result<u64> {
+    let output_bytes = (output_width as u64)
+        .checked_mul(output_height as u64)
+        .and_then(|pixels| pixels.checked_mul(ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "processing memory estimate overflow",
+            )
+        })?;
+    max_decode_allocation_bytes
+        .checked_mul(2)
+        .and_then(|decode_bytes| decode_bytes.checked_add(output_bytes))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "processing memory estimate overflow",
+            )
+        })
+}
+
 fn validate_processing_profiles(
     profiles: &HashMap<String, ProcessingProfile>,
     namespace_profiles: &HashMap<String, String>,
+    max_decode_dimension: u32,
 ) -> io::Result<()> {
     for (name, profile) in profiles {
         if name == "default" || !is_valid_profile_name(name) {
@@ -682,12 +827,12 @@ fn validate_processing_profiles(
             ("output_height", profile.output_height),
         ] {
             if let Some(dimension) = dimension
-                && !(1..=MAX_IMAGE_DIMENSION).contains(&dimension)
+                && !(1..=max_decode_dimension).contains(&dimension)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "Profile {name} {dimension_name} must be between 1 and {MAX_IMAGE_DIMENSION}"
+                        "Profile {name} {dimension_name} must be between 1 and {max_decode_dimension}"
                     ),
                 ));
             }
@@ -1069,14 +1214,35 @@ mod tests {
                 output_height: None,
             },
         )]);
-        assert!(validate_processing_profiles(&partial_dimensions, &HashMap::new()).is_err());
+        assert!(
+            validate_processing_profiles(
+                &partial_dimensions,
+                &HashMap::new(),
+                DEFAULT_MAX_DECODE_DIMENSION,
+            )
+            .is_err()
+        );
 
         let profiles = HashMap::from([("avatar".to_string(), ProcessingProfile::default())]);
         let unknown_assignment = HashMap::from([("users".to_string(), "missing".to_string())]);
-        assert!(validate_processing_profiles(&profiles, &unknown_assignment).is_err());
+        assert!(
+            validate_processing_profiles(
+                &profiles,
+                &unknown_assignment,
+                DEFAULT_MAX_DECODE_DIMENSION,
+            )
+            .is_err()
+        );
 
         let reserved_name = HashMap::from([("default".to_string(), ProcessingProfile::default())]);
-        assert!(validate_processing_profiles(&reserved_name, &HashMap::new()).is_err());
+        assert!(
+            validate_processing_profiles(
+                &reserved_name,
+                &HashMap::new(),
+                DEFAULT_MAX_DECODE_DIMENSION,
+            )
+            .is_err()
+        );
 
         let zero_input_limit = HashMap::from([(
             "tiny".to_string(),
@@ -1085,7 +1251,14 @@ mod tests {
                 ..ProcessingProfile::default()
             },
         )]);
-        assert!(validate_processing_profiles(&zero_input_limit, &HashMap::new()).is_err());
+        assert!(
+            validate_processing_profiles(
+                &zero_input_limit,
+                &HashMap::new(),
+                DEFAULT_MAX_DECODE_DIMENSION,
+            )
+            .is_err()
+        );
     }
 
     #[test]
