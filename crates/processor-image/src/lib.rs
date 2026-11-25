@@ -7,8 +7,8 @@ use processor_contract::{
 use std::{io::Cursor, time::Instant};
 use webp::Encoder;
 
-const MAX_IMAGE_DIMENSION: u32 = 12_000;
-const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 12_000;
+pub const DEFAULT_MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageProcessor;
@@ -25,6 +25,19 @@ pub struct ImageInspection {
 /// Detects and fully decodes image bytes without encoding or modifying them.
 /// The same dimension and allocation limits used by upload processing apply.
 pub fn inspect_image(source: &[u8]) -> Result<ImageInspection, ProcessingError> {
+    inspect_image_with_limits(
+        source,
+        DEFAULT_MAX_IMAGE_DIMENSION,
+        DEFAULT_MAX_DECODE_ALLOC,
+    )
+}
+
+/// Inspects an image using the runtime decoder safety limits.
+pub fn inspect_image_with_limits(
+    source: &[u8],
+    max_image_dimension: u32,
+    max_decode_allocation_bytes: u64,
+) -> Result<ImageInspection, ProcessingError> {
     let format = image::guess_format(source)
         .map_err(|_| ProcessingError::UnsupportedMediaType("Unknown image format".to_string()))?;
     if !supported_format(format) {
@@ -44,9 +57,9 @@ pub fn inspect_image(source: &[u8]) -> Result<ImageInspection, ProcessingError> 
     };
     let mut reader = ImageReader::with_format(Cursor::new(source), format);
     let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits.max_image_width = Some(max_image_dimension);
+    limits.max_image_height = Some(max_image_dimension);
+    limits.max_alloc = Some(max_decode_allocation_bytes);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().map_err(|error| {
         ProcessingError::InvalidInput(format!("Could not initialize image decoder: {error}"))
@@ -140,11 +153,11 @@ fn process_image_blocking(
     // intentionally expensive image files.
     let mut limits = Limits::default();
 
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_width = Some(request.max_decode_dimension);
 
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(request.max_decode_dimension);
 
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits.max_alloc = Some(request.max_decode_allocation_bytes);
 
     reader.limits(limits);
 
@@ -368,7 +381,8 @@ fn crop_and_resize(image: DynamicImage, output_width: u32, output_height: u32) -
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageProcessor, compress_webp, crop_and_resize, declared_mime_is_acceptable, inspect_image,
+        DEFAULT_MAX_DECODE_ALLOC, DEFAULT_MAX_IMAGE_DIMENSION, ImageProcessor, compress_webp,
+        crop_and_resize, declared_mime_is_acceptable, inspect_image,
     };
     use bytes::Bytes;
     use processor_contract::{ProcessingRequest, Processor};
@@ -386,6 +400,8 @@ mod tests {
             max_output_bytes,
             output_width,
             output_height,
+            max_decode_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
+            max_decode_allocation_bytes: DEFAULT_MAX_DECODE_ALLOC,
             queue_wait_us: 0,
         }
     }

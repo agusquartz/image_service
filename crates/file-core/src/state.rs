@@ -1,7 +1,5 @@
 #[cfg(feature = "images")]
 use crate::storage_usage::StorageCatalog;
-#[cfg(feature = "images")]
-use crate::{config::UPLOAD_BUDGET_UNIT_BYTES, error::ApiError, images::ImageStore};
 use crate::{
     config::{
         AppConfig, AuthRequirement, ProcessingPolicy, ProcessingProfile,
@@ -9,6 +7,12 @@ use crate::{
     },
     observability::HttpMetrics,
     rate_limit::RateLimiter,
+};
+#[cfg(feature = "images")]
+use crate::{
+    config::{UPLOAD_BUDGET_UNIT_BYTES, estimate_processing_memory_bytes},
+    error::ApiError,
+    images::ImageStore,
 };
 
 use job_scheduler::{ActivityTracker, DailyUtcWindow, JobScheduler, SchedulerConfig};
@@ -103,6 +107,21 @@ pub struct AppState {
     pub image_jobs: Arc<Semaphore>,
 
     #[cfg(feature = "images")]
+    image_downloads: Arc<Semaphore>,
+
+    #[cfg(feature = "images")]
+    image_processing_memory: Arc<Semaphore>,
+
+    #[cfg(feature = "images")]
+    pub max_decode_dimension: u32,
+
+    #[cfg(feature = "images")]
+    pub max_decode_allocation_bytes: u64,
+
+    #[cfg(feature = "images")]
+    pub processing_memory_budget_bytes: u64,
+
+    #[cfg(feature = "images")]
     pub image_processor: Arc<dyn Processor>,
 
     #[cfg(feature = "images")]
@@ -115,6 +134,18 @@ pub struct AppState {
     async_resource_locks: Arc<Vec<Mutex<()>>>,
     #[cfg(feature = "images")]
     pub upload_read_timeout_seconds: u64,
+    #[cfg(feature = "images")]
+    pub resumable_uploads_enabled: bool,
+    #[cfg(feature = "images")]
+    pub resumable_upload_ttl_seconds: u64,
+
+    #[cfg(feature = "images")]
+    pub resumable_upload_max_chunk_bytes: usize,
+
+    #[cfg(feature = "images")]
+    download_stream_chunk_bytes: usize,
+    #[cfg(feature = "images")]
+    pub resumable_upload_db_path: std::path::PathBuf,
 
     pub max_source_bytes: usize,
 
@@ -208,6 +239,23 @@ impl AppState {
             image_jobs: Arc::new(Semaphore::new(config.max_concurrency)),
 
             #[cfg(feature = "images")]
+            image_downloads: Arc::new(Semaphore::new(config.max_downloads_in_flight)),
+
+            #[cfg(feature = "images")]
+            image_processing_memory: Arc::new(Semaphore::new(
+                (config.processing_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES as u64) as usize,
+            )),
+
+            #[cfg(feature = "images")]
+            max_decode_dimension: config.max_decode_dimension,
+
+            #[cfg(feature = "images")]
+            max_decode_allocation_bytes: config.max_decode_allocation_bytes,
+
+            #[cfg(feature = "images")]
+            processing_memory_budget_bytes: config.processing_memory_budget_bytes,
+
+            #[cfg(feature = "images")]
             image_processor: Arc::new(processor_image::ImageProcessor),
 
             #[cfg(feature = "images")]
@@ -222,6 +270,16 @@ impl AppState {
             async_resource_locks: Arc::new((0..256).map(|_| Mutex::new(())).collect()),
             #[cfg(feature = "images")]
             upload_read_timeout_seconds: config.upload_read_timeout_seconds,
+            #[cfg(feature = "images")]
+            resumable_uploads_enabled: config.resumable_uploads_enabled,
+            #[cfg(feature = "images")]
+            resumable_upload_ttl_seconds: config.resumable_upload_ttl_seconds,
+            #[cfg(feature = "images")]
+            resumable_upload_max_chunk_bytes: config.resumable_upload_max_chunk_bytes,
+            #[cfg(feature = "images")]
+            download_stream_chunk_bytes: config.download_stream_chunk_bytes,
+            #[cfg(feature = "images")]
+            resumable_upload_db_path: config.job_database_path.clone(),
 
             max_source_bytes: config.max_source_bytes,
 
@@ -307,6 +365,84 @@ impl AppState {
         source_bytes: usize,
     ) -> Result<(), ApiError> {
         extend_upload_reservation(self.upload_body_budget.clone(), admission, source_bytes)
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn processing_memory_units_for(
+        &self,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<u32, ApiError> {
+        let estimated = estimate_processing_memory_bytes(
+            self.max_decode_allocation_bytes,
+            output_width,
+            output_height,
+        )
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let units = estimated.div_ceil(UPLOAD_BUDGET_UNIT_BYTES as u64);
+        if units == 0 || units > u32::MAX as u64 {
+            return Err(ApiError::Internal(
+                "Processing memory reservation is invalid".to_string(),
+            ));
+        }
+        let budget_units =
+            (self.processing_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES as u64) as u32;
+        if units > budget_units as u64 {
+            return Err(ApiError::Internal(
+                "Configured processing memory budget cannot fit this image policy".to_string(),
+            ));
+        }
+        Ok(units as u32)
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) async fn admit_image_processing(
+        &self,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        let units = self.processing_memory_units_for(output_width, output_height)?;
+        self.image_processing_memory
+            .clone()
+            .acquire_many_owned(units)
+            .await
+            .map_err(|error| {
+                ApiError::Internal(format!("Image processing memory budget closed: {error}"))
+            })
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn try_admit_image_processing(
+        &self,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<OwnedSemaphorePermit, ApiError> {
+        let units = self.processing_memory_units_for(output_width, output_height)?;
+        self.image_processing_memory
+            .clone()
+            .try_acquire_many_owned(units)
+            .map_err(|_| {
+                ApiError::ServiceUnavailable(
+                    "Image processing memory budget is temporarily busy; retry later".into(),
+                )
+            })
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn try_admit_image_download(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.image_downloads
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ApiError::ServiceUnavailable(
+                    "Image download capacity is temporarily busy; retry later".into(),
+                )
+            })
+    }
+
+    #[cfg(feature = "images")]
+    pub(crate) fn download_stream_chunk_bytes(&self) -> usize {
+        self.download_stream_chunk_bytes
     }
 
     #[cfg(feature = "images")]

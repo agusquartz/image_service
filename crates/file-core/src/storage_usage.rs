@@ -1611,6 +1611,12 @@ impl MaintenanceHandler {
             return Ok(json!({"status":"superseded"}));
         }
         let queue_started = std::time::Instant::now();
+        let memory_permit = self
+            .state
+            .try_admit_image_processing(policy.output_width, policy.output_height)
+            .map_err(|_| {
+                "image processing memory budget is busy; retry maintenance later".to_string()
+            })?;
         let permit = self
             .state
             .image_jobs
@@ -1627,10 +1633,13 @@ impl MaintenanceHandler {
             max_output_bytes: policy.max_output_bytes,
             output_width: policy.output_width,
             output_height: policy.output_height,
+            max_decode_dimension: self.state.max_decode_dimension,
+            max_decode_allocation_bytes: self.state.max_decode_allocation_bytes,
             queue_wait_us,
         };
         let output = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _memory_permit = memory_permit;
             processor.process(request)
         })
         .await
@@ -1851,8 +1860,20 @@ impl PolicyAuditHandler {
                 json!({"inventory_size_bytes":object.size_bytes,"current_size_bytes":metadata.content_length,"inventory_etag":object.etag,"current_etag":metadata.etag}),
             ));
         }
+        let memory_permit = self
+            .state
+            .try_admit_image_processing(policy.output_width, policy.output_height)
+            .map_err(|_| "Image processing memory budget is busy".to_string())?;
+        let max_decode_dimension = self.state.max_decode_dimension;
+        let max_decode_allocation_bytes = self.state.max_decode_allocation_bytes;
         let inspect = tokio::task::spawn_blocking(move || {
-            processor_image::inspect_image(&bytes).map(|inspection| (inspection, bytes.len()))
+            let _memory_permit = memory_permit;
+            processor_image::inspect_image_with_limits(
+                &bytes,
+                max_decode_dimension,
+                max_decode_allocation_bytes,
+            )
+            .map(|inspection| (inspection, bytes.len()))
         })
         .await
         .map_err(|error| format!("Image inspection task failed: {error}"))?;

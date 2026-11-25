@@ -516,6 +516,7 @@ impl ImageProcessingHandler {
             .await
             .map_err(|error| (error.to_string(), true))?;
         let output = reduce_to_webp(
+            &self.state,
             self.state.image_processor.clone(),
             self.state.image_jobs.clone(),
             IncomingImage {
@@ -523,9 +524,7 @@ impl ImageProcessingHandler {
                 mime,
             },
             admission,
-            policy.max_output_bytes,
-            policy.output_width,
-            policy.output_height,
+            &policy,
         )
         .await
         .map_err(classify_api_error)?;
@@ -625,7 +624,9 @@ fn classify_api_error(error: ApiError) -> (String, bool) {
         | ApiError::UnprocessableEntity(message)
         | ApiError::BadRequest(message)
         | ApiError::Conflict(message)
+        | ApiError::PreconditionFailed(message)
         | ApiError::PayloadTooLarge(message) => (message, false),
+        ApiError::ChecksumMismatch => ("The upload checksum did not match".to_string(), false),
         ApiError::ServiceUnavailable(message) => (message, true),
         ApiError::Storage(_) | ApiError::Internal(_) => (
             "Temporary image processing or storage failure".to_string(),
