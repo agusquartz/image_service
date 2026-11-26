@@ -246,7 +246,8 @@ images/store.rs
 Responsibilities:
 
 - Convert ImageKey into a backend-independent object key.
-- Read image bytes through OpenDAL.
+- Stream full or byte-range image reads through OpenDAL without collecting the
+  complete response in a `Vec`.
 - Write image bytes through OpenDAL.
 - Delete image objects through OpenDAL.
 - Read object metadata with `stat` and list slots under a resource prefix.
@@ -471,8 +472,11 @@ The current implementation provides filesystem and S3/S3-compatible
 storage through OpenDAL. Additional backends can be introduced without
 changing the application service or HTTP layers.
 
-### Configuration belongs in one place
+### Configuration has a stable facade
 
-Runtime and processing configuration should progressively move into `AppConfig` instead of being scattered through handlers or infrastructure modules.
+Runtime and processing settings are assembled into `AppConfig`; environment
+parsing is split into focused `config/` modules. Keep that boundary stable so
+handlers and infrastructure consume validated settings instead of parsing
+environment variables independently.
 
 ---
