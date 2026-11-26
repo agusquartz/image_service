@@ -32,13 +32,19 @@ HEAD /api/image-uploads/{upload_id}
 PATCH /api/image-uploads/{upload_id}
 DELETE /api/image-uploads/{upload_id}
 OPTIONS /api/image-uploads
+OPTIONS /api/image-uploads/{upload_id}
 
 GET  /api/storage/usage
 POST /api/storage/reconcile
 POST /api/storage/audits
 GET  /api/storage/audits/{audit_id}
 GET  /api/storage/audits/{audit_id}/findings
+GET  /metrics
 ```
+
+Tus routes are available only when `IMAGE_RESUMABLE_UPLOADS_ENABLED=true`;
+storage usage routes require `IMAGE_STORAGE_USAGE_ENABLED=true`; `/metrics`
+requires `IMAGE_METRICS_ENABLED=true`.
 
 Example image identifier:
 
@@ -211,7 +217,10 @@ The synchronous image endpoint still accepts complete-file `POST` and `PUT` mult
 
 Create a session with a known total length. Use `POST` for create-only semantics or `PUT` for create-or-replace semantics:
 
-`OPTIONS /api/image-uploads` advertises the supported Tus version, extensions, and checksum algorithm.
+`OPTIONS /api/image-uploads` and `OPTIONS /api/image-uploads/{upload_id}`
+advertise the supported Tus version, extensions, and checksum algorithm. Session
+creation and `PATCH`/`DELETE` use `IMAGE_WRITE_AUTH`; session `HEAD` uses
+`IMAGE_READ_AUTH`. Both policies require the bearer token by default.
 
 ```http
 POST /api/image-uploads/products/845/1
@@ -247,6 +256,7 @@ PATCH /api/image-uploads/7c6f...
 Tus-Resumable: 1.0.0
 Upload-Offset: 0
 Content-Type: application/offset+octet-stream
+Authorization: Bearer <api-key>
 
 abcde
 ```
@@ -263,6 +273,7 @@ PATCH /api/image-uploads/7c6f...
 Tus-Resumable: 1.0.0
 Upload-Offset: 5
 Content-Type: application/offset+octet-stream
+Authorization: Bearer <api-key>
 
 fghij
 ```
@@ -398,20 +409,20 @@ GET /api/images/{namespace}/{resource_id}/{slot}
 
 Successful responses return the stored WebP bytes.
 
-Current response headers include:
+Current response headers include the content and security headers below. Storage validators are included only when available from the backend:
 
 ```http
 Content-Type: image/webp
 X-Content-Type-Options: nosniff
-ETag: "..."
-Last-Modified: ...
 ```
+
+When available, responses also include `ETag` and `Last-Modified`.
 
 Reads require the configured `IMAGE_API_KEY` bearer token by default. Set `IMAGE_READ_AUTH=none` to make GET, HEAD, resource listing, image information, and presigned URL creation public. `IMAGE_WRITE_AUTH` independently controls POST, PUT, and DELETE. The service fails to start if a required policy has no API key.
 
-GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses are `public` when `IMAGE_READ_AUTH=none` and `private` when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` sets `no-store`; `IMAGE_CACHE_CONTROL` can override the complete policy. GET supports `If-None-Match` and `If-Modified-Since`, returning `304 Not Modified` when the stored representation has not changed. ETag falls back to a SHA-256 content validator when the storage backend does not provide one. A fresh cached response can remain in use for up to its TTL after a PUT; ETag does not force an earlier check. `immutable` is unsuitable while uploads can replace content at the same URL.
+GET and HEAD return `Cache-Control` with a 60-second default lifetime. Responses are `public` when `IMAGE_READ_AUTH=none` and `private` when reads require authentication. `IMAGE_CACHE_TTL_SECONDS=0` sets `no-store`; `IMAGE_CACHE_CONTROL` can override the complete policy. GET supports `If-None-Match` and `If-Modified-Since`, returning `304 Not Modified` when the stored representation has not changed. GET and HEAD use storage-provided ETags when available and do not hash the complete object to synthesize one; without a storage ETag, the response may omit `ETag`. A fresh cached response can remain in use for up to its TTL after a PUT; ETag does not force an earlier check. `immutable` is unsuitable while uploads can replace content at the same URL.
 
-When a conditional GET matches storage metadata, the service confirms that version before returning `304 Not Modified` (the cached representation is still valid). S3-compatible storage with ETags uses a conditional one-byte range read; LocalFS checks again while holding the resource operation lock. This avoids reading the full image while preventing stale metadata from producing a false 304. If storage does not provide an ETag, the SHA-256 fallback can only be compared after reading the body. For a `200 OK` response, the service reads metadata and bytes as one snapshot: its per-resource lock coordinates local writes/deletes, and storage backends that support conditional reads use `If-Match` to reject bytes from a different ETag. Repeated changes during a read return `503 Service Unavailable` (retry the request) rather than pairing one version's body with another version's validators.
+When a conditional GET matches storage metadata, the service confirms that version before returning `304 Not Modified` (the cached representation is still valid). S3-compatible storage with an ETag uses a conditional one-byte range read; LocalFS checks again while holding the resource operation lock. This avoids reading the full image while preventing stale metadata from producing a false 304. If a backend provides no ETag, GET does not compute a SHA-256 fallback; an available `Last-Modified` value can still be used for date conditions. For a `200 OK` response, the service opens a streaming reader from the metadata: LocalFS rechecks and opens under the resource lock, and backends with conditional-read support use `If-Match` when an ETag is available. Without a storage validator, cross-process external writes cannot be proven unchanged by the service. Repeated changes detected while opening a reader return `503 Service Unavailable` (retry the request) rather than pairing one version's body with another version's validators.
 
 ## Image Information
 
@@ -436,7 +447,7 @@ Returns storage size and available validators plus the output format, dimensions
 }
 ```
 
-The `profile` field reports the profile currently assigned to the namespace; it is not persisted per image. Changing a profile affects future uploads and does not reprocess images already stored.
+The `profile` field reports the profile currently assigned to the namespace; it is not persisted per image. Changing a profile affects future uploads and does not reprocess images already stored. This endpoint reads the stored image to inspect its dimensions; if storage does not provide an ETag, it computes a SHA-256 ETag from that snapshot. This full-object read is specific to the information endpoint; regular GET/HEAD responses do not hash the complete object.
 
 ---
 
@@ -542,18 +553,26 @@ Example:
 Common HTTP statuses include:
 
 ```text
-201 Created
 200 OK
-409 Conflict
+201 Created
+202 Accepted (request queued for background processing)
+204 No Content
+206 Partial Content
 304 Not Modified
 400 Bad Request
 401 Unauthorized
 404 Not Found
+408 Request Timeout
+409 Conflict
 413 Payload Too Large
 415 Unsupported Media Type
+416 Range Not Satisfiable
 422 Unprocessable Entity
+429 Too Many Requests
+460 Checksum Mismatch (Tus checksum extension)
 500 Internal Server Error
 501 Not Implemented
+503 Service Unavailable
 ```
 
 Internal storage-backend or application details are not returned directly to clients.
