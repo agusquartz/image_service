@@ -525,8 +525,8 @@ fn extend_upload_reservation(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod lifecycle_tests {
+    use super::ServiceLifecycle;
 
     #[test]
     fn lifecycle_readiness_can_be_changed_across_clones() {
@@ -539,6 +539,12 @@ mod tests {
         lifecycle.set_ready(false);
         assert!(!server_lifecycle.is_ready());
     }
+}
+
+#[cfg(all(test, feature = "images"))]
+mod tests {
+    use super::*;
+    use crate::{config::UPLOAD_BUDGET_UNIT_BYTES, error::ApiError};
 
     #[test]
     fn admission_releases_count_after_capacity_rejection() {
