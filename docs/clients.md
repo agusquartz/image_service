@@ -65,6 +65,7 @@ Save the image:
 ```bash
 curl \
   "http://127.0.0.1:3000/api/images/products/845/1" \
+  -H "Authorization: Bearer change-me" \
   --output product.webp
 ```
 
@@ -73,7 +74,8 @@ Inspect the headers:
 ```bash
 curl \
   -I \
-  "http://127.0.0.1:3000/api/images/products/845/1"
+  "http://127.0.0.1:3000/api/images/products/845/1" \
+  -H "Authorization: Bearer change-me"
 ```
 
 ### List, check, and delete images
@@ -81,7 +83,8 @@ curl \
 List image slots for a resource:
 
 ```bash
-curl "http://127.0.0.1:3000/api/images/products/845"
+curl "http://127.0.0.1:3000/api/images/products/845" \
+  -H "Authorization: Bearer change-me"
 ```
 
 The response includes existing slots and the current creation ceiling. Existing slots can be above the ceiling; they remain readable and deletable. `max_creatable_slot` does not indicate that the slot is currently empty.
@@ -101,7 +104,8 @@ The response includes existing slots and the current creation ceiling. Existing 
 Check a slot without downloading its body:
 
 ```bash
-curl -I "http://127.0.0.1:3000/api/images/products/845/1"
+curl -I "http://127.0.0.1:3000/api/images/products/845/1" \
+  -H "Authorization: Bearer change-me"
 ```
 
 Delete a slot (the default write policy requires the bearer header):
@@ -115,17 +119,19 @@ curl -X DELETE \
 Read image metadata:
 
 ```bash
-curl "http://127.0.0.1:3000/api/images/products/845/1/info"
+curl "http://127.0.0.1:3000/api/images/products/845/1/info" \
+  -H "Authorization: Bearer change-me"
 ```
 
 Request a temporary direct-read URL (supported by backends with OpenDAL `presign_read`, such as S3):
 
 ```bash
 curl -X POST \
-  "http://127.0.0.1:3000/api/images/products/845/1/presign"
+  "http://127.0.0.1:3000/api/images/products/845/1/presign" \
+  -H "Authorization: Bearer change-me"
 ```
 
-Add the bearer header to the metadata GET or presign POST unless `IMAGE_READ_AUTH=none`. The returned URL can be used as a normal GET URL until its `expires_in` lifetime ends.
+These read and presign requests require the bearer header unless `IMAGE_READ_AUTH=none`. The returned URL can be used as a normal GET URL until its `expires_in` lifetime ends.
 
 ---
 
@@ -180,6 +186,11 @@ The Fetch implementation generates the multipart boundary automatically.
 ```javascript
 const response = await fetch(
   "http://127.0.0.1:3000/api/images/products/845/1",
+  {
+    headers: {
+      Authorization: "Bearer change-me",
+    },
+  },
 );
 
 if (!response.ok) {
@@ -192,7 +203,7 @@ const objectUrl = URL.createObjectURL(blob);
 document.querySelector("img").src = objectUrl;
 ```
 
-For a public image URL used directly in HTML:
+Direct HTML `<img>` requests cannot send a bearer header. This example requires `IMAGE_READ_AUTH=none`:
 
 ```html
 <img
@@ -318,6 +329,7 @@ public class FetchImage {
                     "http://127.0.0.1:3000/api/images/products/845/1"
                 )
             )
+            .header("Authorization", "Bearer change-me")
             .GET()
             .build();
 
@@ -403,6 +415,7 @@ url = (
 
 response = requests.get(
     url,
+    headers={"Authorization": "Bearer change-me"},
     timeout=30,
 )
 
@@ -424,7 +437,7 @@ Example dependencies:
 ```toml
 [dependencies]
 reqwest = {
-    version = "0.12",
+    version = "0.13",
     features = [
         "json",
         "multipart",
@@ -512,6 +525,7 @@ async fn main()
             .get(
                 "http://127.0.0.1:3000/api/images/products/845/1"
             )
+            .bearer_auth("change-me")
             .send()
             .await?
             .error_for_status()?;
