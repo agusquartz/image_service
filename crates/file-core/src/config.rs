@@ -1,5 +1,23 @@
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, env, io, path::PathBuf};
+
+mod cache;
+mod jobs;
+mod observability;
+mod parsing;
+mod processing;
+mod security;
+mod storage;
+mod transfers;
+
+pub use observability::RateLimitConfig;
+use parsing::{parse_bool_env, parse_bounded_u32, parse_bounded_u64, parse_bounded_usize};
+#[cfg(feature = "images")]
+pub(crate) use processing::estimate_processing_memory_bytes;
+pub(crate) use processing::{
+    ProcessingPolicy, ProcessingProfile, max_configured_input_bytes, resolve_processing_policy,
+};
+pub use security::AuthRequirement;
+pub use storage::StorageConfig;
 
 /// Default maximum accepted source image size.
 ///
@@ -12,11 +30,7 @@ pub const DEFAULT_MAX_SOURCE_BYTES: usize = 15 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 100 * 1024;
 pub const DEFAULT_MAX_DECODE_DIMENSION: u32 = 12_000;
 pub const DEFAULT_MAX_DECODE_ALLOCATION_BYTES: u64 = 256 * 1024 * 1024;
-const ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL: u64 = 16;
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
-const DEFAULT_PROCESSING_MEMORY_BUDGET_BYTES: u64 = (2 * DEFAULT_MAX_DECODE_ALLOCATION_BYTES
-    + 1024 * 1024 * ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL)
-    * DEFAULT_MAX_CONCURRENCY as u64;
 
 /// Default freshness lifetime for image responses, in seconds.
 pub const DEFAULT_IMAGE_CACHE_TTL_SECONDS: u64 = 60;
@@ -47,94 +61,6 @@ pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1024;
 
 /// Maximum presigned URL lifetime supported by the S3 API.
 pub const MAX_PRESIGN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
-
-/// Default read requests permitted per rate-limit window and client.
-pub const DEFAULT_READ_RATE_LIMIT_REQUESTS: u32 = 600;
-
-/// Default write requests permitted per rate-limit window and client.
-pub const DEFAULT_WRITE_RATE_LIMIT_REQUESTS: u32 = 60;
-
-/// Default rate-limit window length in seconds.
-pub const DEFAULT_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthRequirement {
-    Required,
-    None,
-}
-
-impl AuthRequirement {
-    fn parse(name: &str, default: Self) -> io::Result<Self> {
-        match env::var(name) {
-            Ok(value) => Self::parse_value(name, &value),
-            Err(env::VarError::NotPresent) => Ok(default),
-            Err(error) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Could not read {name}: {error}"),
-            )),
-        }
-    }
-
-    fn parse_value(name: &str, value: &str) -> io::Result<Self> {
-        if value.eq_ignore_ascii_case("required") {
-            Ok(Self::Required)
-        } else if value.eq_ignore_ascii_case("none") {
-            Ok(Self::None)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be either 'required' or 'none'"),
-            ))
-        }
-    }
-
-    pub fn is_required(self) -> bool {
-        self == Self::Required
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RateLimitConfig {
-    pub read_requests: u32,
-    pub write_requests: u32,
-    pub window_seconds: u64,
-}
-
-#[derive(Clone)]
-pub struct StorageConfig {
-    /// OpenDAL storage scheme.
-    ///
-    /// Examples:
-    ///
-    /// - fs
-    /// - s3
-    pub scheme: String,
-
-    /// Backend-specific OpenDAL configuration.
-    pub options: HashMap<String, String>,
-}
-
-/// Optional per-namespace processing overrides.
-///
-/// Omitted fields inherit the existing global processing settings.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessingProfile {
-    pub max_input_bytes: Option<usize>,
-    pub max_output_bytes: Option<usize>,
-    pub output_width: Option<u32>,
-    pub output_height: Option<u32>,
-}
-
-/// Fully resolved processing policy for one upload.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
-pub struct ProcessingPolicy {
-    pub profile_name: String,
-    pub max_input_bytes: usize,
-    pub max_output_bytes: usize,
-    pub output_width: u32,
-    pub output_height: u32,
-}
 
 /// Runtime application configuration.
 ///
@@ -319,722 +245,59 @@ impl AppConfig {
     pub fn from_env() -> io::Result<Self> {
         let bind_address = env::var("IMAGE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
-        let storage_scheme = env::var("IMAGE_STORAGE_SCHEME").unwrap_or_else(|_| "fs".to_string());
-
-        let mut storage_options = HashMap::new();
-
-        for (key, value) in env::vars() {
-            let Some(option) = key.strip_prefix("IMAGE_STORAGE_") else {
-                continue;
-            };
-
-            if option == "SCHEME" || value.is_empty() {
-                continue;
-            }
-
-            storage_options.insert(option.to_ascii_lowercase(), value);
-        }
-
-        if storage_scheme == "fs" && !storage_options.contains_key("root") {
-            let root = dirs::data_local_dir()
-                .ok_or_else(|| io::Error::other("Could not determine the local data directory"))?
-                .join("image-service")
-                .join("images");
-
-            storage_options.insert("root".to_string(), root.to_string_lossy().into_owned());
-        }
-
-        if storage_scheme == "fs"
-            && !storage_options.contains_key("atomic_write_dir")
-            && let Some(root) = storage_options.get("root")
-        {
-            let atomic_write_dir = PathBuf::from(root).join(".tmp");
-
-            storage_options.insert(
-                "atomic_write_dir".to_string(),
-                atomic_write_dir.to_string_lossy().into_owned(),
-            );
-        }
-
-        let max_concurrency = env::var("IMAGE_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
-
-        let max_decode_dimension = parse_bounded_u32(
-            "IMAGE_MAX_DECODE_DIMENSION",
-            DEFAULT_MAX_DECODE_DIMENSION,
-            1,
-            u32::MAX,
-        )?;
-        let max_decode_allocation_bytes = parse_bounded_u64(
-            "IMAGE_MAX_DECODE_ALLOCATION_BYTES",
-            DEFAULT_MAX_DECODE_ALLOCATION_BYTES,
-            1,
-            u64::MAX,
-        )?;
-        let processing_memory_budget_bytes = parse_bounded_u64(
-            "IMAGE_PROCESSING_MEMORY_BUDGET_BYTES",
-            DEFAULT_PROCESSING_MEMORY_BUDGET_BYTES,
-            1,
-            u64::MAX,
-        )?;
-
-        let max_source_bytes = parse_bounded_usize(
-            "IMAGE_MAX_INPUT_BYTES",
-            DEFAULT_MAX_SOURCE_BYTES,
-            1,
-            usize::MAX,
-        )?;
-        let max_output_bytes = parse_bounded_usize(
-            "IMAGE_MAX_OUTPUT_BYTES",
-            DEFAULT_MAX_OUTPUT_BYTES,
-            1,
-            usize::MAX,
-        )?;
-        let output_width = parse_bounded_u32(
-            "IMAGE_OUTPUT_WIDTH",
-            DEFAULT_OUTPUT_WIDTH,
-            1,
-            max_decode_dimension,
-        )?;
-        let output_height = parse_bounded_u32(
-            "IMAGE_OUTPUT_HEIGHT",
-            DEFAULT_OUTPUT_HEIGHT,
-            1,
-            max_decode_dimension,
-        )?;
-
-        let processing_profiles =
-            parse_json_env::<HashMap<String, ProcessingProfile>>("IMAGE_PROCESSING_PROFILES")?;
-        let namespace_profiles =
-            parse_json_env::<HashMap<String, String>>("IMAGE_NAMESPACE_PROFILES")?;
-        validate_processing_profiles(
-            &processing_profiles,
-            &namespace_profiles,
-            max_decode_dimension,
-        )?;
-        let max_profile_width = processing_profiles
-            .values()
-            .filter_map(|profile| profile.output_width)
-            .max()
-            .unwrap_or(output_width)
-            .max(output_width);
-        let max_profile_height = processing_profiles
-            .values()
-            .filter_map(|profile| profile.output_height)
-            .max()
-            .unwrap_or(output_height)
-            .max(output_height);
-        let minimum_processing_budget = estimate_processing_memory_bytes(
-            max_decode_allocation_bytes,
-            max_profile_width,
-            max_profile_height,
-        )?;
-        let processing_budget_units =
-            processing_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES as u64;
-        let minimum_processing_units =
-            minimum_processing_budget.div_ceil(UPLOAD_BUDGET_UNIT_BYTES as u64);
-        if processing_budget_units < minimum_processing_units
-            || processing_budget_units > tokio::sync::Semaphore::MAX_PERMITS as u64
-            || max_decode_allocation_bytes > usize::MAX as u64
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IMAGE_PROCESSING_MEMORY_BUDGET_BYTES must fit at least one configured processing operation and the Tokio semaphore; increase it or lower decode/output limits",
-            ));
-        }
-        let largest_input =
-            max_configured_input_bytes(max_source_bytes, &processing_profiles, &namespace_profiles);
-        let max_uploads_in_flight = parse_bounded_usize(
-            "IMAGE_MAX_UPLOADS_IN_FLIGHT",
-            DEFAULT_MAX_UPLOADS_IN_FLIGHT,
-            1,
-            1024,
-        )?;
-        let default_upload_budget = largest_input
-            .div_ceil(UPLOAD_BUDGET_UNIT_BYTES)
-            .checked_mul(DEFAULT_MAX_UPLOADS_IN_FLIGHT)
-            .and_then(|units| units.checked_mul(UPLOAD_BUDGET_UNIT_BYTES))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload budget overflow"))?;
-        let upload_memory_budget_bytes = parse_bounded_usize(
-            "IMAGE_UPLOAD_MEMORY_BUDGET_BYTES",
-            default_upload_budget,
-            1,
-            usize::MAX,
-        )?;
-        let upload_memory_threshold_bytes = parse_bounded_usize(
-            "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES",
-            DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
-            1,
-            usize::MAX,
-        )?;
-        let upload_units = largest_input.div_ceil(UPLOAD_BUDGET_UNIT_BYTES);
-        let budget_units = upload_memory_budget_bytes / UPLOAD_BUDGET_UNIT_BYTES;
-        if upload_memory_budget_bytes < largest_input
-            || budget_units < upload_units
-            || upload_units > u32::MAX as usize
-            || budget_units > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IMAGE_UPLOAD_MEMORY_BUDGET_BYTES must cover the largest configured input and fit the semaphore",
-            ));
-        }
-        let upload_read_timeout_seconds = parse_bounded_u64(
-            "IMAGE_UPLOAD_READ_TIMEOUT_SECONDS",
-            DEFAULT_UPLOAD_READ_TIMEOUT_SECONDS,
-            1,
-            86_400,
-        )?;
-        let resumable_uploads_enabled = parse_bool_env("IMAGE_RESUMABLE_UPLOADS_ENABLED", false)?;
-        let resumable_upload_ttl_seconds = parse_bounded_u64(
-            "IMAGE_RESUMABLE_UPLOAD_TTL_SECONDS",
-            86_400,
-            60,
-            31 * 24 * 60 * 60,
-        )?;
-        let resumable_upload_max_chunk_bytes = parse_bounded_usize(
-            "IMAGE_RESUMABLE_UPLOAD_MAX_CHUNK_BYTES",
-            DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
-            1,
-            usize::MAX,
-        )?;
-        let max_downloads_in_flight = parse_bounded_usize(
-            "IMAGE_MAX_DOWNLOADS_IN_FLIGHT",
-            DEFAULT_MAX_DOWNLOADS_IN_FLIGHT,
-            1,
-            tokio::sync::Semaphore::MAX_PERMITS,
-        )?;
-        let download_stream_chunk_bytes = parse_bounded_usize(
-            "IMAGE_DOWNLOAD_STREAM_CHUNK_BYTES",
-            DEFAULT_DOWNLOAD_STREAM_CHUNK_BYTES,
-            1,
-            16 * 1024 * 1024,
-        )?;
-        let shutdown_timeout_seconds = parse_bounded_u64(
-            "IMAGE_SHUTDOWN_TIMEOUT_SECONDS",
-            DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
-            1,
-            3600,
-        )?;
-        let job_database_path = match env::var("IMAGE_JOB_DB_PATH") {
-            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IMAGE_JOB_DB_PATH cannot be empty",
-                ));
-            }
-            Err(env::VarError::NotPresent) => dirs::data_local_dir()
-                .ok_or_else(|| io::Error::other("Could not determine the local data directory"))?
-                .join("image-service")
-                .join("jobs.sqlite3"),
-            Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Could not read IMAGE_JOB_DB_PATH: {error}"),
-                ));
-            }
-        };
-        let background_job_concurrency =
-            parse_bounded_usize("IMAGE_BACKGROUND_JOB_CONCURRENCY", 1, 1, 64)?;
-        let background_idle_seconds =
-            parse_bounded_u64("IMAGE_BACKGROUND_IDLE_SECONDS", 30, 0, 86_400)?;
-        let job_retention_days = parse_bounded_u64("IMAGE_JOB_RETENTION_DAYS", 30, 1, 3650)?;
-        let async_image_max_jobs = parse_bounded_usize("IMAGE_ASYNC_MAX_JOBS", 1000, 1, 1000)?;
-        let async_image_max_bytes =
-            parse_bounded_u64("IMAGE_ASYNC_MAX_STAGED_BYTES", 1_073_741_824, 1, u64::MAX)?;
-        let storage_usage_enabled = parse_bool_env("IMAGE_STORAGE_USAGE_ENABLED", false)?;
-        let storage_catalog_path = match env::var("IMAGE_STORAGE_CATALOG_DB_PATH") {
-            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IMAGE_STORAGE_CATALOG_DB_PATH cannot be empty",
-                ));
-            }
-            Err(env::VarError::NotPresent) => {
-                job_database_path.with_file_name("storage-catalog.sqlite3")
-            }
-            Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Could not read IMAGE_STORAGE_CATALOG_DB_PATH: {error}"),
-                ));
-            }
-        };
-        let storage_inventory_interval_seconds = parse_bounded_u64(
-            "IMAGE_STORAGE_INVENTORY_INTERVAL_SECONDS",
-            3600,
-            60,
-            31 * 24 * 60 * 60,
-        )?;
-        let background_window_utc = env::var("IMAGE_BACKGROUND_WINDOW_UTC")
-            .ok()
-            .map(|window| window.trim().to_string())
-            .filter(|window| !window.is_empty());
-        if let Some(window) = &background_window_utc {
-            job_scheduler::DailyUtcWindow::parse(window)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        }
-        let max_slots = parse_bounded_u32(
-            "IMAGE_MAX_SLOTS",
-            u32::from(DEFAULT_MAX_SLOTS),
-            1,
-            u32::from(MAX_SLOT_NUMBER),
-        )? as u8;
-
-        let api_key = env::var("IMAGE_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-
-        if env::var_os("GETMETHOD_AUTH").is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "GETMETHOD_AUTH has been removed; use IMAGE_READ_AUTH and IMAGE_WRITE_AUTH",
-            ));
-        }
-
-        let read_auth = AuthRequirement::parse("IMAGE_READ_AUTH", AuthRequirement::Required)?;
-        let write_auth = AuthRequirement::parse("IMAGE_WRITE_AUTH", AuthRequirement::Required)?;
-
-        if (read_auth.is_required() || write_auth.is_required()) && api_key.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IMAGE_API_KEY is required when IMAGE_READ_AUTH or IMAGE_WRITE_AUTH is 'required'",
-            ));
-        }
-
-        validate_storage_usage_auth(storage_usage_enabled, api_key.as_deref())?;
-
-        let rate_limit = RateLimitConfig {
-            read_requests: parse_bounded_u32(
-                "IMAGE_RATE_LIMIT_READ_REQUESTS",
-                DEFAULT_READ_RATE_LIMIT_REQUESTS,
-                0,
-                u32::MAX,
-            )?,
-            write_requests: parse_bounded_u32(
-                "IMAGE_RATE_LIMIT_WRITE_REQUESTS",
-                DEFAULT_WRITE_RATE_LIMIT_REQUESTS,
-                0,
-                u32::MAX,
-            )?,
-            window_seconds: parse_bounded_u64(
-                "IMAGE_RATE_LIMIT_WINDOW_SECONDS",
-                DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
-                1,
-                86_400,
-            )?,
-        };
-
-        let metrics_enabled = parse_bool_env("IMAGE_METRICS_ENABLED", false)?;
-        let metrics_auth = parse_bool_env("IMAGE_METRICS_AUTH", true)?;
-        validate_metrics_auth(metrics_enabled, metrics_auth, api_key.as_deref())?;
-
-        let presign_ttl_seconds = env::var("IMAGE_PRESIGN_TTL_SECONDS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("IMAGE_PRESIGN_TTL_SECONDS must be a positive integer: {error}"),
-                )
-            })?
-            .unwrap_or(3600);
-
-        if presign_ttl_seconds == 0 || presign_ttl_seconds > MAX_PRESIGN_TTL_SECONDS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "IMAGE_PRESIGN_TTL_SECONDS must be between 1 and {MAX_PRESIGN_TTL_SECONDS}"
-                ),
-            ));
-        }
-
-        let cache_control = env::var("IMAGE_CACHE_CONTROL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-
-        let cache_ttl_seconds = env::var("IMAGE_CACHE_TTL_SECONDS")
-            .ok()
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("IMAGE_CACHE_TTL_SECONDS must be a non-negative integer: {error}"),
-                )
-            })?
-            .unwrap_or(DEFAULT_IMAGE_CACHE_TTL_SECONDS);
-
-        let cache_control = cache_control.unwrap_or_else(|| {
-            if cache_ttl_seconds == 0 {
-                "no-store".to_string()
-            } else {
-                let visibility = if read_auth.is_required() {
-                    "private"
-                } else {
-                    "public"
-                };
-                format!("{visibility}, max-age={cache_ttl_seconds}")
-            }
-        });
-
-        if axum::http::HeaderValue::from_str(&cache_control).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IMAGE_CACHE_CONTROL must be a valid HTTP header value",
-            ));
-        }
-
-        let public_base_url = env::var("IMAGE_PUBLIC_BASE_URL")
-            .ok()
-            .map(|value| value.trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty());
-
-        let storage = StorageConfig {
-            scheme: storage_scheme,
-            options: storage_options,
-        };
+        let storage = storage::load()?;
+        let processing = processing::load()?;
+        let transfer = transfers::load(processing.largest_input)?;
+        let jobs = jobs::load()?;
+        let security = security::load(jobs.storage_usage_enabled)?;
+        let observability = observability::load(security.api_key.as_deref())?;
+        let cache = cache::load(security.read_auth)?;
 
         Ok(Self {
             bind_address,
             storage,
-            max_concurrency,
-            max_decode_dimension,
-            max_decode_allocation_bytes,
-            processing_memory_budget_bytes,
-            max_uploads_in_flight,
-            upload_memory_budget_bytes,
-            upload_memory_threshold_bytes,
-            upload_read_timeout_seconds,
-            resumable_uploads_enabled,
-            resumable_upload_ttl_seconds,
-            resumable_upload_max_chunk_bytes,
-            max_downloads_in_flight,
-            download_stream_chunk_bytes,
-            shutdown_timeout_seconds,
-            job_database_path,
-            background_job_concurrency,
-            background_idle_seconds,
-            background_window_utc,
-            job_retention_days,
-            async_image_max_jobs,
-            async_image_max_bytes,
-            storage_usage_enabled,
-            storage_catalog_path,
-            storage_inventory_interval_seconds,
-            max_source_bytes,
-            max_output_bytes,
-            output_width,
-            output_height,
-            processing_profiles,
-            namespace_profiles,
-            max_slots,
-            api_key,
-            read_auth,
-            write_auth,
-            rate_limit,
-            metrics_enabled,
-            metrics_auth,
-            presign_ttl_seconds,
-            cache_control,
-            public_base_url,
+            max_concurrency: processing.max_concurrency,
+            max_decode_dimension: processing.max_decode_dimension,
+            max_decode_allocation_bytes: processing.max_decode_allocation_bytes,
+            processing_memory_budget_bytes: processing.processing_memory_budget_bytes,
+            max_uploads_in_flight: transfer.max_uploads_in_flight,
+            upload_memory_budget_bytes: transfer.upload_memory_budget_bytes,
+            upload_memory_threshold_bytes: transfer.upload_memory_threshold_bytes,
+            upload_read_timeout_seconds: transfer.upload_read_timeout_seconds,
+            resumable_uploads_enabled: transfer.resumable_uploads_enabled,
+            resumable_upload_ttl_seconds: transfer.resumable_upload_ttl_seconds,
+            resumable_upload_max_chunk_bytes: transfer.resumable_upload_max_chunk_bytes,
+            max_downloads_in_flight: transfer.max_downloads_in_flight,
+            download_stream_chunk_bytes: transfer.download_stream_chunk_bytes,
+            shutdown_timeout_seconds: transfer.shutdown_timeout_seconds,
+            job_database_path: jobs.database_path,
+            background_job_concurrency: jobs.background_concurrency,
+            background_idle_seconds: jobs.background_idle_seconds,
+            background_window_utc: jobs.background_window_utc,
+            job_retention_days: jobs.retention_days,
+            async_image_max_jobs: jobs.async_image_max_jobs,
+            async_image_max_bytes: jobs.async_image_max_bytes,
+            storage_usage_enabled: jobs.storage_usage_enabled,
+            storage_catalog_path: jobs.storage_catalog_path,
+            storage_inventory_interval_seconds: jobs.storage_inventory_interval_seconds,
+            max_source_bytes: processing.max_source_bytes,
+            max_output_bytes: processing.max_output_bytes,
+            output_width: processing.output_width,
+            output_height: processing.output_height,
+            processing_profiles: processing.processing_profiles,
+            namespace_profiles: processing.namespace_profiles,
+            max_slots: security.max_slots,
+            api_key: security.api_key,
+            read_auth: security.read_auth,
+            write_auth: security.write_auth,
+            rate_limit: observability.rate_limit,
+            metrics_enabled: observability.metrics_enabled,
+            metrics_auth: observability.metrics_auth,
+            presign_ttl_seconds: security.presign_ttl_seconds,
+            cache_control: cache.cache_control,
+            public_base_url: cache.public_base_url,
         })
     }
-}
-
-fn parse_json_env<T>(name: &str) -> io::Result<T>
-where
-    T: for<'de> Deserialize<'de> + Default,
-{
-    let Ok(value) = env::var(name) else {
-        return Ok(T::default());
-    };
-    if value.trim().is_empty() {
-        return Ok(T::default());
-    }
-    serde_json::from_str(&value).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must contain a valid JSON object: {error}"),
-        )
-    })
-}
-
-pub(crate) fn estimate_processing_memory_bytes(
-    max_decode_allocation_bytes: u64,
-    output_width: u32,
-    output_height: u32,
-) -> io::Result<u64> {
-    let output_bytes = (output_width as u64)
-        .checked_mul(output_height as u64)
-        .and_then(|pixels| pixels.checked_mul(ESTIMATED_PROCESSING_BYTES_PER_OUTPUT_PIXEL))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "processing memory estimate overflow",
-            )
-        })?;
-    max_decode_allocation_bytes
-        .checked_mul(2)
-        .and_then(|decode_bytes| decode_bytes.checked_add(output_bytes))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "processing memory estimate overflow",
-            )
-        })
-}
-
-fn validate_processing_profiles(
-    profiles: &HashMap<String, ProcessingProfile>,
-    namespace_profiles: &HashMap<String, String>,
-    max_decode_dimension: u32,
-) -> io::Result<()> {
-    for (name, profile) in profiles {
-        if name == "default" || !is_valid_profile_name(name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid or reserved processing profile name: {name}"),
-            ));
-        }
-        if profile.max_input_bytes == Some(0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Profile {name} max_input_bytes must be greater than zero"),
-            ));
-        }
-        if profile.max_output_bytes == Some(0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Profile {name} max_output_bytes must be greater than zero"),
-            ));
-        }
-        if profile.output_width.is_some() != profile.output_height.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Profile {name} must set output_width and output_height together"),
-            ));
-        }
-        for (dimension_name, dimension) in [
-            ("output_width", profile.output_width),
-            ("output_height", profile.output_height),
-        ] {
-            if let Some(dimension) = dimension
-                && !(1..=max_decode_dimension).contains(&dimension)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "Profile {name} {dimension_name} must be between 1 and {max_decode_dimension}"
-                    ),
-                ));
-            }
-        }
-    }
-
-    for (namespace, profile_name) in namespace_profiles {
-        if namespace.is_empty()
-            || namespace.len() > 32
-            || !namespace.chars().all(|character| {
-                character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || character == '-'
-                    || character == '_'
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid namespace in IMAGE_NAMESPACE_PROFILES: {namespace}"),
-            ));
-        }
-        if !profiles.contains_key(profile_name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Namespace {namespace} references undefined image processing profile: {profile_name}"
-                ),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn is_valid_profile_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name.chars().all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || character == '-'
-                || character == '_'
-        })
-}
-
-pub(crate) fn resolve_processing_policy(
-    namespace: &str,
-    global_max_input_bytes: usize,
-    global_max_output_bytes: usize,
-    global_output_width: u32,
-    global_output_height: u32,
-    profiles: &HashMap<String, ProcessingProfile>,
-    namespace_profiles: &HashMap<String, String>,
-) -> ProcessingPolicy {
-    let Some(profile_name) = namespace_profiles.get(namespace) else {
-        return ProcessingPolicy {
-            profile_name: "default".to_string(),
-            max_input_bytes: global_max_input_bytes,
-            max_output_bytes: global_max_output_bytes,
-            output_width: global_output_width,
-            output_height: global_output_height,
-        };
-    };
-
-    let profile = &profiles[profile_name];
-    ProcessingPolicy {
-        profile_name: profile_name.clone(),
-        max_input_bytes: profile.max_input_bytes.unwrap_or(global_max_input_bytes),
-        max_output_bytes: profile.max_output_bytes.unwrap_or(global_max_output_bytes),
-        output_width: profile.output_width.unwrap_or(global_output_width),
-        output_height: profile.output_height.unwrap_or(global_output_height),
-    }
-}
-
-pub(crate) fn max_configured_input_bytes(
-    global_max_input_bytes: usize,
-    profiles: &HashMap<String, ProcessingProfile>,
-    namespace_profiles: &HashMap<String, String>,
-) -> usize {
-    namespace_profiles
-        .values()
-        .filter_map(|profile_name| profiles.get(profile_name))
-        .filter_map(|profile| profile.max_input_bytes)
-        .fold(global_max_input_bytes, usize::max)
-}
-
-fn parse_bounded_usize(name: &str, default: usize, min: usize, max: usize) -> io::Result<usize> {
-    let value = env::var(name)
-        .ok()
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer: {error}"),
-            )
-        })?
-        .unwrap_or(default);
-    validate_bounded_usize(name, value, min, max)
-}
-
-fn validate_bounded_usize(name: &str, value: usize, min: usize, max: usize) -> io::Result<usize> {
-    if !(min..=max).contains(&value) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must be between {min} and {max}"),
-        ));
-    }
-    Ok(value)
-}
-
-fn parse_bounded_u32(name: &str, default: u32, min: u32, max: u32) -> io::Result<u32> {
-    let value = env::var(name)
-        .ok()
-        .map(|value| value.parse::<u32>())
-        .transpose()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer: {error}"),
-            )
-        })?
-        .unwrap_or(default);
-    if !(min..=max).contains(&value) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must be between {min} and {max}"),
-        ));
-    }
-    Ok(value)
-}
-
-fn parse_bounded_u64(name: &str, default: u64, min: u64, max: u64) -> io::Result<u64> {
-    let value = env::var(name)
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer: {error}"),
-            )
-        })?
-        .unwrap_or(default);
-    validate_bounded_u64(name, value, min, max)
-}
-
-fn validate_bounded_u64(name: &str, value: u64, min: u64, max: u64) -> io::Result<u64> {
-    if !(min..=max).contains(&value) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must be between {min} and {max}"),
-        ));
-    }
-    Ok(value)
-}
-
-fn parse_bool_env(name: &str, default: bool) -> io::Result<bool> {
-    match env::var(name) {
-        Ok(value) => parse_bool_value(name, Some(&value), default),
-        Err(env::VarError::NotPresent) => parse_bool_value(name, None, default),
-        Err(error) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Could not read {name}: {error}"),
-        )),
-    }
-}
-
-fn parse_bool_value(name: &str, value: Option<&str>, default: bool) -> io::Result<bool> {
-    match value {
-        Some(value) => value.parse::<bool>().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be 'true' or 'false': {error}"),
-            )
-        }),
-        None => Ok(default),
-    }
-}
-
-fn validate_metrics_auth(
-    metrics_enabled: bool,
-    metrics_auth: bool,
-    api_key: Option<&str>,
-) -> io::Result<()> {
-    if metrics_enabled && metrics_auth && api_key.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IMAGE_METRICS_ENABLED=true with IMAGE_METRICS_AUTH=true requires IMAGE_API_KEY to be configured",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_storage_usage_auth(enabled: bool, api_key: Option<&str>) -> io::Result<()> {
-    if enabled && api_key.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IMAGE_API_KEY is required when IMAGE_STORAGE_USAGE_ENABLED=true",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1058,27 +321,31 @@ mod tests {
 
     #[test]
     fn production_rate_limit_defaults_are_independent_and_bounded() {
-        assert_eq!(DEFAULT_READ_RATE_LIMIT_REQUESTS, 600);
-        assert_eq!(DEFAULT_WRITE_RATE_LIMIT_REQUESTS, 60);
-        assert_eq!(DEFAULT_RATE_LIMIT_WINDOW_SECONDS, 60);
+        assert_eq!(observability::DEFAULT_READ_RATE_LIMIT_REQUESTS, 600);
+        assert_eq!(observability::DEFAULT_WRITE_RATE_LIMIT_REQUESTS, 60);
+        assert_eq!(observability::DEFAULT_RATE_LIMIT_WINDOW_SECONDS, 60);
     }
 
     #[test]
     fn shutdown_timeout_defaults_to_25_seconds_and_is_bounded() {
         assert_eq!(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, 25);
         assert_eq!(
-            validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 25, 1, 3600).unwrap(),
+            parsing::validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 25, 1, 3600).unwrap(),
             25
         );
-        assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 0, 1, 3600).is_err());
-        assert!(validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 3601, 1, 3600).is_err());
+        assert!(
+            parsing::validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 0, 1, 3600).is_err()
+        );
+        assert!(
+            parsing::validate_bounded_u64("IMAGE_SHUTDOWN_TIMEOUT_SECONDS", 3601, 1, 3600).is_err()
+        );
     }
 
     #[test]
     fn upload_memory_threshold_has_an_eight_mib_default_and_requires_positive_bytes() {
         assert_eq!(DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES, 8 * 1024 * 1024);
         assert_eq!(
-            validate_bounded_usize(
+            parsing::validate_bounded_usize(
                 "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES",
                 DEFAULT_UPLOAD_MEMORY_THRESHOLD_BYTES,
                 1,
@@ -1088,25 +355,30 @@ mod tests {
             8 * 1024 * 1024
         );
         assert!(
-            validate_bounded_usize("IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES", 0, 1, usize::MAX)
-                .is_err()
+            parsing::validate_bounded_usize(
+                "IMAGE_UPLOAD_MEMORY_THRESHOLD_BYTES",
+                0,
+                1,
+                usize::MAX
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn metrics_auth_defaults_to_required_and_only_requires_key_when_metrics_are_enabled() {
-        assert!(parse_bool_value("IMAGE_METRICS_AUTH", None, true).unwrap());
-        assert!(validate_metrics_auth(true, true, None).is_err());
-        assert!(validate_metrics_auth(false, true, None).is_ok());
-        assert!(validate_metrics_auth(true, false, None).is_ok());
-        assert!(validate_metrics_auth(true, true, Some("secret")).is_ok());
+        assert!(parsing::parse_bool_value("IMAGE_METRICS_AUTH", None, true).unwrap());
+        assert!(observability::validate_metrics_auth(true, true, None).is_err());
+        assert!(observability::validate_metrics_auth(false, true, None).is_ok());
+        assert!(observability::validate_metrics_auth(true, false, None).is_ok());
+        assert!(observability::validate_metrics_auth(true, true, Some("secret")).is_ok());
     }
 
     #[test]
     fn storage_usage_requires_a_key_only_when_enabled() {
-        assert!(validate_storage_usage_auth(false, None).is_ok());
-        assert!(validate_storage_usage_auth(true, None).is_err());
-        assert!(validate_storage_usage_auth(true, Some("secret")).is_ok());
+        assert!(security::validate_storage_usage_auth(false, None).is_ok());
+        assert!(security::validate_storage_usage_auth(true, None).is_err());
+        assert!(security::validate_storage_usage_auth(true, Some("secret")).is_ok());
     }
 
     #[test]
@@ -1215,7 +487,7 @@ mod tests {
             },
         )]);
         assert!(
-            validate_processing_profiles(
+            processing::validate_processing_profiles(
                 &partial_dimensions,
                 &HashMap::new(),
                 DEFAULT_MAX_DECODE_DIMENSION,
@@ -1226,7 +498,7 @@ mod tests {
         let profiles = HashMap::from([("avatar".to_string(), ProcessingProfile::default())]);
         let unknown_assignment = HashMap::from([("users".to_string(), "missing".to_string())]);
         assert!(
-            validate_processing_profiles(
+            processing::validate_processing_profiles(
                 &profiles,
                 &unknown_assignment,
                 DEFAULT_MAX_DECODE_DIMENSION,
@@ -1236,7 +508,7 @@ mod tests {
 
         let reserved_name = HashMap::from([("default".to_string(), ProcessingProfile::default())]);
         assert!(
-            validate_processing_profiles(
+            processing::validate_processing_profiles(
                 &reserved_name,
                 &HashMap::new(),
                 DEFAULT_MAX_DECODE_DIMENSION,
@@ -1252,7 +524,7 @@ mod tests {
             },
         )]);
         assert!(
-            validate_processing_profiles(
+            processing::validate_processing_profiles(
                 &zero_input_limit,
                 &HashMap::new(),
                 DEFAULT_MAX_DECODE_DIMENSION,

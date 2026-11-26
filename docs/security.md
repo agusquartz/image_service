@@ -24,7 +24,7 @@ The service includes several defensive measures:
 - Tus upload sessions are disabled by default. When enabled, read/write authentication applies to session creation, chunk writes, status, and cancellation. Session IDs are random UUIDs and sessions expire; SQLite stores session metadata, offsets, status, and chunk checksums, while confirmed bytes are held in the private `__image_transfer/resumable/` staging prefix in the configured storage backend. Protect and persist both locations. The service cleans expired session data and startup orphan objects, but storage access should still be restricted to the service.
 - `X-Content-Type-Options: nosniff` on image responses.
 - Required bearer-token protection for reads and writes by default; each policy can be explicitly set to `none`.
-- Per-client read/write rate limits with a `429` response and `Retry-After`.
+- Per-source-IP read/write rate limits with a `429` response and `Retry-After`.
 - Server-generated request IDs and structured JSON request logs.
 - An optional Prometheus metrics endpoint protected by the API key by default.
 

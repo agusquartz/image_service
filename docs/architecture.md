@@ -21,7 +21,16 @@ src/main.rs                       # Minimal executable entry point
 crates/
 ├── file-core/src/                # HTTP, auth, config, storage, lifecycle, use cases
 │   ├── auth.rs
-│   ├── config.rs
+│   ├── config.rs                   # AppConfig façade and settings assembly
+│   ├── config/
+│   │   ├── cache.rs                # Cache headers and public URL
+│   │   ├── jobs.rs                # Durable jobs and storage catalog settings
+│   │   ├── observability.rs        # Metrics and rate limits
+│   │   ├── parsing.rs              # Shared environment parsers and bounds
+│   │   ├── processing.rs           # Image limits and namespace profiles
+│   │   ├── security.rs             # API key, auth policies, slots, presigning
+│   │   ├── storage.rs              # OpenDAL backend configuration
+│   │   └── transfers.rs            # Upload/download admission and timeouts
 │   ├── router.rs
 │   ├── state.rs
 │   └── images/                   # Image API and storage adapters; enabled by `images`
@@ -237,7 +246,8 @@ images/store.rs
 Responsibilities:
 
 - Convert ImageKey into a backend-independent object key.
-- Read image bytes through OpenDAL.
+- Stream full or byte-range image reads through OpenDAL without collecting the
+  complete response in a `Vec`.
 - Write image bytes through OpenDAL.
 - Delete image objects through OpenDAL.
 - Read object metadata with `stat` and list slots under a resource prefix.
@@ -259,10 +269,20 @@ The operation coordinator is an in-memory consistency mechanism for one service 
 
 ### Configuration and Shared State
 
+Configuration is assembled by `config.rs` into the existing `AppConfig` used
+by the application. Domain-specific environment parsing lives in `config/`:
+storage, image processing, security, observability, transfer limits, durable
+jobs/catalog, and cache/public URL settings each have a focused module. Shared
+parsers keep boolean, integer, and bounds handling consistent.
+
+This is an internal organization change. It preserves the existing environment
+variable names, defaults, validation, and `AppConfig` fields so other Core
+modules and existing deployments keep the same behavior.
+
 Files:
 
 ```text
-config.rs
+config.rs and config/*.rs
 state.rs
 ```
 
@@ -452,8 +472,11 @@ The current implementation provides filesystem and S3/S3-compatible
 storage through OpenDAL. Additional backends can be introduced without
 changing the application service or HTTP layers.
 
-### Configuration belongs in one place
+### Configuration has a stable facade
 
-Runtime and processing configuration should progressively move into `AppConfig` instead of being scattered through handlers or infrastructure modules.
+Runtime and processing settings are assembled into `AppConfig`; environment
+parsing is split into focused `config/` modules. Keep that boundary stable so
+handlers and infrastructure consume validated settings instead of parsing
+environment variables independently.
 
 ---

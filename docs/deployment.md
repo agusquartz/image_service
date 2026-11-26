@@ -79,9 +79,12 @@ cargo build --release --locked --no-default-features --features worker-protocol
 cargo build --release --locked --no-default-features --features all
 ```
 
-Builds without `images` expose health/readiness and optional metrics only. The
-`worker-protocol` feature includes versioned worker/job DTOs but no worker transport or
-job dispatch yet. Use the default build for a functioning image API.
+Builds without `images` expose health/readiness and optional metrics; they do
+not expose image routes. The durable scheduler remains an internal Core
+facility, but no image-processing queue is registered without `images`. The
+`worker-protocol` feature adds versioned worker/job DTOs only; remote worker
+transport and dispatch are not implemented. Use the default build for a
+functioning image API.
 
 The Dockerfile explicitly builds package `image_service`. Its default is
 `IMAGE_SERVICE_FEATURES=images`; use `--build-arg IMAGE_SERVICE_FEATURES=all`
