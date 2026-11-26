@@ -8,7 +8,7 @@
 
 Image Service validates and decodes uploaded images with defensive limits, then stores WebP within the configured output-size limit. A valid static WebP that already has the target dimensions, needs no orientation transform, and fits the byte limit is preserved as-is. Other inputs are cropped, resized, or encoded only as needed; output uses the configured target dimensions unless further downscaling is needed to meet the byte limit.
 
-Storage is provided through OpenDAL. The currently compiled backends are local filesystem and S3/S3-compatible object storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so the service can evolve toward configurable processing policies and multiple storage backends.
+Storage is provided through OpenDAL. The currently compiled backends are local filesystem and S3/S3-compatible object storage. HTTP handling, image processing, application orchestration, validation, and storage are intentionally separated so additional processing policies and storage backends can be added without coupling them to the HTTP layer.
 
 ## Why Image Service?
 
@@ -136,10 +136,11 @@ The version currently on `main` is used in production by two companies running a
 - Image retrieval over HTTP; private reads are the secure default and public reads are configurable.
 - Image information with storage and WebP dimensions metadata.
 - Presigned read URLs when the storage backend supports them.
-- ETag and Last-Modified validators with conditional GET/HEAD requests.
+- Storage-provided ETag and Last-Modified validators with conditional GET/HEAD requests when available.
 - Resource image listing, HEAD metadata checks, and idempotent deletion.
 - POST creates only in an unused slot; PUT creates or replaces the complete image.
 - Optional durable asynchronous image processing through `/api/image-jobs/...`; existing `/api/images/...` routes remain synchronous.
+- Optional Tus resumable uploads and storage-backed HTTP `Range` downloads.
 - Independent bearer-token policies for reads and writes; both are protected by default.
 - Per-source-IP read/write rate limits with `429` responses and `Retry-After`; clients behind one NAT/proxy share the budget.
 - Structured JSON request logs, server-generated request IDs, and an optional authenticated Prometheus endpoint.
@@ -190,7 +191,7 @@ cargo build --release --locked --no-default-features --features worker-protocol
 cargo build --release --locked --no-default-features --features all
 ```
 
-The no-image builds expose health/readiness, optional metrics, and the durable internal job catalog; image routes and local image processing are excluded. The `worker-protocol` feature includes versioned worker/job data types, but does not yet provide remote worker transport or dispatch. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
+The no-image builds expose health/readiness, optional metrics, and the generic durable internal job catalog; image routes and local image processing are excluded. The `worker-protocol` feature includes versioned worker/job data types, but does not yet provide remote worker transport or dispatch. See [Architecture](docs/architecture.md#cargo-workspace-and-features).
 
 ## API Overview
 
@@ -208,6 +209,20 @@ POST /api/images/{namespace}/{resource_id}/{slot}/presign
 DELETE /api/images/{namespace}/{resource_id}/{slot}
 GET  /api/images/{namespace}/{resource_id}
 DELETE /api/images/{namespace}/{resource_id}
+
+POST /api/image-jobs/{namespace}/{resource_id}/{slot}
+PUT  /api/image-jobs/{namespace}/{resource_id}/{slot}
+GET  /api/image-jobs/{job_id}
+
+OPTIONS /api/image-uploads                          # when Tus is enabled
+OPTIONS /api/image-uploads/{upload_id}              # when Tus is enabled
+POST    /api/image-uploads/{namespace}/{resource_id}/{slot}
+PUT     /api/image-uploads/{namespace}/{resource_id}/{slot}
+HEAD    /api/image-uploads/{upload_id}
+PATCH   /api/image-uploads/{upload_id}
+DELETE  /api/image-uploads/{upload_id}
+
+GET  /metrics                                        # when metrics are enabled
 
 GET  /api/storage/usage?namespace=products&resource_id=845&slot=1
 POST /api/storage/reconcile
@@ -381,6 +396,11 @@ IMAGE_BACKGROUND_JOB_CONCURRENCY
 IMAGE_BACKGROUND_IDLE_SECONDS
 IMAGE_BACKGROUND_WINDOW_UTC
 IMAGE_JOB_RETENTION_DAYS
+IMAGE_ASYNC_MAX_JOBS
+IMAGE_ASYNC_MAX_STAGED_BYTES
+IMAGE_STORAGE_USAGE_ENABLED
+IMAGE_STORAGE_CATALOG_DB_PATH
+IMAGE_STORAGE_INVENTORY_INTERVAL_SECONDS
 IMAGE_MAX_INPUT_BYTES
 IMAGE_MAX_OUTPUT_BYTES
 IMAGE_OUTPUT_WIDTH
@@ -400,7 +420,10 @@ IMAGE_PRESIGN_TTL_SECONDS
 IMAGE_CACHE_TTL_SECONDS
 IMAGE_CACHE_CONTROL
 IMAGE_PUBLIC_BASE_URL
+RUST_LOG
 ```
+
+Tus upload-session routes are disabled unless `IMAGE_RESUMABLE_UPLOADS_ENABLED=true`; `/metrics` is disabled unless `IMAGE_METRICS_ENABLED=true`. `IMAGE_STORAGE_*` also covers backend-specific OpenDAL options.
 
 Input/output byte limits, target output dimensions, decoder safety limits, and the global maximum slot number for new images can be configured at runtime. Input defaults to 15 MiB for compatibility, output defaults to 100 KiB, and new slots default to `1..=5` (`IMAGE_MAX_SLOTS` accepts `1..=255`). Existing higher slots remain readable and deletable after lowering the setting; PUT can replace them but cannot create them. If quality 0 at the target dimensions still exceeds the byte limit, the service reduces dimensions while preserving the target aspect ratio. Decoder dimension and allocation defaults are 12,000 px and 256 MiB; the weighted processing memory budget defaults to 1,056 MiB for two concurrent 1024×1024 operations. These are configurable safeguards, not automatic measurements of host RAM; increasing dimensions, allocation limits, or concurrency requires planning for additional hardware use. Image GET and HEAD responses default to a 60-second cache lifetime; set `IMAGE_CACHE_TTL_SECONDS=0` to emit `Cache-Control: no-store`.
 
@@ -432,7 +455,7 @@ Implemented capabilities are listed above and documented in the linked guides. R
 - More image operations; profiles already apply input/output limits and target dimensions by namespace. Future per-namespace policy work means auth, formats, slot limits, storage routing, quotas, and retention.
 - Distributed rate limiting and per-namespace quotas; current rate limits are in-memory per process.
 - OpenTelemetry and image-processing/storage metrics; current `/metrics` covers HTTP request counts, HTTP duration, and rate-limited requests only.
-- Background processing and direct-to-object-storage uploads.
+- Remote worker dispatch and direct-to-object-storage uploads.
 - Persistent metadata, deduplication, content addressing, and storage migration tooling.
 - Structured configuration files and a command-line configuration interface.
 
